@@ -1,0 +1,24 @@
+[package]
+name = "cljform"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Form-addressed Clojure editing: whole-form ops with machine-checked shape invariants"
+repository = "https://github.com/eraserhd/cljform"
+
+[[bin]]
+name = "cljform"
+path = "src/main.rs"
+
+[dependencies]
+tree-sitter = "0.25.10"
+tree-sitter-clojure = "0.1.0"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+blake3 = "1"
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1

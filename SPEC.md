@@ -1,6 +1,6 @@
 # cljform — form-addressed Clojure editing: spec
 
-Status: **proposal** · Created: 2026-09-29
+Status: **implemented (v1)** · Created: 2026-09-29
 Shape: standalone Rust CLI (`cljform`) + pi extension wrapper (`clojure-forms`)
 
 ## 1. Problem
@@ -64,7 +64,7 @@ nesting sanity. Neither exists as a first-class tool today.
 ┌───────────────▼───────────────────────────────────────────────┐
 │ cljform (Rust, no network, no Clojure runtime)                │
 │                                                               │
-│  parse:  parinfer engine (same as parinfer-rust), paren mode  │
+│  parse:  tree-sitter + tree-sitter-clojure grammar            │
 │  map:    top-level form table: addr, kind, name, line range,  │
 │          blake3 hash, contained-kind counts                    │
 │  ops:    forms · get · check · edit · insert · delete ·       │
@@ -172,8 +172,9 @@ detectors), report the resulting form table + a per-form change summary,
 
 Input: a draft s-expression written with **correct indentation and no
 (reliable) brackets** — the recovery technique the clojure-parinfer skill
-prescribes. The tool runs the parindent-style **indent mode** of the parinfer
-engine and returns:
+prescribes. The tool runs a built-in **indent mode** (parinfer-style
+paren-trail inference implemented in-tool, on top of the same
+string/comment/char/regex-aware scanner used elsewhere) and returns:
 
 ```json
 { "ok": true, "op": "materialize",
@@ -238,18 +239,29 @@ make-widget (line 28–101) — intended?"` and decides.
 
 ## 7. Rust implementation notes
 
-- **Engine:** the `parinfer` crate — the exact engine inside parinfer-rust
-  (no JVM, no new parser to trust). Paren mode for all file/content parsing.
-  Top-level forms = maximal depth-0 balanced ranges over the token stream;
-  line/col from the engine's `Span`s. If the crate's parse-tree API proves
-  insufficient for boundary extraction, fall back to a depth-counter over the
-  token stream — the paren-mode token sequence is sufficient; the *requirement*
-  is exact byte ranges + line/col, not the API.
+- **Engine:** `tree-sitter` + the `tree-sitter-clojure` grammar (oakmac).
+  *Decision log:* the original proposal named "the `parinfer` crate — the
+  exact engine inside parinfer-rust"; that crate does not exist as a usable
+  parse API (parinfer-rust is an application, and its transformation pipeline
+  is not importable as a syntax tree). tree-sitter is the better foundation
+  anyway: byte-exact ranges and line/col for free, a real Clojure grammar
+  (strings, regex/char literals, metadata, reader conditionals and `#_` are
+  handled by the grammar rather than hand-rolled scanning), and graceful
+  error recovery — `has_error()` plus ERROR/MISSING nodes are the paren-mode
+  well-formedness check (I1). Top-level forms = the grammar's top-level
+  children (comments and `#_` discards excluded from the table; their bytes
+  are preserved as gap bytes). Nesting detectors run as an ancestor-stack
+  walk over the tree, so a bracket-balanced-but-wrong-shape file (F1) parses
+  cleanly and is caught by *shape*, not by parse failure.
+- **materialize** implements parinfer indent-mode semantics (dedent below an
+  open bracket's column closes its paren trail at the end of the previous
+  line; EOF closes the rest) on top of a shared literal-aware scanner;
+  output is a labeled candidate, never applied.
 - **Hashing:** `blake3` over exact form bytes (and file bytes for
   `--expect-file` / `generation`).
 - **No evaluation, no I/O beyond the target file.** No Clojure interop, no
   plugin loading. Reader macros (`#(...)`, etc.) are tokens to the
-  engine; they are never executed. This is a hard, reviewable property of the
+  grammar; they are never executed. This is a hard, reviewable property of the
   dependency set.
 - **Atomic write** per I1 (temp+rename+fsync, same-directory temp file).
 - **Output:** `serde_json`; human mode is a thin formatter over the same
@@ -262,7 +274,7 @@ make-widget (line 28–101) — intended?"` and decides.
   cljform/
   ├── Cargo.toml
   ├── src/main.rs        # arg parsing (clap), dispatch, JSON envelope
-  ├── src/parser.rs      # parinfer wrapper, form table build
+  ├── src/parser.rs      # tree-sitter wrapper, form table build
   ├── src/ops/{forms,get,check,edit,insert,delete,materialize}.rs
   ├── src/invariants.rs  # I1–I6 + detectors
   └── tests/{golden, property, fuzz, regression}/
@@ -381,14 +393,15 @@ closer misplaced. Two outcomes, both safe:
 
 | M | Scope | Acceptance |
 |---|-------|------------|
-| **M1** (read-only) | `forms`, `get`, `check` + golden tests + perf | golden tables stable across two parinfer crate versions; 1,100-line file `check` < 50 ms |
+| **M1** (read-only) | `forms`, `get`, `check` + golden tests + perf | golden tables stable across repeated runs; grammar pinned via Cargo.lock; 1,100-line file `check` < 50 ms |
 | **M2** (mutation) | `edit`, `insert`, `delete`, I1–I6, detectors, atomic writes, property/fuzz/regression suites | all §7 tests green; **regression test `swallowed_defest` fires D1 with the exact line range on its fixture** |
 | **M3** (wrapper) | extension + 7 tools + guard hook + prompt note; subagent inheritance check; dogfood: redo a representative multi-file one-line schema change across several files, plus one function-body replacement, through the tools on a scratch branch | dogfood diff byte-matches the hand-done equivalent changes; guard demonstrably reports a lost form when a deliberately-broken `edit` is made |
 | **M4** (draft, optional) | `materialize` + detector tuning + `CLJFORM_BIN` polish | the skill's indent-mode recovery is a single `clj-draft` call |
 
 Cross-cutting acceptance (always): a `cargo clippy -D warnings` clean build;
-no dependencies beyond `parinfer`, `clap`, `serde_json`, `blake3`,
-`tempfile` (+ test crates); MIT license, matching parinfer-rust.
+no dependencies beyond `tree-sitter`, `tree-sitter-clojure`, `clap`,
+`serde`/`serde_json`, `blake3`, `tempfile` (+ test crates); MIT license,
+matching parinfer-rust.
 
 ## 12. Open questions
 
@@ -422,3 +435,43 @@ cljform converts its mechanical parts into *enforcement*:
 | "never use smart mode" | preserved: inference exists only as explicit, labeled `materialize` |
 | "kondo/cljfmt are the bracket-type/style gates" | unchanged; cljform deliberately defers to them (I2 keeps their input stable) |
 | "verify registered test counts after adding deftests" | `forms` `contains` summary at edit time; the test runner's registered-test count remains the runtime gate |
+
+## 14. Implementation addendum (as built)
+
+Deviations from the letter of this spec, chosen deliberately during
+implementation ("robust and foolproof" outranks the original friction-first
+design):
+
+- **Repair beats refusal.** The "content must be exactly one form" gate and
+  the hard generation stop are gone. Content is normalized (markdown fences
+  stripped, edges trimmed) and unbalanced brackets are repaired by
+  indent-mode inference when unambiguous — with a reported diff. Only
+  structurally ambiguous content is refused (exit 1, line/col, nothing
+  written). Comments-only/empty content is still rejected (interpolation
+  accidents).
+- **`--expect` is advisory by default.** A stale address is re-aimed by hash
+  when the expected form is still uniquely findable; `--strict` restores the
+  hard stop (exit 3).
+- **Detectors:** D1's host set is wide (all executable-scope heads, matched
+  by base name so `clojure.test/deftest` is caught); former D4 merged into
+  D1 (the message names the host). One warning per offending node,
+  innermost host.
+- **Engine:** tree-sitter + tree-sitter-clojure (§7 decision log). All tree
+  walking runs on a 64 MB-stack worker thread; 50k-deep data parses in
+  ~0.3 s. BOMs are stripped for analysis and re-prepended on write.
+- **Splice hardening:** trailing-comment content gets a newline before a
+  same-line neighbor (the neighbor cannot be commented out); delete seams
+  keep attached comments with their surviving line.
+- **Ops:** `edit` absorbed insert/delete via `--mode` (replace | insert-after
+  | insert-before | append | prepend | delete) and accepts multi-form
+  content (I3 generalized to an N-form allowed-change window).
+- **Wrapper:** tools are `clj_forms`/`clj_edit` (two tools, not seven);
+  content passes via `--content-file` (pi exec has no stdin). Guard hook and
+  prompt note as specced. Builtin subagents don't inherit extension tools
+  (strict allowlists) but the guard hook fires for them; a
+  `clojure-worker` user agent ships with the clj tools allowed.
+- **Tests:** 48 green (cli, golden, repair, adversarial, fuzz, F1
+  regression); `cargo clippy -D warnings` clean; release `check` on a
+  1,081-line file < 10 ms. Dogfooded end-to-end by a local model via the
+  wrapper (4 tasks, tests green, shape reports binding) including a live
+  bracket-mistake → precise-refusal → self-correction cycle.
