@@ -946,12 +946,17 @@ fn run_edit(
                             code: "patch-not-found",
                             line: Some(target.form.line[0]),
                             col: None,
+                            // Hand back the exact form bytes: the dominant
+                            // failure is oldText re-typed from a sed/cat read,
+                            // and this makes recovery one call, no clj_get.
                             message: format!(
-                                "--old-text not found inside form {form_label} (lines {}–{}); occurrences elsewhere in the file do not count",
-                                target.form.line[0], target.form.line[1]
+                                "--old-text not found inside form {form_label} (lines {}–{}); occurrences elsewhere in the file do not count\n\nexact form bytes (copy oldText from these):\n{}",
+                                target.form.line[0],
+                                target.form.line[1],
+                                String::from_utf8_lossy(form_bytes)
                             ),
                             hint: Some(
-                                "fetch the exact form bytes first (cljform get / clj_get) and patch against them"
+                                "use the exact bytes above verbatim; only re-fetch with clj_get if the file changed since you read it"
                                     .into(),
                             ),
                             suggestions: None,

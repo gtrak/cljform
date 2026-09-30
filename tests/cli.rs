@@ -384,6 +384,11 @@ fn patch_mode_surgical_replacement() {
     );
     assert_eq!(code, 3, "(ns is not inside the big form: {d})");
     assert_eq!(d["error"]["code"], "patch-not-found");
+    // The error carries the exact form bytes, so recovery needs no clj_get.
+    assert!(
+        d["error"]["message"].as_str().unwrap().contains("(let [a 1]"),
+        "form bytes embedded: {d}"
+    );
 
     // Ambiguous within the form.
     let (code, d, _) = run(

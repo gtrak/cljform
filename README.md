@@ -31,7 +31,7 @@ cljform [--json|--human] <op> …
 | `get <file> [--addr N\|--name sym]` | One form's exact bytes + metadata. Names are extracted for var-defining `def…` heads (`defn`, `defapifn`, …; not `defmethod`, which extends an existing multimethod) |
 | `check [file]` | Parse + table + nesting warnings (file or stdin) |
 | `edit <file> --name s\|--addr N [--mode M] [--content C\|--content-file F] [--repair]` | Whole-form edit; modes `replace` (default), `insert-after` (`--after`, 0=before first), `insert-before` (`--before`), `append`, `prepend`, `delete`. `--repair` allows a guessed mid-file dedent closure |
-| `edit <file> --name s\|--addr N --mode patch --old-text T [--new-text U]` | Surgical text patch inside one form: `T` must occur exactly once in the form's byte range and never cross its boundary; `U` (default empty) replaces it. Bytes outside the match are untouched; no bracket repair, but I1–I3 still gate the write |
+| `edit <file> --name s\|--addr N --mode patch --old-text T [--new-text U]` | Surgical text patch inside one form: `T` must occur exactly once in the form's byte range and never cross its boundary; `U` (default empty) replaces it. Bytes outside the match are untouched; no bracket repair, but I1–I3 still gate the write. A mismatch error returns the form's **exact bytes**, so recovery needs no `clj_get` round-trip |
 | `materialize --content C` | Indent-mode bracket completion → labeled candidate + diff (never writes). Completes missing **closers** implied by indentation; it does not invent missing openers, so a fully bracket-less draft comes back unchanged with a note |
 
 Exit codes: `0` ok · `1` parse/structure failure (nothing written) · `2`

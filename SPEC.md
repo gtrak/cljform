@@ -495,7 +495,10 @@ design):
   form's byte range, must occur exactly once, never crosses the boundary;
   full I1–I3 + guard pipeline still gates the write. No repair in patch
   mode — a bracket-breaking patch is refused (exit 1), not silently fixed.
-  Strictness is the point: the error was granularity, not safety. Sub-form
+  A `patch-not-found` error returns the form's **exact bytes** (the dominant
+  failure is `oldText` re-typed from a `sed`/`cat` read), so recovery is one
+  call with no `clj_get` round-trip. Strictness is the point: the error was
+  granularity, not safety. Sub-form
   path addressing (§10) remains reserved for v2.
 - **Wrapper:** tools are `clj_forms`/`clj_get`/`clj_edit`/`clj_draft`;
   content passes via `--content-file` (pi exec has no stdin). Guard hook and
