@@ -269,6 +269,36 @@ fn materialize_bracketless_draft_is_not_invented() {
 }
 
 #[test]
+fn insert_separates_forms_with_a_blank_line() {
+    let (_p, f) = fresh("spacing.clj");
+    std::fs::write(&f, "(ns t)\n\n(def a 1)\n").unwrap();
+    let (code, d, _) = run(
+        &["edit", &f, "--mode", "append", "--content", "(defn f [x] x)", "--json"],
+        None,
+    );
+    assert_eq!(code, 0, "{d}");
+    assert_eq!(
+        std::fs::read_to_string(&f).unwrap(),
+        "(ns t)\n\n(def a 1)\n\n(defn f [x] x)\n"
+    );
+
+    // insert-after must not split a same-line trailing comment from its form.
+    std::fs::write(&f, "(ns t)\n\n(def a 1) ; keep me\n\n(def b 2)\n").unwrap();
+    let (code, d, _) = run(
+        &[
+            "edit", &f, "--mode", "insert-after", "--after", "2", "--content",
+            "(defn g [x] x)", "--json",
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "{d}");
+    assert_eq!(
+        std::fs::read_to_string(&f).unwrap(),
+        "(ns t)\n\n(def a 1) ; keep me\n\n(defn g [x] x)\n\n(def b 2)\n"
+    );
+}
+
+#[test]
 fn materialize_flags_unterminated_fence() {
     // materialize is the explicit inference tool, so it still infers — but it
     // must say the draft looks truncated rather than resolve silently.

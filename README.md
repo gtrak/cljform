@@ -114,7 +114,7 @@ see SPEC.md §14.
 
 ```
 cargo install --path .              # binary → ~/.cargo/bin/cljform
-cargo test                          # 59 tests: cli, golden, repair,
+cargo test                          # cli, golden, repair,
                                     # adversarial, fuzz, F1 regression
 ```
 

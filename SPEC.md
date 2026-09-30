@@ -514,8 +514,8 @@ design):
   Metadata (`^:malli/always`, `^:private`, type hints) was already skipped
   correctly; only the variable symbol is taken. Did-you-mean ranks exact and
   substring matches above edit distance.
-- **Tests:** 59 green (cli, golden, repair, adversarial, fuzz, F1
-  regression); `cargo clippy -D warnings` clean; release `check` on a
+- **Tests:** the full suite (cli, golden, repair, adversarial, fuzz, F1
+  regression) is green; `cargo clippy -D warnings` clean; release `check` on a
   1,081-line file < 10 ms. Dogfooded end-to-end by a local model via the
   wrapper (4 tasks, tests green, shape reports binding) including a live
   bracket-mistake → precise-refusal → self-correction cycle.

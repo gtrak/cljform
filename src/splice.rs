@@ -44,6 +44,13 @@ pub fn apply(bytes: &[u8], forms: &[Form], splice: &Splice) -> Vec<u8> {
                 n if n >= forms.len() => forms.last().map(|f| f.end_byte).unwrap_or(bytes.len()),
                 n => forms[n - 1].end_byte,
             };
+            // Inserting "after form N" means after that form's whole line, so
+            // a same-line trailing comment stays attached to its form.
+            let pos = if *after == 0 {
+                pos
+            } else {
+                after_anchor_line(bytes, pos)
+            };
             insert_at(bytes, pos, content)
         }
         Splice::InsertBefore { before, content } => {
@@ -87,27 +94,63 @@ pub fn apply(bytes: &[u8], forms: &[Form], splice: &Splice) -> Vec<u8> {
     }
 }
 
-fn insert_at(bytes: &[u8], pos: usize, content: &[u8]) -> Vec<u8> {
-    let before_sep: &[u8] = if pos > 0 && bytes[pos - 1] != b'\n' {
-        b"\n"
-    } else {
-        b""
+/// Move past the rest of the anchor form's line when that tail is only
+/// whitespace and/or a trailing comment (so the line ends cleanly and a
+/// same-line comment stays with its form). If another form shares the line,
+/// return `pos` unchanged so the insertion lands right after the anchor.
+fn after_anchor_line(bytes: &[u8], pos: usize) -> usize {
+    let rest = &bytes[pos..];
+    let Some(nl) = rest.iter().position(|&b| b == b'\n') else {
+        return pos; // no newline: at EOF, nothing to skip
     };
-    // After the inserted content: newline unless one is already there or we
-    // are appending at EOF (then terminate the file with one).
-    let at_eof = pos >= bytes.len();
-    let after_sep: &[u8] = if at_eof || (pos < bytes.len() && bytes[pos] != b'\n') {
-        b"\n"
-    } else {
+    let line = &rest[..nl];
+    let code = line.iter().find(|&&b| b != b' ' && b != b'\t').copied();
+    match code {
+        None | Some(b';') => pos + nl + 1,
+        Some(_) => pos,
+    }
+}
+
+fn trailing_newlines(bytes: &[u8]) -> usize {
+    bytes.iter().rev().take_while(|&&b| b == b'\n').count()
+}
+
+fn leading_newlines(bytes: &[u8]) -> usize {
+    bytes.iter().take_while(|&&b| b == b'\n').count()
+}
+
+fn insert_at(bytes: &[u8], pos: usize, content: &[u8]) -> Vec<u8> {
+    // Separate the inserted block from its neighbours with a blank line
+    // (top-level Clojure convention). Whitespace only: no form's bytes move.
+    let before_sep: &[u8] = if pos == 0 {
         b""
+    } else {
+        match trailing_newlines(&bytes[..pos]) {
+            0 => b"\n\n",
+            1 => b"\n",
+            _ => b"",
+        }
+    };
+    let at_eof = pos >= bytes.len();
+    let after_sep: &[u8] = if at_eof {
+        b""
+    } else {
+        match leading_newlines(&bytes[pos..]) {
+            0 => b"\n\n",
+            1 => b"\n",
+            _ => b"",
+        }
     };
     let mut out =
-        Vec::with_capacity(bytes.len() + content.len() + before_sep.len() + after_sep.len());
+        Vec::with_capacity(bytes.len() + content.len() + before_sep.len() + after_sep.len() + 1);
     out.extend_from_slice(&bytes[..pos]);
     out.extend_from_slice(before_sep);
     out.extend_from_slice(content);
     out.extend_from_slice(after_sep);
     out.extend_from_slice(&bytes[pos..]);
+    if at_eof {
+        out.push(b'\n');
+    }
     out
 }
 
