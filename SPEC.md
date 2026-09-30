@@ -502,7 +502,16 @@ design):
   prompt note as specced. Builtin subagents don't inherit extension tools
   (strict allowlists) but the guard hook fires for them; a
   `clojure-worker` user agent ships with the clj tools allowed.
-- **Tests:** 57 green (cli, golden, repair, adversarial, fuzz, F1
+- **Definition heads are recognized by prefix, not a fixed list.** Name
+  extraction (and D2) treats any `def…`-prefixed head as a definition:
+  `defn`/`defmacro`/`defrecord` and project macros like `defapifn`,
+  `defstate`, `defroutes`. Only the following symbol names the var, so
+  metadata (`^:malli/always`, `^:private`, type hints) is naturally skipped.
+  A small denylist (`default`, `defer`, `defensive`, `defmethod` — the last
+  attaches to an existing multimethod rather than defining one) avoids
+  inventing names. Did-you-mean ranks exact and substring matches above edit
+  distance.
+- **Tests:** 58 green (cli, golden, repair, adversarial, fuzz, F1
   regression); `cargo clippy -D warnings` clean; release `check` on a
   1,081-line file < 10 ms. Dogfooded end-to-end by a local model via the
   wrapper (4 tasks, tests green, shape reports binding) including a live

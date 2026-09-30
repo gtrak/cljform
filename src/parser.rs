@@ -14,12 +14,19 @@ use tree_sitter::{Node, Parser, Tree};
 
 use crate::invariants::{self, DetectorWarning};
 
-/// Heads whose second top-level `sym_lit` child names the defined var.
-/// Compared against the *base* name (portion after any `ns/` qualifier).
-pub const DEF_HEADS: &[&str] = &[
-    "def", "defn", "defn-", "defmacro", "defonce", "defmulti", "defprotocol",
-    "definterface", "deftype", "defrecord", "defstruct", "deftest", "definline",
-];
+/// `def…`-prefixed symbols that are NOT definition forms, so prefix matching
+/// does not invent names for them. (`defmethod` attaches a method to an
+/// existing multimethod; naming it would collide with the `defmulti`.)
+const DEF_FALSE_FRIENDS: &[&str] = &["default", "defer", "defensive", "defmethod"];
+
+/// Is `base` a definition-like head? Clojure convention is that `def`-prefixed
+/// symbols define the following var: `defn`, `defmacro`, `defrecord`,
+/// `deftest`, and project macros like `defapifn`/`defstate`/`defroutes`.
+/// Prefix matching means custom def-macros get names with no configuration;
+/// a small denylist rejects common non-def identifiers.
+pub fn is_def_head(base: &str) -> bool {
+    base.starts_with("def") && !DEF_FALSE_FRIENDS.contains(&base)
+}
 
 /// Kinds whose subtree is inert for nesting detectors.
 const INERT_KINDS: &[&str] = &[
@@ -197,7 +204,7 @@ fn sym_text(sym: Node, bytes: &[u8]) -> String {
 /// Var name for def-like forms: the second `sym_lit` child (metadata nests
 /// inside `sym_lit`, so it is skipped naturally; docstrings are not syms).
 pub fn def_name(node: Node, head: &str, bytes: &[u8]) -> Option<String> {
-    if !DEF_HEADS.contains(&base_head(head)) {
+    if !is_def_head(base_head(head)) {
         return None;
     }
     let mut cursor = node.walk();

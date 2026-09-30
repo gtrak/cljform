@@ -92,16 +92,22 @@ pub fn run_detectors(root: &Node, forms: &[Form], bytes: &[u8]) -> Vec<DetectorW
         }
         // Innermost enclosing host that forbids this head (by base name).
         for (host_head, host_node) in stack.iter().rev() {
-            let Some((id, _hosts, _forbidden)) = RULES.iter().find(|(_, hosts, forb)| {
-                forb.iter().any(|f| parser::head_matches(&head, f))
-                    && hosts
-                        .iter()
-                        .any(|h| parser::head_matches(host_head, h))
-            }) else {
+            let mut matched: Option<(&str, Node)> = None;
+            for (id, hosts, forb) in RULES.iter() {
+                // D2 is "accidental local def": any def-like head counts, so a
+                // project def-macro (defapifn, defstate, …) is caught too.
+                let forbidden = forb.iter().any(|f| parser::head_matches(&head, f))
+                    || (*id == "D2" && parser::is_def_head(parser::base_head(&head)));
+                if forbidden && hosts.iter().any(|h| parser::head_matches(host_head, h)) {
+                    matched = Some((*id, *host_node));
+                    break;
+                }
+            }
+            let Some((id, host_node)) = matched else {
                 continue;
             };
             let host_base = parser::base_head(host_head);
-            let host_name = parser::def_name(*host_node, host_base, bytes);
+            let host_name = parser::def_name(host_node, host_base, bytes);
             let host_label = match host_name {
                 Some(n) => format!("{host_base} {n}"),
                 None => host_base.to_string(),

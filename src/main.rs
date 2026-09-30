@@ -387,19 +387,31 @@ fn read_content(
 }
 
 fn suggestions_for(forms: &[Form], query: &str) -> Vec<Suggestion> {
-    let mut scored: Vec<(usize, &Form)> = forms
+    let q = query.to_lowercase();
+    // Rank exact > substring (either direction) > edit distance, so a form
+    // whose name literally contains the query is never buried by closer-
+    // spelling strangers.
+    let mut scored: Vec<(u8, usize, &Form)> = forms
         .iter()
         .filter_map(|f| {
-            f.name
-                .as_ref()
-                .map(|n| (levenshtein(&n.to_lowercase(), &query.to_lowercase()), f))
+            f.name.as_ref().map(|n| {
+                let nl = n.to_lowercase();
+                let rank = if nl == q {
+                    0
+                } else if nl.contains(&q) || q.contains(&nl) {
+                    1
+                } else {
+                    2
+                };
+                (rank, levenshtein(&nl, &q), f)
+            })
         })
         .collect();
-    scored.sort_by_key(|(d, _)| *d);
+    scored.sort_by_key(|a| (a.0, a.1));
     scored
         .into_iter()
         .take(3)
-        .map(|(_, f)| Suggestion {
+        .map(|(_, _, f)| Suggestion {
             addr: f.addr,
             kind: f.kind.clone(),
             name: f.name.clone(),

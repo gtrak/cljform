@@ -115,3 +115,59 @@ fn get_by_name_roundtrips_exact_bytes() {
     assert_eq!(form.matches('(').count(), form.matches(')').count());
     assert_eq!(row["kind"], "defn-");
 }
+
+#[test]
+fn custom_def_macro_heads_are_named_and_targeted() {
+    // Regression: `defapifn ^:malli/always get-service` reported name: null
+    // because only a fixed head list was recognized — so the recommended
+    // name-first targeting mode failed on project def-macros, and did-you-mean
+    // could not see the form either.
+    let dir = std::env::temp_dir().join("cljform-golden");
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("defmacros.clj");
+    std::fs::write(
+        &p,
+        "(ns m)\n\n(defapifn ^:malli/always get-service :- Out [s] s)\n\n(defrecord GetServiceInput [x])\n\n(defn other [x] x)\n\n(defn bad []\n  (defapifn ^:malli/always nested [x] x))\n",
+    )
+    .unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_cljform"))
+        .args(["forms", p.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    let d: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let f = &d["forms"][1];
+    assert_eq!(f["kind"], "defapifn");
+    assert_eq!(f["name"], "get-service", "def-macro name extracted: {f}");
+
+    // Name targeting now resolves it.
+    let out = Command::new(env!("CARGO_BIN_EXE_cljform"))
+        .args(["get", p.to_str().unwrap(), "--name", "get-service", "--json"])
+        .output()
+        .unwrap();
+    let d: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(d["result"]["addr"], 2, "{d}");
+
+    // A typo ranks the form that contains the query above unrelated names.
+    let out = Command::new(env!("CARGO_BIN_EXE_cljform"))
+        .args(["get", p.to_str().unwrap(), "--name", "get-servce", "--json"])
+        .output()
+        .unwrap();
+    let d: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(d["error"]["suggestions"][0]["name"], "get-service", "{d}");
+
+    // D2 treats a nested def-macro as an accidental local def.
+    let out = Command::new(env!("CARGO_BIN_EXE_cljform"))
+        .args(["check", p.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    let d: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(
+        d["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["id"] == "D2" && w["message"].as_str().unwrap().contains("nested")),
+        "{d}"
+    );
+}

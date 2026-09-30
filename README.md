@@ -28,7 +28,7 @@ cljform [--json|--human] <op> …
 | Op | Purpose |
 |----|---------|
 | `forms <file>` | Top-level form table: addr, kind, name, lines, blake3, `contains` shape summary, D-warnings |
-| `get <file> [--addr N\|--name sym]` | One form's exact bytes + metadata |
+| `get <file> [--addr N\|--name sym]` | One form's exact bytes + metadata. Names are extracted for any `def`-prefixed head, so project macros (`defapifn`, `defstate`, …) are name-targetable |
 | `check [file]` | Parse + table + nesting warnings (file or stdin) |
 | `edit <file> --name s\|--addr N [--mode M] [--content C\|--content-file F] [--repair]` | Whole-form edit; modes `replace` (default), `insert-after` (`--after`, 0=before first), `insert-before` (`--before`), `append`, `prepend`, `delete`. `--repair` allows a guessed mid-file dedent closure |
 | `edit <file> --name s\|--addr N --mode patch --old-text T [--new-text U]` | Surgical text patch inside one form: `T` must occur exactly once in the form's byte range and never cross its boundary; `U` (default empty) replaces it. Bytes outside the match are untouched; no bracket repair, but I1–I3 still gate the write |
@@ -60,7 +60,7 @@ truncated paste — exit 1, `truncated-content`), and any repair under
 | ID | Fires on |
 |----|----------|
 | D1 | `deftest` nested inside executable scope (`defn`, `let`, `fn`, `try`, threading macros, … — hosts matched by base name, so `clojure.test/deftest` is caught too) |
-| D2 | `def`/`defn`/… nested inside another def's body (accidental local def) |
+| D2 | any `def…` head (`def`, `defn`, project macros like `defapifn`/`defstate`) nested inside another def's body (accidental local def) |
 | D3 | `ns` not the first form |
 
 Quotes, syntax quotes, regex/char literals, `(comment …)` bodies, `#_`
@@ -114,7 +114,7 @@ see SPEC.md §14.
 
 ```
 cargo install --path .              # binary → ~/.cargo/bin/cljform
-cargo test                          # 57 tests: cli, golden, repair,
+cargo test                          # 58 tests: cli, golden, repair,
                                     # adversarial, fuzz, F1 regression
 ```
 
