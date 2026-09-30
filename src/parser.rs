@@ -14,18 +14,26 @@ use tree_sitter::{Node, Parser, Tree};
 
 use crate::invariants::{self, DetectorWarning};
 
-/// `def…`-prefixed symbols that are NOT definition forms, so prefix matching
-/// does not invent names for them. (`defmethod` attaches a method to an
-/// existing multimethod; naming it would collide with the `defmulti`.)
-const DEF_FALSE_FRIENDS: &[&str] = &["default", "defer", "defensive", "defmethod"];
+/// `def…`-prefixed symbols that are not definition forms at all, so prefix
+/// matching does not treat them as defs.
+const NON_DEF_HEADS: &[&str] = &["default", "defer", "defensive"];
 
-/// Is `base` a definition-like head? Clojure convention is that `def`-prefixed
-/// symbols define the following var: `defn`, `defmacro`, `defrecord`,
-/// `deftest`, and project macros like `defapifn`/`defstate`/`defroutes`.
-/// Prefix matching means custom def-macros get names with no configuration;
-/// a small denylist rejects common non-def identifiers.
-pub fn is_def_head(base: &str) -> bool {
-    base.starts_with("def") && !DEF_FALSE_FRIENDS.contains(&base)
+/// Is `base` definition-like? Clojure convention is that `def`-prefixed symbols
+/// are definitions: `defn`, `defmacro`, `defrecord`, `deftest`, project macros
+/// like `defapifn`/`defstate`/`defroutes`, and `defmethod` (it registers a
+/// method). A small denylist rejects common English words that merely start
+/// with `def`.
+pub fn is_def_like(base: &str) -> bool {
+    base.starts_with("def") && !NON_DEF_HEADS.contains(&base)
+}
+
+/// Does this head DEFINE A VAR? Then the following symbol is the var name.
+/// `defmethod` is definition-like but extends an existing multimethod — the
+/// symbol after it names a var defined by `defmulti`, not by this form — so it
+/// is excluded from naming (otherwise `--name <multimethod>` would be
+/// ambiguous between the `defmulti` and every method).
+pub fn defines_var(base: &str) -> bool {
+    is_def_like(base) && base != "defmethod"
 }
 
 /// Kinds whose subtree is inert for nesting detectors.
@@ -204,7 +212,7 @@ fn sym_text(sym: Node, bytes: &[u8]) -> String {
 /// Var name for def-like forms: the second `sym_lit` child (metadata nests
 /// inside `sym_lit`, so it is skipped naturally; docstrings are not syms).
 pub fn def_name(node: Node, head: &str, bytes: &[u8]) -> Option<String> {
-    if !is_def_head(base_head(head)) {
+    if !defines_var(base_head(head)) {
         return None;
     }
     let mut cursor = node.walk();

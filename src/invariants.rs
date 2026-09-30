@@ -94,10 +94,10 @@ pub fn run_detectors(root: &Node, forms: &[Form], bytes: &[u8]) -> Vec<DetectorW
         for (host_head, host_node) in stack.iter().rev() {
             let mut matched: Option<(&str, Node)> = None;
             for (id, hosts, forb) in RULES.iter() {
-                // D2 is "accidental local def": any def-like head counts, so a
-                // project def-macro (defapifn, defstate, …) is caught too.
+                // D2 is "accidental local def": any definition-like head
+                // counts, so `defmethod` and project def-macros are caught too.
                 let forbidden = forb.iter().any(|f| parser::head_matches(&head, f))
-                    || (*id == "D2" && parser::is_def_head(parser::base_head(&head)));
+                    || (*id == "D2" && parser::is_def_like(parser::base_head(&head)));
                 if forbidden && hosts.iter().any(|h| parser::head_matches(host_head, h)) {
                     matched = Some((*id, *host_node));
                     break;

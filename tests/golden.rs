@@ -127,7 +127,7 @@ fn custom_def_macro_heads_are_named_and_targeted() {
     let p = dir.join("defmacros.clj");
     std::fs::write(
         &p,
-        "(ns m)\n\n(defapifn ^:malli/always get-service :- Out [s] s)\n\n(defrecord GetServiceInput [x])\n\n(defn other [x] x)\n\n(defn bad []\n  (defapifn ^:malli/always nested [x] x))\n",
+        "(ns m)\n\n(defapifn ^:malli/always get-service :- Out [s] s)\n\n(defrecord GetServiceInput [x])\n\n(defn other [x] x)\n\n(defn bad []\n  (defapifn ^:malli/always nested [x] x))\n\n(defn also-bad []\n  (defmethod handle :x [m] m))\n",
     )
     .unwrap();
 
@@ -156,18 +156,53 @@ fn custom_def_macro_heads_are_named_and_targeted() {
     let d: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(d["error"]["suggestions"][0]["name"], "get-service", "{d}");
 
-    // D2 treats a nested def-macro as an accidental local def.
+    // D2 treats a nested def-macro as an accidental local def — and a nested
+    // defmethod is def-like too (it registers a method as a side effect), even
+    // though it defines no var and so is never name-extracted.
     let out = Command::new(env!("CARGO_BIN_EXE_cljform"))
         .args(["check", p.to_str().unwrap(), "--json"])
         .output()
         .unwrap();
     let d: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let warnings = d["warnings"].as_array().unwrap();
     assert!(
-        d["warnings"]
-            .as_array()
-            .unwrap()
+        warnings
             .iter()
             .any(|w| w["id"] == "D2" && w["message"].as_str().unwrap().contains("nested")),
         "{d}"
     );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w["id"] == "D2" && w["message"].as_str().unwrap().contains("defmethod")),
+        "nested defmethod must be D2: {d}"
+    );
+    // ...but it is not name-extracted (it would collide with the defmulti).
+    let out = Command::new(env!("CARGO_BIN_EXE_cljform"))
+        .args(["forms", p.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    let d: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(d["forms"][1]["name"], "get-service");
+}
+
+#[test]
+fn defmethod_does_not_define_a_var_name() {
+    // `--name dispatch` must resolve to the defmulti, unambiguously, even with
+    // defmethods present.
+    let dir = std::env::temp_dir().join("cljform-golden");
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("multimethod.clj");
+    std::fs::write(
+        &p,
+        "(ns m)\n\n(defmulti dispatch :type)\n\n(defmethod dispatch :a [x] x)\n\n(defmethod dispatch :b [x] x)\n",
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_cljform"))
+        .args(["get", p.to_str().unwrap(), "--name", "dispatch", "--json"])
+        .output()
+        .unwrap();
+    let d: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(d["ok"], true, "{d}");
+    assert_eq!(d["result"]["kind"], "defmulti");
 }

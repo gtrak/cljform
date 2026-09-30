@@ -502,16 +502,19 @@ design):
   prompt note as specced. Builtin subagents don't inherit extension tools
   (strict allowlists) but the guard hook fires for them; a
   `clojure-worker` user agent ships with the clj tools allowed.
-- **Definition heads are recognized by prefix, not a fixed list.** Name
-  extraction (and D2) treats any `def…`-prefixed head as a definition:
-  `defn`/`defmacro`/`defrecord` and project macros like `defapifn`,
-  `defstate`, `defroutes`. Only the following symbol names the var, so
-  metadata (`^:malli/always`, `^:private`, type hints) is naturally skipped.
-  A small denylist (`default`, `defer`, `defensive`, `defmethod` — the last
-  attaches to an existing multimethod rather than defining one) avoids
-  inventing names. Did-you-mean ranks exact and substring matches above edit
-  distance.
-- **Tests:** 58 green (cli, golden, repair, adversarial, fuzz, F1
+- **Definition heads are recognized by prefix, not a fixed list**, and the
+  two uses are distinguished. **Definition-like** (for D2, "accidental local
+  def") is any `def…` head: `defn`, `defmacro`, `defmethod`, and project
+  macros like `defapifn`/`defstate`/`defroutes`; a small denylist (`default`,
+  `defer`, `defensive`) rejects English words that merely start with `def`.
+  **Var-defining** (for name extraction) is definition-like minus
+  `defmethod`: it extends an existing multimethod, so the symbol after it
+  names a var the `defmulti` defines — naming it would make
+  `--name <multimethod>` ambiguous between the `defmulti` and every method.
+  Metadata (`^:malli/always`, `^:private`, type hints) was already skipped
+  correctly; only the variable symbol is taken. Did-you-mean ranks exact and
+  substring matches above edit distance.
+- **Tests:** 59 green (cli, golden, repair, adversarial, fuzz, F1
   regression); `cargo clippy -D warnings` clean; release `check` on a
   1,081-line file < 10 ms. Dogfooded end-to-end by a local model via the
   wrapper (4 tasks, tests green, shape reports binding) including a live
