@@ -29,6 +29,12 @@ pub enum PrepareError {
     Unparseable(ParseError),
     /// Indent mode itself rejected the structure (mismatched brackets).
     Materialize(materialize::MaterializeError),
+    /// Content came from an opening markdown fence that was never closed:
+    /// almost certainly a truncated paste, so no repair is attempted.
+    TruncatedFence,
+    /// `--strict`: content is unbalanced and would have been repaired;
+    /// refusal instead, carrying the repair diff that was not applied.
+    RepairRefused { diff: String },
 }
 
 impl PrepareError {
@@ -47,6 +53,12 @@ impl PrepareError {
                 "content structure is ambiguous for bracket repair — line {} col {}: {}",
                 e.line, e.col, e.message
             ),
+            PrepareError::RepairRefused { .. } => "--strict: submitted content is unbalanced and would \
+                 have been repaired by indentation — refused instead"
+                .to_string(),
+            PrepareError::TruncatedFence => "content starts with a markdown fence that is never \
+                 closed — the paste looks truncated, so it was not repaired"
+                .to_string(),
         }
     }
 
@@ -54,24 +66,32 @@ impl PrepareError {
         match self {
             PrepareError::Unparseable(e) => Some((e.line, e.col)),
             PrepareError::Materialize(e) => Some((e.line, e.col)),
-            PrepareError::Empty => None,
+            PrepareError::Empty
+            | PrepareError::TruncatedFence
+            | PrepareError::RepairRefused { .. } => None,
         }
     }
 }
 
-/// Normalize raw content into spliceable, parseable bytes.
-pub fn prepare(raw: &str, allow_empty: bool) -> Result<Prepared, PrepareError> {
+/// Fence-strip and edge-trim only — no bracket inference. `materialize`
+/// must see the caller's real draft so its own indent-mode inference runs on
+/// it (running `prepare` first would repair the draft and mask the diff).
+/// Also reports whether the draft began with a markdown fence that was never
+/// closed (a likely truncated paste).
+pub fn normalize_draft(raw: &str) -> (String, Vec<String>, bool) {
     let mut notes = Vec::new();
-
-    // 1. Strip markdown code fences when present (agents paste them). A
-    //    missing closing fence (truncated paste) still yields the content.
-    let stripped = strip_fences(raw);
+    let (stripped, unterminated) = strip_fences(raw);
     if stripped.len() != raw.len() {
         notes.push("stripped markdown code fence".to_string());
     }
+    (stripped.trim().to_string(), notes, unterminated)
+}
 
-    // 2. Trim whitespace at both edges.
-    let text = stripped.trim();
+/// Normalize raw content into spliceable, parseable bytes.
+pub fn prepare(raw: &str, allow_empty: bool, strict: bool) -> Result<Prepared, PrepareError> {
+    // 1. Strip fences and trim edges.
+    let (text, mut notes, truncated_fence) = normalize_draft(raw);
+
     if text.is_empty() {
         if allow_empty {
             return Ok(Prepared {
@@ -85,25 +105,38 @@ pub fn prepare(raw: &str, allow_empty: bool) -> Result<Prepared, PrepareError> {
         return Err(PrepareError::Empty);
     }
 
-    // 3. Try as-is.
+    // 2. Try as-is.
     if let Ok(parsed) = parser::parse(text.as_bytes()) {
-        return finish(text, parsed.forms.len(), false, String::new(), notes);
+        return finish(&text, parsed.forms.len(), false, String::new(), notes);
     }
 
-    // 4. Repair via indent mode, then re-parse.
-    notes.push("content unbalanced; brackets repaired by indentation".to_string());
-    match materialize::indent_mode(text) {
+    // An unterminated opening fence means the paste was very likely cut off.
+    // Repairing truncated content is how a wrong form gets written, so refuse.
+    if truncated_fence {
+        return Err(PrepareError::TruncatedFence);
+    }
+
+    // 3. Unbalanced: indent-mode repair — unless `--strict` refuses it. A
+    //    non-repair (indent mode had nothing to add) is a plain parse error.
+    match materialize::indent_mode(&text) {
         Err(e) => Err(PrepareError::Materialize(e)),
-        Ok(repaired) => match parser::parse(repaired.as_bytes()) {
-            Ok(parsed) => {
-                let diff = materialize::unified_diff(text, &repaired, "submitted", "repaired");
-                finish(&repaired, parsed.forms.len(), true, diff, notes)
+        Ok(repaired) if repaired == text => {
+            Err(PrepareError::Unparseable(parser::parse(text.as_bytes()).expect_err("parse failed above")))
+        }
+        Ok(repaired) => {
+            let diff = materialize::unified_diff(&text, &repaired, "submitted", "repaired");
+            if strict {
+                return Err(PrepareError::RepairRefused { diff });
             }
-            // Repair didn't take: surface the direct parse error (more precise).
-            Err(_) => Err(PrepareError::Unparseable(
-                parser::parse(text.as_bytes()).expect_err("proven above"),
-            )),
-        },
+            notes.push("content unbalanced; brackets repaired by indentation".to_string());
+            match parser::parse(repaired.as_bytes()) {
+                Ok(parsed) => finish(&repaired, parsed.forms.len(), true, diff, notes),
+                // Repair didn't take: surface the direct parse error (more precise).
+                Err(_) => Err(PrepareError::Unparseable(
+                    parser::parse(text.as_bytes()).expect_err("parse failed above"),
+                )),
+            }
+        }
     }
 }
 
@@ -127,23 +160,25 @@ fn finish(
 }
 
 /// Strip markdown fences: remove an opening ``` / ~~~ line (with optional
-/// info string) and a matching closing line when present.
-fn strip_fences(raw: &str) -> String {
+/// info string) and a matching closing line when present. Returns the text
+/// and whether an opening fence had NO closing fence (possible truncation).
+fn strip_fences(raw: &str) -> (String, bool) {
     let text = raw.trim_start();
     let fence = if text.starts_with("```") {
         "```"
     } else if text.starts_with("~~~") {
         "~~~"
     } else {
-        return raw.to_string();
+        return (raw.to_string(), false);
     };
     let mut lines: Vec<&str> = text.split('\n').collect();
     lines.remove(0); // opening fence (possibly with info string)
     while lines.last().is_some_and(|l| l.trim().is_empty()) {
         lines.pop();
     }
-    if lines.last().is_some_and(|l| l.trim() == fence) {
+    let closed = lines.last().is_some_and(|l| l.trim() == fence);
+    if closed {
         lines.pop();
     }
-    lines.join("\n")
+    (lines.join("\n"), !closed)
 }

@@ -15,7 +15,8 @@ pub struct MaterializeError {
 
 struct OpenParen {
     ch: u8,
-    /// 0-based absolute column in the original draft.
+    /// 0-based column within its own line (line-relative, so it can be
+    /// compared against a line's indentation).
     col: usize,
 }
 
@@ -28,14 +29,11 @@ pub fn indent_mode(draft: &str) -> Result<String, MaterializeError> {
     }
 
     let mut stack: Vec<OpenParen> = Vec::new();
-    // Absolute byte offset of the start of the current line within the draft.
-    let mut line_start: usize = 0;
 
     for li in 0..lines.len() {
         let trimmed = lines[li].trim_start();
         // Blank and comment-only lines never close parens.
         if trimmed.is_empty() || trimmed.starts_with(';') {
-            line_start += lines[li].len() + 1;
             continue;
         }
         let line = lines[li].clone();
@@ -54,9 +52,6 @@ pub fn indent_mode(draft: &str) -> Result<String, MaterializeError> {
         if !to_close.is_empty() {
             if let Some(prev) = last_content_line(&lines, li) {
                 insert_closers(&mut lines, prev, &to_close);
-                // Line lengths upstream of `li` changed; shift line_start.
-                let added: usize = to_close.len();
-                line_start += added;
             }
         }
 
@@ -96,10 +91,7 @@ pub fn indent_mode(draft: &str) -> Result<String, MaterializeError> {
                         i += 2;
                     }
                     b'(' | b'[' | b'{' => {
-                        stack.push(OpenParen {
-                            ch: b,
-                            col: line_start + i,
-                        });
+                        stack.push(OpenParen { ch: b, col: i });
                         i += 1;
                     }
                     b')' | b']' | b'}' => {
@@ -139,7 +131,6 @@ pub fn indent_mode(draft: &str) -> Result<String, MaterializeError> {
                 },
             }
         }
-        line_start += lines[li].len() + 1;
     }
 
     // EOF: close everything still open at the end of the last content line.

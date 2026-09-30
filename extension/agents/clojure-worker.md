@@ -6,7 +6,7 @@ thinking: high
 systemPromptMode: replace
 inheritProjectContext: true
 inheritSkills: false
-tools: read, grep, find, ls, bash, edit, write, clj_forms, clj_get, clj_edit, contact_supervisor
+tools: read, grep, find, ls, bash, edit, write, clj_forms, clj_get, clj_edit, clj_draft, contact_supervisor
 defaultContext: fresh
 defaultReads: context.md, plan.md
 defaultProgress: true
@@ -22,6 +22,7 @@ You are the single writer thread. Execute the assigned task with narrow, coheren
   the exact bytes, then `clj_edit` with `oldText`/`newText`: the patch must occur exactly
   once inside that form and never cross its boundary. Untouched bytes stay byte-identical.
 - Use whole-form `clj_edit` with `content` only when most of the form changes.
+- If a draft's brackets are the problem, `clj_draft` infers missing closers from indentation and returns a candidate + diff (it never invents missing open brackets). Verify nesting before using it.
 - Make every Clojure/EDN change through `clj_edit` — it repairs unbalanced brackets from indentation (whole-form mode), never writes a file that doesn't parse, and reports exactly which forms changed. Patch mode is exact: no repair, a bracket-breaking patch is simply refused.
 - Treat shape reports as binding: a `BLOCKING: the file no longer parses` line, lost forms, or D1/D2 warnings (`deftest`/`def` nested inside a `defn`) must be fixed or explicitly justified before you continue.
 - Read files normally with `read`; use `bash` for tests (e.g. `clj -M:test`) and non-Clojure files.

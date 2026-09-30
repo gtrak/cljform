@@ -244,6 +244,47 @@ fn materialize_outputs_candidate_never_writes() {
 }
 
 #[test]
+fn materialize_keeps_body_inside_inner_form() {
+    // Regression: indent mode closed the inner form one line early (absolute
+    // vs line-relative columns), so the body escaped the let. Balance alone
+    // would not catch it; the candidate must nest correctly.
+    let (_c, d, _) = run(&["materialize", "--json"], Some("(defn f [x]\n  (let [a 1]\n    a"));
+    assert_eq!(d["ok"], true);
+    assert_eq!(
+        d["result"]["candidate"],
+        "(defn f [x]\n  (let [a 1]\n    a))"
+    );
+    assert!(d["result"]["diff"].as_str().unwrap().contains("+    a)"));
+}
+
+#[test]
+fn materialize_bracketless_draft_is_not_invented() {
+    // Conservative: a fully bracket-less draft is returned as-is with a note
+    // (a guessed bracketing is worse than an obvious no-op).
+    let draft = "defn f [x]\n  let [a 1]\n    a";
+    let (_c, d, _) = run(&["materialize", "--json"], Some(draft));
+    assert_eq!(d["ok"], true);
+    assert_eq!(d["result"]["candidate"], draft);
+    assert!(d["result"]["note"].as_str().unwrap().contains("does not invent"));
+}
+
+#[test]
+fn materialize_flags_unterminated_fence() {
+    // materialize is the explicit inference tool, so it still infers — but it
+    // must say the draft looks truncated rather than resolve silently.
+    let (_c, d, _) = run(
+        &["materialize", "--json"],
+        Some("```clojure\n(defn f [x]\n  (let [a 1]\n    a"),
+    );
+    assert_eq!(d["ok"], true);
+    assert_eq!(d["result"]["candidate"], "(defn f [x]\n  (let [a 1]\n    a))");
+    assert!(
+        d["notes"].as_array().unwrap().iter().any(|n| n.as_str().unwrap().contains("truncated")),
+        "{d}"
+    );
+}
+
+#[test]
 fn exit_codes_are_stable() {
     let (_p, f) = fresh("codes.clj");
     // 0: success

@@ -78,7 +78,8 @@ fn markdown_fence_stripped() {
 }
 
 #[test]
-fn truncated_fence_still_yields_content() {
+fn complete_content_with_unterminated_fence_is_accepted() {
+    // The code itself parses, so the dangling fence is harmless decoration.
     let p = fixture("r4.clj");
     let (code, d) = edit_content(
         p.to_str().unwrap(),
@@ -87,6 +88,23 @@ fn truncated_fence_still_yields_content() {
     );
     assert_eq!(code, 0, "{d}");
     assert_eq!(d["result"]["repaired"], false);
+}
+
+#[test]
+fn unterminated_fence_truncated_content_is_refused_not_repaired() {
+    // Regression: a fence that never closes + an unbalanced body means the
+    // paste was likely cut off. Repairing it commits a guessed form, which is
+    // worse than failing, so it is refused outright.
+    let p = fixture("r11.clj");
+    let before = std::fs::read_to_string(&p).unwrap();
+    let (code, d) = edit_content(
+        p.to_str().unwrap(),
+        "target",
+        "```clojure\n(defn target [x]\n  (let [y 2]\n    y",
+    );
+    assert_eq!(code, 1, "{d}");
+    assert_eq!(d["error"]["code"], "truncated-content");
+    assert_eq!(std::fs::read_to_string(&p).unwrap(), before, "nothing written");
 }
 
 #[test]
@@ -152,5 +170,61 @@ fn repair_multiple_missing_closers_across_levels() {
     let g: serde_json::Value = serde_json::from_slice(&get.stdout).unwrap();
     let form = g["result"]["form"].as_str().unwrap();
     assert_eq!(form.matches('(').count(), form.matches(')').count());
-    assert!(form.ends_with("(+ x y))"));
+    // The body must stay INSIDE the let, not become a second defn body.
+    assert_eq!(form, "(defn target [x]\n  (let [y 2]\n    (+ x y)))");
+}
+
+#[test]
+fn repair_keeps_bare_body_inside_inner_form() {
+    // Regression: indent mode compared an absolute byte column against a
+    // per-line indent, so an inner form was closed a line too early and its
+    // body escaped it. A bare atom body makes the wrong nesting unambiguous
+    // (balance-only assertions passed the buggy output).
+    let p = fixture("r9.clj");
+    let (code, d) = edit_content(
+        p.to_str().unwrap(),
+        "target",
+        "(defn target [x]\n  (let [y 2]\n    y",
+    );
+    assert_eq!(code, 0, "{d}");
+    assert_eq!(d["result"]["repaired"], true);
+    let get = Command::new(env!("CARGO_BIN_EXE_cljform"))
+        .args(["get", p.to_str().unwrap(), "--name", "target", "--json"])
+        .output()
+        .unwrap();
+    let g: serde_json::Value = serde_json::from_slice(&get.stdout).unwrap();
+    assert_eq!(
+        g["result"]["form"].as_str().unwrap(),
+        "(defn target [x]\n  (let [y 2]\n    y))"
+    );
+}
+
+#[test]
+fn strict_refuses_repair() {
+    let p = fixture("r10.clj");
+    let before = std::fs::read_to_string(&p).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cljform"))
+        .args([
+            "edit",
+            p.to_str().unwrap(),
+            "--name",
+            "target",
+            "--content",
+            "(defn target [x]\n  (* x 2)",
+            "--strict",
+            "--json",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.as_mut().unwrap().write_all(b"").ok();
+    let out = child.wait_with_output().unwrap();
+    let d: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(3), "{d}");
+    assert_eq!(d["error"]["code"], "repair-refused");
+    // The refusal shows the repair it declined to apply.
+    assert!(d["error"]["message"].as_str().unwrap().contains("+++ repaired"), "{d}");
+    assert_eq!(std::fs::read_to_string(&p).unwrap(), before, "strict must not write");
 }

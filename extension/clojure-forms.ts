@@ -240,6 +240,65 @@ export default function ClojureForms(pi: ExtensionAPI) {
 		},
 	});
 
+	// ─── clj_draft ───────────────────────────────────────────────────────────
+
+	pi.registerTool({
+		name: "clj_draft",
+		label: "Clj Draft",
+		description:
+			"Mechanized indent mode: submit a draft s-expression written with correct indentation but missing " +
+			"closing brackets and get back a bracketed CANDIDATE plus a unified diff. It completes missing " +
+			"closers implied by indentation. It does NOT invent missing openers, so a fully bracket-less draft " +
+			"is returned unchanged with a note (a guessed bracketing would be worse than an obvious no-op). " +
+			"Never writes to a file — verify nesting before use.",
+		promptSnippet: "Recover bracket structure from an indentation-only draft (candidate + diff, never writes).",
+		promptGuidelines: [
+			"Use clj_draft when the draft's brackets are the problem: it infers missing closers from indentation and shows the diff.",
+			"Its output is a candidate — verify nesting, then feed it to clj_edit.",
+			"It will not guess missing OPEN brackets; if the note says nothing was inferred, add the open brackets yourself.",
+		],
+		parameters: Type.Object({
+			content: Type.String({ description: "The draft s-expression (indentation is the structural signal)" }),
+		}),
+
+		async execute(_toolCallId, params, _signal, _onUpdate) {
+			const { writeFileSync, unlinkSync } = await import("node:fs");
+			const { tmpdir } = await import("node:os");
+			const { join } = await import("node:path");
+			const tmp = join(tmpdir(), `cljform-draft-${process.pid}-${Date.now()}.clj`);
+			writeFileSync(tmp, params.content);
+			try {
+				const result = await pi.exec(resolveBin(), ["materialize", "--content-file", tmp, "--json"], {
+					timeout: 15_000,
+				});
+				const out = parseEnvelope(result.stdout);
+				if (!out || !out.ok) {
+					const text = out?.error ? errorText(out) : `cljform failed: ${result.stderr || result.stdout}`;
+					return { content: [{ type: "text", text }], isError: true };
+				}
+				const r = out.result ?? {};
+				const lines = [
+					`candidate (${r.note ?? "brackets inferred from indentation"}):`,
+					"",
+					r.candidate ?? "",
+					"",
+					"diff (draft → candidate):",
+					r.diff || "(no change)",
+				];
+				return {
+					content: [{ type: "text", text: lines.join("\n") }],
+					details: { candidate: r.candidate, diff: r.diff, note: r.note },
+				};
+			} finally {
+				try {
+					unlinkSync(tmp);
+				} catch {
+					/* already removed */
+				}
+			}
+		},
+	});
+
 	// ─── clj_edit ───────────────────────────────────────────────────────────
 
 	pi.registerTool({
@@ -262,6 +321,7 @@ export default function ClojureForms(pi: ExtensionAPI) {
 			"mode: replace (default) | patch (needs oldText/newText) | insert-after (anchor: after/name, 0=before first) | insert-before | append | prepend | delete.",
 			"Address WARNING D1/D2 lines in the result — they mean a form is nested inside another defn/let.",
 			"dryRun: true validates and shows the outcome without writing.",
+			"strict: true (CI mode) refuses detector warnings, --expect mismatches, and content repairs instead of applying them.",
 		],
 		parameters: Type.Object({
 			path: Type.String({ description: "Path to the .clj/.cljs/.cljc/.edn file" }),
@@ -298,6 +358,12 @@ export default function ClojureForms(pi: ExtensionAPI) {
 			after: Type.Optional(Type.Number({ description: "insert-after anchor addr (0 = before first)" })),
 			before: Type.Optional(Type.Number({ description: "insert-before anchor addr" })),
 			dryRun: Type.Optional(Type.Boolean({ description: "Validate and report without writing" })),
+			strict: Type.Optional(
+				Type.Boolean({
+					description:
+						"Refuse mismatches, detector warnings, and content repairs instead of applying them (CI mode)",
+				}),
+			),
 		}),
 
 		async execute(_toolCallId, params, _signal, _onUpdate) {
@@ -329,6 +395,7 @@ export default function ClojureForms(pi: ExtensionAPI) {
 			if (params.after !== undefined) args.push("--after", String(params.after));
 			if (params.before !== undefined) args.push("--before", String(params.before));
 			if (params.dryRun) args.push("--dry-run");
+			if (params.strict) args.push("--strict");
 			if (mode === "patch") {
 				args.push("--old-text", params.oldText!);
 				args.push("--new-text", params.newText ?? "");
@@ -452,12 +519,13 @@ export default function ClojureForms(pi: ExtensionAPI) {
 		return {
 			systemPrompt: `${_event.systemPrompt}
 
-For Clojure/EDN files (*.clj, *.cljs, *.cljc, *.edn) prefer the clj_forms/clj_edit tools over raw text
-edits: they address whole forms by name or address, repair unbalanced brackets automatically, and never
-write a file that does not parse. Shape reports in tool results are binding: a "BLOCKING: the file no
-longer parses" line, lost forms in the guard report, or D1–D4 nesting warnings must be fixed or
-explicitly justified in your next action. After editing, prefer clj-check semantics already built into
-clj_edit's output over re-reading the whole file.`,
+For Clojure/EDN files (*.clj, *.cljs, *.cljc, *.edn) prefer the clj_forms/clj_get/clj_edit tools over raw text
+edits: they address whole forms by name or address, fetch exact bytes, patch inside a form (oldText/newText),
+repair unbalanced content by indentation, and never write a file that does not parse. clj_draft recovers
+brackets from an indentation-only draft (candidate + diff, never writes). Shape reports in tool results are
+binding: a "BLOCKING: the file no longer parses" line, lost forms in the guard report, or D1–D4 nesting
+warnings must be fixed or explicitly justified in your next action. After editing, prefer clj-check semantics
+already built into clj_edit's output over re-reading the whole file.`,
 		};
 	});
 }

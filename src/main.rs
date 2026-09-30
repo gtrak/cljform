@@ -637,20 +637,67 @@ fn dispatch(cli: &Cli) -> Result<Output, Fail> {
         },
         Op::Materialize { content, content_file } => {
             let raw = read_content(content, content_file)?;
-            let prepared = content::prepare(&raw, false).map_err(prepare_fail)?;
-            let candidate = materialize::indent_mode(&String::from_utf8_lossy(&prepared.bytes))
-                .map_err(|e| Fail(
+            // Run indent mode on the caller's REAL draft: `prepare` would
+            // repair the draft first and mask the very diff this op exists
+            // to show (a pre-repaired draft always looks like a no-op).
+            let (draft, mut notes, truncated_fence) = content::normalize_draft(&raw);
+            if draft.is_empty() {
+                return Err(Fail(
                     1,
                     ErrorBody {
                         code: "materialize-error",
-                        line: Some(e.line),
-                        col: Some(e.col),
-                        message: e.message,
+                        line: None,
+                        col: None,
+                        message: "draft is empty".into(),
                         hint: None,
                         suggestions: None,
                     },
-                ))?;
-            let diff = materialize::unified_diff(&raw, &candidate, "draft", "candidate");
+                ));
+            }
+            let candidate = materialize::indent_mode(&draft).map_err(|e| Fail(
+                1,
+                ErrorBody {
+                    code: "materialize-error",
+                    line: Some(e.line),
+                    col: Some(e.col),
+                    message: e.message,
+                    hint: None,
+                    suggestions: None,
+                },
+            ))?;
+            let diff = materialize::unified_diff(&draft, &candidate, "draft", "candidate");
+            if truncated_fence {
+                notes.push("draft began with a markdown fence that is never closed — if you did not mean this, the paste may be truncated".to_string());
+            }
+            let inferred = candidate != draft;
+            let draft_parses = parser::parse(draft.as_bytes()).is_ok();
+            let note = if inferred {
+                // Inference must yield something that actually parses; a bad
+                // candidate is worse than none.
+                if parser::parse(candidate.as_bytes()).is_err() {
+                    return Err(Fail(
+                        1,
+                        ErrorBody {
+                            code: "materialize-error",
+                            line: None,
+                            col: None,
+                            message: "indent inference produced a candidate that does not parse; refusing"
+                                .into(),
+                            hint: Some(
+                                "fix the draft's explicit structure, or add the missing brackets by hand"
+                                    .into(),
+                            ),
+                            suggestions: None,
+                        },
+                    ));
+                }
+                notes.push("brackets inferred from indentation; verify nesting before use".to_string());
+                "brackets inferred from indentation; verify nesting before use"
+            } else if draft_parses {
+                "draft already parses; nothing to infer (cljform closes brackets implied by indentation, but does not invent missing openers)"
+            } else {
+                "no change inferred — cljform closes brackets implied by indentation but does not invent missing openers; add the open brackets and retry"
+            };
             Ok(Output {
                 ok: true,
                 op: "materialize",
@@ -660,10 +707,10 @@ fn dispatch(cli: &Cli) -> Result<Output, Fail> {
                 result: Some(serde_json::json!({
                     "candidate": candidate,
                     "diff": diff,
-                    "note": "brackets inferred from indentation; verify nesting before use",
+                    "note": note,
                 })),
                 warnings: None,
-                notes: Some(prepared.notes),
+                notes: Some(notes),
                 error: None,
             })
         }
@@ -689,20 +736,52 @@ fn dispatch(cli: &Cli) -> Result<Output, Fail> {
 }
 
 fn prepare_fail(p: content::PrepareError) -> Fail {
-    Fail(
-        1,
-        ErrorBody {
-            code: "not-one-form",
-            line: p.line_col().map(|(l, _)| l),
-            col: p.line_col().map(|(_, c)| c),
-            message: p.message(),
-            hint: Some(
-                "repair happens automatically when the fix is unambiguous; this content needs a human eye"
+    match p {
+        content::PrepareError::RepairRefused { diff } => Fail(
+            3,
+            ErrorBody {
+                code: "repair-refused",
+                line: None,
+                col: None,
+                message: format!(
+                    "--strict: submitted content is unbalanced; refusing rather than repairing it by indentation\n{diff}"
+                ),
+                hint: Some(
+                    "submit balanced content, or drop --strict to allow the reported, verified repair"
+                        .into(),
+                ),
+                suggestions: None,
+            },
+        ),
+        content::PrepareError::TruncatedFence => Fail(
+            1,
+            ErrorBody {
+                code: "truncated-content",
+                line: None,
+                col: None,
+                message: "content starts with a markdown fence that is never closed — the paste looks truncated; refusing to repair it"
                     .into(),
-            ),
-            suggestions: None,
-        },
-    )
+                hint: Some(
+                    "resend the complete content, or remove the stray opening fence".into(),
+                ),
+                suggestions: None,
+            },
+        ),
+        other => Fail(
+            1,
+            ErrorBody {
+                code: "not-one-form",
+                line: other.line_col().map(|(l, _)| l),
+                col: other.line_col().map(|(_, c)| c),
+                message: other.message(),
+                hint: Some(
+                    "repair happens automatically when the fix is unambiguous; this content needs a human eye"
+                        .into(),
+                ),
+                suggestions: None,
+            },
+        ),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -882,7 +961,7 @@ fn run_edit(
         _ => {
             let raw = read_content(content, content_file)?;
             Some(Payload::Prepared(
-                content::prepare(&raw, false).map_err(prepare_fail)?,
+                content::prepare(&raw, false, strict).map_err(prepare_fail)?,
             ))
         }
     };

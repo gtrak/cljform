@@ -1,6 +1,6 @@
 [package]
 name = "cljform"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 description = "Form-addressed Clojure editing: whole-form ops with machine-checked shape invariants"

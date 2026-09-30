@@ -32,7 +32,7 @@ cljform [--json|--human] <op> …
 | `check [file]` | Parse + table + nesting warnings (file or stdin) |
 | `edit <file> --name s\|--addr N [--mode M] [--content C\|--content-file F]` | Whole-form edit; modes `replace` (default), `insert-after` (`--after`, 0=before first), `insert-before` (`--before`), `append`, `prepend`, `delete` |
 | `edit <file> --name s\|--addr N --mode patch --old-text T [--new-text U]` | Surgical text patch inside one form: `T` must occur exactly once in the form's byte range and never cross its boundary; `U` (default empty) replaces it. Bytes outside the match are untouched; no bracket repair, but I1–I3 still gate the write |
-| `materialize --content C` | Indent-mode bracket inference → labeled candidate + diff (never writes) |
+| `materialize --content C` | Indent-mode bracket completion → labeled candidate + diff (never writes). Completes missing **closers** implied by indentation; it does not invent missing openers, so a fully bracket-less draft comes back unchanged with a note |
 
 Exit codes: `0` ok · `1` parse/structure failure (nothing written) · `2`
 usage · `3` name not found / ambiguous / stale `--expect` under `--strict` ·
@@ -41,8 +41,14 @@ usage · `3` name not found / ambiguous / stale `--expect` under `--strict` ·
 Guards: `--expect <hash-prefix>` (12+ hex chars, `blake3:` optional) is
 advisory by default — a stale address is re-aimed by hash when the expected
 form is still uniquely findable, and the re-aim is reported. `--strict`
-turns mismatches and detector warnings into refusals. `--dry-run` validates
-and writes nothing.
+turns mismatches, detector warnings, **and content repairs** into refusals
+(exit 3, `repair-refused`, with the diff it declined to apply). `--dry-run`
+validates and writes nothing.
+
+Refusal beats guessed repair. Unbalanced content is repaired from
+indentation only when that is safe; two cases are refused outright instead:
+content from an **unterminated markdown fence** (a likely truncated paste —
+never repaired, exit 1 `truncated-content`), and `--strict`.
 
 ## Detectors
 
@@ -62,11 +68,13 @@ on a 64 MB-stack worker thread — 50k-deep data is fine.
 Lives in this repo at `extension/clojure-forms.ts` (with the
 `extension/agents/clojure-worker.md` subagent definition). It registers:
 
-- **clj_forms / clj_get / clj_edit** — the table, single-form byte fetch,
-  and the editor. `clj_get` returns one form's exact bytes (refreshing the
-  cache); `clj_edit` takes whole-form `content` or a surgical
-  `oldText`/`newText` patch (mode auto-selects `patch`), so a four-line
-  change in a 60-line form no longer means re-transcribing 60 lines.
+- **clj_forms / clj_get / clj_edit / clj_draft** — the table, single-form byte
+  fetch, the editor, and a draft recovery aid. `clj_get` returns one form's
+  exact bytes (refreshing the cache); `clj_edit` takes whole-form `content`
+  or a surgical `oldText`/`newText` patch (mode auto-selects `patch`), so a
+  four-line change in a 60-line form no longer means re-transcribing 60
+  lines. `clj_draft` runs the indent-mode completer on an
+  indentation-only draft and returns candidate + diff (never writes).
   Content is passed via temp file; names survive earlier edits better than
   addresses.
 - **Guard hook** — after *any* built-in `edit`/`write` touching
@@ -101,7 +109,7 @@ see SPEC.md §14.
 
 ```
 cargo install --path .              # binary → ~/.cargo/bin/cljform
-cargo test                          # 50 tests: cli, golden, repair,
+cargo test                          # 56 tests: cli, golden, repair,
                                     # adversarial, fuzz, F1 regression
 ```
 
@@ -121,3 +129,9 @@ evaluated.
   burial, reader conditionals, stale-view traps.
 - `tests/fuzz.rs` — 300 deterministic garbage inputs: structured errors,
   never a panic, never a partial write.
+- `tests/repair.rs` — repair is asserted on **nesting**, not just paren
+  balance. Indent mode once compared an absolute byte column against a
+  per-line indent, closing an inner form a line early (`(let [y 2])` with
+  the body escaping it); balance-only assertions passed the wrong output.
+  Now the repaired form text is compared exactly, and an unterminated
+  markdown fence around unbalanced content is refused, not repaired.
