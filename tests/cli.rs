@@ -278,3 +278,124 @@ fn human_mode_goes_to_stdout_stderr_without_json() {
     assert!(s.contains("helper"));
     assert!(!s.starts_with('{'), "must not be json");
 }
+
+#[test]
+fn patch_mode_surgical_replacement() {
+    let dir = std::env::temp_dir().join("cljform-cli");
+    let p = dir.join("patch.clj");
+    std::fs::write(
+        &p,
+        "(ns p)\n\n(defn big [x]\n  (let [a 1]\n    {:a a\n     :b 2}))\n\n(def other :untouched)\n",
+    )
+    .unwrap();
+    let f = p.to_str().unwrap();
+
+    // One-line change in a multi-line form.
+    let (code, d, _) = run(
+        &["edit", f, "--name", "big", "--mode", "patch", "--old-text", ":b 2", "--new-text", ":b (inc 2)", "--json"],
+        None,
+    );
+    assert_eq!(code, 0, "{d}");
+    assert_eq!(d["result"]["summary"]["action"], "patched");
+    assert!(d["result"]["diff"].as_str().unwrap().contains(":b (inc 2)"));
+    assert_eq!(d["result"]["repaired"], false);
+    // The untouched form kept its bytes despite the line shift.
+    let (_c, forms, _) = run(&["forms", f, "--json"], None);
+    let rows = forms["forms"].as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[2]["name"], "other");
+    assert_eq!(rows[2]["line"], serde_json::json!([8, 8]));
+
+    // Scoped: needle occurs once in the target form but also in the ns form.
+    let (code, d, _) = run(
+        &["edit", f, "--name", "big", "--mode", "patch", "--old-text", "(ns", "--new-text", "X", "--json"],
+        None,
+    );
+    assert_eq!(code, 3, "(ns is not inside the big form: {d})");
+    assert_eq!(d["error"]["code"], "patch-not-found");
+
+    // Ambiguous within the form.
+    let (code, d, _) = run(
+        &["edit", f, "--name", "big", "--mode", "patch", "--old-text", "a", "--new-text", "q", "--json"],
+        None,
+    );
+    assert_eq!(code, 3);
+    assert_eq!(d["error"]["code"], "patch-ambiguous");
+    assert!(d["error"]["message"].as_str().unwrap().contains("times"));
+
+    // Cross-boundary oldText: spans into the next form -> not found in form.
+    let (code, d, _) = run(
+        &["edit", f, "--name", "big", "--mode", "patch", "--old-text", ":b (inc 2))\n\n(def other", "--new-text", "X", "--json"],
+        None,
+    );
+    assert_eq!(code, 3);
+    assert_eq!(d["error"]["code"], "patch-not-found");
+
+    // newText that breaks brackets: refused, nothing written.
+    let before = std::fs::read_to_string(f).unwrap();
+    let (code, d, _) = run(
+        &["edit", f, "--name", "big", "--mode", "patch", "--old-text", ":b (inc 2)", "--new-text", ":b (inc 2))", "--json"],
+        None,
+    );
+    assert_eq!(code, 1);
+    assert_eq!(d["error"]["code"], "parse-error");
+    assert_eq!(std::fs::read_to_string(f).unwrap(), before, "no repair in patch mode");
+
+    // Empty newText deletes the snippet (balanced removal).
+    let (code, d, _) = run(
+        &["edit", f, "--name", "big", "--mode", "patch", "--old-text", ":a a\n     ", "--new-text", "", "--json"],
+        None,
+    );
+    assert_eq!(code, 0, "{d}");
+    let (_cc, chk, _) = run(&["check", f, "--json"], None);
+    assert_eq!(chk["ok"], true);
+    let text = std::fs::read_to_string(f).unwrap();
+    assert!(!text.contains(":a a"));
+
+    // Patch no-op.
+    let (code, d, _) = run(
+        &["edit", f, "--name", "big", "--mode", "patch", "--old-text", ":b (inc 2)", "--new-text", ":b (inc 2)", "--json"],
+        None,
+    );
+    assert_eq!(code, 0);
+    assert!(d["notes"].as_array().unwrap().iter().any(|n| n.as_str().unwrap().contains("no-op")));
+
+    // Dry-run patch writes nothing.
+    let before = std::fs::read_to_string(f).unwrap();
+    let (code, d, _) = run(
+        &["edit", f, "--name", "big", "--mode", "patch", "--old-text", ":b (inc 2)", "--new-text", ":b 9", "--dry-run", "--json"],
+        None,
+    );
+    assert_eq!(code, 0);
+    assert_eq!(d["result"]["wrote"], false);
+    assert_eq!(std::fs::read_to_string(f).unwrap(), before);
+
+    // Missing --old-text is a usage error.
+    let (code, _d, _) = run(&["edit", f, "--name", "big", "--mode", "patch", "--new-text", "x", "--json"], None);
+    assert_eq!(code, 2);
+}
+
+#[test]
+fn patch_mode_line_growth_shifts_later_forms() {
+    let dir = std::env::temp_dir().join("cljform-cli");
+    let p = dir.join("patch-shift.clj");
+    std::fs::write(
+        &p,
+        "(ns s)\n\n(defn f [x]\n  {:a 1})\n\n(def after :ok)\n",
+    )
+    .unwrap();
+    let f = p.to_str().unwrap();
+    let (_c, forms, _) = run(&["forms", f, "--json"], None);
+    let after_hash = forms["forms"].as_array().unwrap()[2]["hash"].clone();
+
+    let (code, d, _) = run(
+        &["edit", f, "--name", "f", "--mode", "patch", "--old-text", "{:a 1})", "--new-text", "{:a 1\n   :b 2\n   :c 3})", "--json"],
+        None,
+    );
+    assert_eq!(code, 0, "{d}");
+    let (_c, forms, _) = run(&["forms", f, "--json"], None);
+    let rows = forms["forms"].as_array().unwrap();
+    assert_eq!(rows[1]["line"], serde_json::json!([3, 6]), "target grew");
+    assert_eq!(rows[2]["line"], serde_json::json!([8, 8]), "later form shifted");
+    assert_eq!(rows[2]["hash"], after_hash, "shifted form kept its bytes");
+}

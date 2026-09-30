@@ -1,6 +1,6 @@
 # cljform — form-addressed Clojure editing: spec
 
-Status: **implemented (v1)** · Created: 2026-09-29
+Status: **implemented (v1; v0.2 surgical patch mode)** · Created: 2026-09-29
 Shape: standalone Rust CLI (`cljform`) + pi extension wrapper (`clojure-forms`)
 
 ## 1. Problem
@@ -465,12 +465,22 @@ design):
 - **Ops:** `edit` absorbed insert/delete via `--mode` (replace | insert-after
   | insert-before | append | prepend | delete) and accepts multi-form
   content (I3 generalized to an N-form allowed-change window).
-- **Wrapper:** tools are `clj_forms`/`clj_edit` (two tools, not seven);
+- **Granularity (v0.2).** A whole-form edit unit made small changes inside
+  large forms force full re-transcription (a dropped `]` in a 60-line resend
+  was the observed failure). Added `get` / `clj_get` to fetch exact form
+  bytes, and `--mode patch` (`--old-text`/`--new-text`, `clj_edit`
+  `oldText`/`newText`): exact-match replacement constrained to the target
+  form's byte range, must occur exactly once, never crosses the boundary;
+  full I1–I3 + guard pipeline still gates the write. No repair in patch
+  mode — a bracket-breaking patch is refused (exit 1), not silently fixed.
+  Strictness is the point: the error was granularity, not safety. Sub-form
+  path addressing (§10) remains reserved for v2.
+- **Wrapper:** tools are `clj_forms`/`clj_get`/`clj_edit` (three tools, not seven);
   content passes via `--content-file` (pi exec has no stdin). Guard hook and
   prompt note as specced. Builtin subagents don't inherit extension tools
   (strict allowlists) but the guard hook fires for them; a
   `clojure-worker` user agent ships with the clj tools allowed.
-- **Tests:** 48 green (cli, golden, repair, adversarial, fuzz, F1
+- **Tests:** 50 green (cli, golden, repair, adversarial, fuzz, F1
   regression); `cargo clippy -D warnings` clean; release `check` on a
   1,081-line file < 10 ms. Dogfooded end-to-end by a local model via the
   wrapper (4 tasks, tests green, shape reports binding) including a live

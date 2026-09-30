@@ -43,6 +43,10 @@ struct Cli {
 enum Mode {
     /// Replace the target form (default).
     Replace,
+    /// Exact-match text replacement scoped to the target form: --old-text
+    /// must occur exactly once inside the form's bytes; --new-text replaces
+    /// it. Full verification pipeline; no bracket repair (patch is surgical).
+    Patch,
     /// Insert after --after (0 = before first; omit = append).
     InsertAfter,
     /// Insert before --before (omit = prepend).
@@ -98,11 +102,19 @@ enum Op {
         #[arg(long)]
         name: Option<String>,
         /// Replacement/insertion content (else --content-file or stdin).
+        /// Not used by patch (use --old-text/--new-text) or delete.
         #[arg(long)]
         content: Option<String>,
         /// Read content from this file (wrapper path; avoids argv limits).
         #[arg(long)]
         content_file: Option<PathBuf>,
+        /// Patch mode: exact text to find inside the target form (must occur
+        /// exactly once there; occurrences elsewhere are ignored).
+        #[arg(long, requires = "new_text")]
+        old_text: Option<String>,
+        /// Patch mode: replacement text (may be empty to delete).
+        #[arg(long)]
+        new_text: Option<String>,
         /// Expected current hash prefix of the target form (advisory unless
         /// --strict; enables re-aim when a stale view is recoverable).
         #[arg(long)]
@@ -664,11 +676,14 @@ fn dispatch(cli: &Cli) -> Result<Output, Fail> {
             name,
             content,
             content_file,
+            old_text,
+            new_text,
             expect,
             dry_run,
             strict,
         } => run_edit(
-            file, *mode, *addr, *after, *before, name, content, content_file, expect, *dry_run, *strict,
+            file, *mode, *addr, *after, *before, name, content, content_file, old_text, new_text,
+            expect, *dry_run, *strict,
         ),
     }
 }
@@ -700,6 +715,8 @@ fn run_edit(
     name: &Option<String>,
     content: &Option<String>,
     content_file: &Option<PathBuf>,
+    old_text: &Option<String>,
+    new_text: &Option<String>,
     expect: &Option<String>,
     dry_run: bool,
     strict: bool,
@@ -711,7 +728,7 @@ fn run_edit(
     // Resolve target per mode.
     let resolved_by_name = name.is_some();
     let target = match mode {
-        Mode::Replace | Mode::Delete => resolve_target(&before_forms, &addr, name)?,
+        Mode::Replace | Mode::Patch | Mode::Delete => resolve_target(&before_forms, &addr, name)?,
         Mode::InsertAfter | Mode::InsertBefore | Mode::Append | Mode::Prepend => {
             // Anchor: explicit index, name, or file edges.
             match (after, before, name) {
@@ -777,12 +794,97 @@ fn run_edit(
         }
     };
 
-    // Content (not needed for delete).
-    let prepared = if mode == Mode::Delete {
-        None
-    } else {
-        let raw = read_content(content, content_file)?;
-        Some(content::prepare(&raw, false).map_err(prepare_fail)?)
+    // Payload: whole-form content (normalized/repaired) or a surgical patch
+    // scoped to the target form's bytes (no repair — patch is exact).
+    enum Payload {
+        Prepared(content::Prepared),
+        Patch { bytes: Vec<u8>, diff: String, noop: bool },
+    }
+    let payload: Option<Payload> = match mode {
+        Mode::Delete => None,
+        Mode::Patch => {
+            let Some(old) = old_text.as_deref().filter(|s| !s.is_empty()) else {
+                return Err(Fail(
+                    2,
+                    ErrorBody {
+                        code: "usage",
+                        line: None,
+                        col: None,
+                        message: "patch mode requires non-empty --old-text".into(),
+                        hint: Some("patch replaces an exact snippet inside one form; for whole-form edits use --content".into()),
+                        suggestions: None,
+                    },
+                ));
+            };
+            let new = new_text.as_deref().unwrap_or("");
+            let form_bytes = &bytes[target.form.start_byte..target.form.end_byte];
+            let needle = old.as_bytes();
+            let hits = find_all(form_bytes, needle);
+            let form_label = match &target.form.name {
+                Some(n) => format!("{} {n}", target.form.kind),
+                None => target.form.kind.clone(),
+            };
+            match hits.len() {
+                0 => {
+                    return Err(Fail(
+                        3,
+                        ErrorBody {
+                            code: "patch-not-found",
+                            line: Some(target.form.line[0]),
+                            col: None,
+                            message: format!(
+                                "--old-text not found inside form {form_label} (lines {}–{}); occurrences elsewhere in the file do not count",
+                                target.form.line[0], target.form.line[1]
+                            ),
+                            hint: Some(
+                                "fetch the exact form bytes first (cljform get / clj_get) and patch against them"
+                                    .into(),
+                            ),
+                            suggestions: None,
+                        },
+                    ));
+                }
+                1 => {}
+                n => {
+                    return Err(Fail(
+                        3,
+                        ErrorBody {
+                            code: "patch-ambiguous",
+                            line: Some(target.form.line[0]),
+                            col: None,
+                            message: format!(
+                                "--old-text occurs {n} times inside form {form_label} — include more surrounding lines to make it unique"
+                            ),
+                            hint: None,
+                            suggestions: None,
+                        },
+                    ));
+                }
+            }
+            let i = hits[0];
+            let mut nb = Vec::with_capacity(form_bytes.len() - needle.len() + new.len());
+            nb.extend_from_slice(&form_bytes[..i]);
+            nb.extend_from_slice(new.as_bytes());
+            nb.extend_from_slice(&form_bytes[i + needle.len()..]);
+            let noop = nb == form_bytes;
+            let diff = if noop {
+                String::new()
+            } else {
+                materialize::unified_diff(
+                    &String::from_utf8_lossy(form_bytes),
+                    &String::from_utf8_lossy(&nb),
+                    "before",
+                    "after",
+                )
+            };
+            Some(Payload::Patch { bytes: nb, diff, noop })
+        }
+        _ => {
+            let raw = read_content(content, content_file)?;
+            Some(Payload::Prepared(
+                content::prepare(&raw, false).map_err(prepare_fail)?,
+            ))
+        }
     };
 
     // --expect guard (advisory by default).
@@ -818,7 +920,9 @@ fn run_edit(
     // Build splice + allowed-change window.
     let (sp, allowed) = match mode {
         Mode::Replace => {
-            let p = prepared.as_ref().expect("replace prepared content");
+            let Some(Payload::Prepared(p)) = payload.as_ref() else {
+                unreachable!("replace carries prepared content")
+            };
             (
                 splice::Splice::Edit {
                     addr: target.addr,
@@ -830,12 +934,29 @@ fn run_edit(
                 },
             )
         }
+        Mode::Patch => {
+            let Some(Payload::Patch { bytes: content, .. }) = payload.as_ref() else {
+                unreachable!("patch carries patched form bytes")
+            };
+            (
+                splice::Splice::Edit {
+                    addr: target.addr,
+                    content: content.clone(),
+                },
+                invariants::Allowed::Replace {
+                    addr: target.addr,
+                    n: 1,
+                },
+            )
+        }
         Mode::Delete => (
             splice::Splice::Delete { addr: target.addr },
             invariants::Allowed::Delete { addr: target.addr },
         ),
         Mode::InsertAfter | Mode::Append => {
-            let p = prepared.as_ref().expect("insert prepared content");
+            let Some(Payload::Prepared(p)) = payload.as_ref() else {
+                unreachable!("insert carries prepared content")
+            };
             // target.addr == 0 → before first (at=1); == len → end (at=len+1).
             let at = if target.addr >= before_forms.len() {
                 before_forms.len() + 1
@@ -851,7 +972,9 @@ fn run_edit(
             )
         }
         Mode::InsertBefore | Mode::Prepend => {
-            let p = prepared.as_ref().expect("insert prepared content");
+            let Some(Payload::Prepared(p)) = payload.as_ref() else {
+                unreachable!("insert carries prepared content")
+            };
             // target.addr == 0 → before first (at=1); else before form k (at=k).
             let at = if target.addr == 0 { 1 } else { target.addr };
             (
@@ -866,13 +989,19 @@ fn run_edit(
 
     let new_bytes = splice::apply(&bytes, &before_forms, &sp);
 
-    // No-op detection: replace with byte-identical content, unrepaired.
-    if mode == Mode::Replace {
-        let new_text = String::from_utf8_lossy(&new_bytes).to_string();
-        let old_text = String::from_utf8_lossy(&bytes).to_string();
-        if new_text == old_text && !prepared.as_ref().unwrap().repaired {
-            notes.push("no-op: content identical to the target form".to_string());
+    // No-op detection.
+    match (&payload, mode) {
+        (Some(Payload::Prepared(p)), Mode::Replace) => {
+            let new_text = String::from_utf8_lossy(&new_bytes).to_string();
+            let old_text = String::from_utf8_lossy(&bytes).to_string();
+            if new_text == old_text && !p.repaired {
+                notes.push("no-op: content identical to the target form".to_string());
+            }
         }
+        (Some(Payload::Patch { noop: true, .. }), _) => {
+            notes.push("no-op: --new-text equals --old-text".to_string());
+        }
+        _ => {}
     }
 
     // I1: post-splice parse.
@@ -913,7 +1042,7 @@ fn run_edit(
     }
 
     // Repair visibility.
-    if let Some(p) = &prepared {
+    if let Some(Payload::Prepared(p)) = &payload {
         notes.extend(p.notes.clone());
         if p.repaired {
             notes.push("content was repaired (brackets inferred from indentation)".to_string());
@@ -924,6 +1053,10 @@ fn run_edit(
     let summary = match mode {
         Mode::Replace => {
             let f = &after_parsed.forms[target.addr - 1];
+            let content_forms = match &payload {
+                Some(Payload::Prepared(p)) => p.forms,
+                _ => unreachable!("replace carries prepared content"),
+            };
             serde_json::json!({
                 "action": "replaced",
                 "addr": target.addr,
@@ -935,7 +1068,19 @@ fn run_edit(
                 "wasName": target.form.name,
                 "wasLine": target.form.line,
                 "hashBefore": hashutil::tagged(&target.form.hash),
-                "contentForms": prepared.as_ref().unwrap().forms,
+                "contentForms": content_forms,
+            })
+        }
+        Mode::Patch => {
+            let f = &after_parsed.forms[target.addr - 1];
+            serde_json::json!({
+                "action": "patched",
+                "addr": target.addr,
+                "kind": f.kind,
+                "name": f.name,
+                "line": f.line,
+                "hash": hashutil::tagged(&f.hash),
+                "hashBefore": hashutil::tagged(&target.form.hash),
             })
         }
         Mode::Delete => serde_json::json!({
@@ -968,20 +1113,32 @@ fn run_edit(
     };
 
     let mut text = human_summary(&summary, &shape);
-    if let Some(p) = &prepared {
-        if p.repaired && !p.repair_diff.is_empty() {
+    match &payload {
+        Some(Payload::Prepared(p)) if p.repaired && !p.repair_diff.is_empty() => {
             text.push('\n');
             text.push_str(&p.repair_diff);
         }
+        Some(Payload::Patch { diff, .. }) if !diff.is_empty() => {
+            text.push('\n');
+            text.push_str(diff);
+        }
+        _ => {}
     }
+
+    let (repaired, repair_diff, patch_diff) = match &payload {
+        Some(Payload::Prepared(p)) => (p.repaired, p.repair_diff.clone(), String::new()),
+        Some(Payload::Patch { diff, .. }) => (false, String::new(), diff.clone()),
+        None => (false, String::new(), String::new()),
+    };
 
     let result = serde_json::json!({
         "text": text,
         "summary": summary,
         "changed": shape.changed,
         "untouched": shape.untouched,
-        "repaired": prepared.as_ref().map(|p| p.repaired).unwrap_or(false),
-        "repairDiff": prepared.as_ref().map(|p| p.repair_diff.clone()).unwrap_or_default(),
+        "repaired": repaired,
+        "repairDiff": repair_diff,
+        "diff": patch_diff,
         "wrote": !dry_run,
     });
 
@@ -1012,6 +1169,29 @@ fn run_edit(
         notes: Some(notes),
         error: None,
     })
+}
+
+/// All byte offsets where `needle` occurs in `haystack` (overlapping not
+/// expected for text patches; non-overlapping scan is correct here).
+fn find_all(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return vec![];
+    }
+    let mut out = vec![];
+    let mut start = 0usize;
+    while start + needle.len() <= haystack.len() {
+        if let Some(pos) = haystack[start..]
+            .windows(needle.len())
+            .position(|w| w == needle)
+        {
+            let at = start + pos;
+            out.push(at);
+            start = at + 1;
+        } else {
+            break;
+        }
+    }
+    out
 }
 
 fn placeholder_form(forms: &[Form]) -> Form {
@@ -1054,6 +1234,15 @@ fn human_summary(summary: &serde_json::Value, shape: &invariants::ShapeCheck) ->
             label(summary),
             summary["lineBefore"][0],
             summary["lineBefore"][1],
+            shape.untouched
+        ),
+        "patched" => format!(
+            "patched form {} {} at lines {}–{} — {} changed, {} untouched",
+            summary["addr"],
+            label(summary),
+            summary["line"][0],
+            summary["line"][1],
+            shape.changed,
             shape.untouched
         ),
         "inserted" => format!(

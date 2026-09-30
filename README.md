@@ -31,6 +31,7 @@ cljform [--json|--human] <op> …
 | `get <file> [--addr N\|--name sym]` | One form's exact bytes + metadata |
 | `check [file]` | Parse + table + nesting warnings (file or stdin) |
 | `edit <file> --name s\|--addr N [--mode M] [--content C\|--content-file F]` | Whole-form edit; modes `replace` (default), `insert-after` (`--after`, 0=before first), `insert-before` (`--before`), `append`, `prepend`, `delete` |
+| `edit <file> --name s\|--addr N --mode patch --old-text T [--new-text U]` | Surgical text patch inside one form: `T` must occur exactly once in the form's byte range and never cross its boundary; `U` (default empty) replaces it. Bytes outside the match are untouched; no bracket repair, but I1–I3 still gate the write |
 | `materialize --content C` | Indent-mode bracket inference → labeled candidate + diff (never writes) |
 
 Exit codes: `0` ok · `1` parse/structure failure (nothing written) · `2`
@@ -61,8 +62,13 @@ on a 64 MB-stack worker thread — 50k-deep data is fine.
 Lives in this repo at `extension/clojure-forms.ts` (with the
 `extension/agents/clojure-worker.md` subagent definition). It registers:
 
-- **clj_forms / clj_edit** — the table and the whole-form editor (content
-  via temp file; names survive earlier edits better than addresses).
+- **clj_forms / clj_get / clj_edit** — the table, single-form byte fetch,
+  and the editor. `clj_get` returns one form's exact bytes (refreshing the
+  cache); `clj_edit` takes whole-form `content` or a surgical
+  `oldText`/`newText` patch (mode auto-selects `patch`), so a four-line
+  change in a 60-line form no longer means re-transcribing 60 lines.
+  Content is passed via temp file; names survive earlier edits better than
+  addresses.
 - **Guard hook** — after *any* built-in `edit`/`write` touching
   `*.clj|cljs|cljc|cljx|edn`, appends a shape report to the tool result:
   form-count delta, lost/gained named forms, D-warnings, or a `BLOCKING:`
@@ -95,7 +101,7 @@ see SPEC.md §14.
 
 ```
 cargo install --path .              # binary → ~/.cargo/bin/cljform
-cargo test                          # 48 tests: cli, golden, repair,
+cargo test                          # 50 tests: cli, golden, repair,
                                     # adversarial, fuzz, F1 regression
 ```
 

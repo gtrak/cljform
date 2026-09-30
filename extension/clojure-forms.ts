@@ -193,37 +193,101 @@ export default function ClojureForms(pi: ExtensionAPI) {
 		},
 	});
 
+	// ─── clj_get ────────────────────────────────────────────────────────────
+
+	pi.registerTool({
+		name: "clj_get",
+		label: "Clj Get",
+		description:
+			"Fetch one top-level form from a Clojure/EDN file: its EXACT bytes plus address, kind, name, " +
+			"line range, and blake3 hash. Use this before editing: modify the fetched bytes rather than " +
+			"re-typing form content, then clj_edit with the same hash via expect — transcription errors " +
+			"become impossible.",
+		promptSnippet: "Fetch a Clojure form's exact bytes before editing it.",
+		promptGuidelines: [
+			"Fetch with clj_get, make your change against the exact bytes, then clj_edit — never re-type a form from memory.",
+			"For small changes inside a large form, prefer clj_edit patch mode (oldText/newText) over resending the whole form.",
+		],
+		parameters: Type.Object({
+			path: Type.String({ description: "Path to the .clj/.cljs/.cljc/.edn file" }),
+			name: Type.Optional(
+				Type.String({ description: "Form by defined name (defn/def/deftest/…)" }),
+			),
+			addr: Type.Optional(Type.Number({ description: "Form by 1-based address" })),
+		}),
+
+		async execute(_toolCallId, params, _signal, _onUpdate) {
+			const args = ["get", params.path, "--json"];
+			if (params.name !== undefined) args.push("--name", params.name);
+			if (params.addr !== undefined) args.push("--addr", String(params.addr));
+			const result = await pi.exec(resolveBin(), args, { timeout: 15_000 });
+			const out = parseEnvelope(result.stdout);
+			if (!out || !out.ok) {
+				const text = out?.error ? errorText(out) : `cljform failed: ${result.stderr || result.stdout}`;
+				return { content: [{ type: "text", text }], isError: true };
+			}
+			remember(params.path, out.forms);
+			const r = out.result ?? {};
+			const lines = [
+				`${params.path} · addr ${r.addr} ${r.kind}${r.name ? ` ${r.name}` : ""} · lines ${r.line?.[0]}–${r.line?.[1]} · ${r.hash}`,
+				"",
+				r.form ?? "(empty form)",
+			];
+			return {
+				content: [{ type: "text", text: lines.join("\n") }],
+				details: { forms: out.forms, form: r },
+			};
+		},
+	});
+
 	// ─── clj_edit ───────────────────────────────────────────────────────────
 
 	pi.registerTool({
 		name: "clj_edit",
 		label: "Clj Edit",
 		description:
-			"Whole-form edit for Clojure/EDN files: replace a form by name or addr, insert before/after, " +
-			"append/prepend, or delete. Content may be unbalanced — brackets are repaired from indentation " +
-			"when unambiguous, and markdown fences are stripped. The file is written only if the result " +
-			"parses and every untouched form is byte-identical. Shape warnings (D1: deftest nested in defn, " +
-			"etc.) are reported in-turn. Use this instead of raw edit/write for Clojure files.",
+			"Whole-form editing for Clojure/EDN files. Two ways to change a form:\n" +
+			"(1) PATCH (preferred for small changes): pass oldText + newText — oldText must occur exactly once " +
+			"inside the target form (scope is the form only; matches elsewhere are ignored); the replacement is " +
+			"verified with the full pipeline (file must still parse, every other form byte-identical). No bracket " +
+			"repair in patch mode — fetch exact bytes with clj_get if unsure.\n" +
+			"(2) REPLACE (or insert/delete via mode): pass content — the full replacement form; content may be " +
+			"unbalanced (brackets repaired from indentation when unambiguous) and markdown fences are stripped. " +
+			"The file is written only if the result parses and every untouched form is byte-identical. Target " +
+			"forms by name or addr; name survives earlier edits better.",
 		promptGuidelines: [
-			"Prefer name targeting (name: \"handle-thing\") over addr — it survives earlier edits.",
-			"content is the FULL replacement form, no markdown fences needed.",
-			"mode: replace (default) | insert-after (anchor: after/name, 0=before first) | insert-before | append | prepend | delete.",
-			"Read the result text: 'replaced form N kind name (was …)' tells you exactly what was touched.",
-			"Address WARNING D1/D2/D4 lines in the result — they mean wrong nesting.",
+			"Small change in a big form → patch mode (oldText/newText); full rewrite → content.",
+			"Fetch exact bytes with clj_get first; edit against them, never re-type from memory.",
+			"Prefer name targeting over addr — addrs shift after insert/delete; the result's 'was …' field tells you exactly what was replaced.",
+			"mode: replace (default) | patch (needs oldText/newText) | insert-after (anchor: after/name, 0=before first) | insert-before | append | prepend | delete.",
+			"Address WARNING D1/D2 lines in the result — they mean a form is nested inside another defn/let.",
 			"dryRun: true validates and shows the outcome without writing.",
 		],
 		parameters: Type.Object({
 			path: Type.String({ description: "Path to the .clj/.cljs/.cljc/.edn file" }),
-			content: Type.String({
-				description: "Replacement or insertion content (one or more whole forms). Ignored for mode=delete.",
-			}),
 			name: Type.Optional(
 				Type.String({ description: "Target form by defined name (defn/def/deftest/…)" }),
 			),
 			addr: Type.Optional(Type.Number({ description: "Target form by 1-based address" })),
+			oldText: Type.Optional(
+				Type.String({
+					description:
+						"Patch mode: exact text to replace inside the target form (must occur exactly once there)",
+				}),
+			),
+			newText: Type.Optional(
+				Type.String({ description: "Patch mode: replacement text (may be empty to delete)" }),
+			),
+			content: Type.Optional(
+				Type.String({
+					description:
+						"Full replacement/insertion content (whole form(s)) for non-patch modes; required for replace/insert unless mode=delete/patch",
+				}),
+			),
 			mode: Type.Optional(
 				Type.Union([
 					Type.Literal("replace"),
+					Type.Literal("patch"),
 					Type.Literal("insert-after"),
 					Type.Literal("insert-before"),
 					Type.Literal("append"),
@@ -237,43 +301,65 @@ export default function ClojureForms(pi: ExtensionAPI) {
 		}),
 
 		async execute(_toolCallId, params, _signal, _onUpdate) {
-			const args = ["edit", params.path, "--json"];
-			args.push("--mode", params.mode ?? "replace");
+			const mode = params.mode ?? (params.oldText !== undefined ? "patch" : "replace");
+			// Validate payload vs mode.
+			if (mode === "delete" || mode === "patch") {
+				// content not needed
+			} else if (params.content === undefined) {
+				return {
+					content: [{ type: "text", text: `clj_edit ${mode} requires content (or use patch mode with oldText/newText)` }],
+					isError: true,
+				};
+			}
+			if (mode === "patch" && params.oldText === undefined) {
+				return {
+					content: [{ type: "text", text: "clj_edit patch requires oldText (and newText, which may be empty string)" }],
+					isError: true,
+				};
+			}
+			if (params.oldText !== undefined && mode !== "patch") {
+				return {
+					content: [{ type: "text", text: `oldText/newText only apply to mode "patch"` }],
+					isError: true,
+				};
+			}
+			const args = ["edit", params.path, "--json", "--mode", mode];
 			if (params.name !== undefined) args.push("--name", params.name);
 			if (params.addr !== undefined) args.push("--addr", String(params.addr));
 			if (params.after !== undefined) args.push("--after", String(params.after));
 			if (params.before !== undefined) args.push("--before", String(params.before));
 			if (params.dryRun) args.push("--dry-run");
-			if (params.mode !== "delete") {
-				// Content via temp file: no stdin in pi.exec, no argv limits.
-				const { writeFileSync, unlinkSync } = await import("node:fs");
-				const { tmpdir } = await import("node:os");
-				const { join } = await import("node:path");
-				const tmp = join(tmpdir(), `cljform-content-${process.pid}-${Date.now()}.clj`);
-				writeFileSync(tmp, params.content ?? "");
-				args.push("--content-file", tmp);
+			if (mode === "patch") {
+				args.push("--old-text", params.oldText!);
+				args.push("--new-text", params.newText ?? "");
+				return await runEdit(args, params);
+			}
+			if (mode === "delete") {
+				return await runEdit(args, params);
+			}
+			// Content via temp file: no stdin in pi.exec, no argv limits.
+			const { writeFileSync, unlinkSync } = await import("node:fs");
+			const { tmpdir } = await import("node:os");
+			const { join } = await import("node:path");
+			const tmp = join(tmpdir(), `cljform-content-${process.pid}-${Date.now()}.clj`);
+			writeFileSync(tmp, params.content ?? "");
+			args.push("--content-file", tmp);
+			try {
+				return await runEdit(args, params);
+			} finally {
 				try {
-					return await runEdit(args, params, tmp, () => unlinkSync(tmp));
-				} finally {
-					try {
-						unlinkSync(tmp);
-					} catch {
-						/* already removed */
-					}
+					unlinkSync(tmp);
+				} catch {
+					/* already removed */
 				}
 			}
-			return await runEdit(args, params, null, null);
 		},
 	});
 
 	async function runEdit(
 		args: string[],
 		params: { path: string; mode?: string; dryRun?: boolean },
-		tmpPath: string | null,
-		cleanup: (() => void) | null,
 	): Promise<{ content: { type: "text"; text: string }[]; isError?: boolean; details?: unknown }> {
-		void tmpPath;
-		void cleanup;
 		const result = await pi.exec(resolveBin(), args, { timeout: 20_000 });
 		const out = parseEnvelope(result.stdout);
 		if (!out || !out.ok) {
@@ -288,6 +374,11 @@ export default function ClojureForms(pi: ExtensionAPI) {
 			lines.push("");
 			lines.push("content was REPAIRED (brackets inferred from indentation) — verify the result:");
 			if (r.repairDiff) lines.push(r.repairDiff);
+		}
+		if (r.diff) {
+			lines.push("");
+			lines.push("patch diff:");
+			lines.push(r.diff);
 		}
 		if (out.forms) {
 			lines.push(`file now: ${out.forms.length} forms · ${shapeSummary(out.forms)}`);
