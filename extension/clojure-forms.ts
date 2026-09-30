@@ -1,0 +1,405 @@
+/**
+ * clojure-forms — form-addressed Clojure editing for pi
+ *
+ * Wraps the cljform Rust CLI (form table, whole-form edits with bracket
+ * repair, shape verification) and guards the built-in edit/write tools for
+ * Clojure/EDN files with a structural shape report.
+ *
+ * Philosophy: the agent should never have to bracket-count. clj_edit does
+ * what it means, repairs unbalanced content when the fix is unambiguous,
+ * never writes a file that doesn't parse, and reports exactly what changed.
+ *
+ * Binary discovery: CLJFORM_BIN env override, then PATH (cargo install).
+ */
+
+import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { Type } from "@sinclair/typebox";
+
+interface FormRow {
+	addr: number;
+	kind: string;
+	name: string | null;
+	line: [number, number];
+	hash: string;
+	contains: Record<string, number>;
+}
+
+interface DetectorWarning {
+	id: string;
+	line: number;
+	end_line: number;
+	message: string;
+	hint: string;
+}
+
+interface CljformOutput {
+	ok: boolean;
+	op: string;
+	file?: string;
+	file_hash?: string;
+	forms?: FormRow[];
+	warnings?: DetectorWarning[];
+	notes?: string[];
+	result?: {
+		text?: string;
+		summary?: any;
+		changed?: number;
+		untouched?: number;
+		repaired?: boolean;
+		repairDiff?: string;
+		wrote?: boolean;
+	};
+	error?: {
+		code: string;
+		line?: number;
+		col?: number;
+		message: string;
+		hint?: string;
+		suggestions?: { addr: number; kind: string; name: string | null; line: [number, number] }[];
+	};
+}
+
+const CLJ_EXT = /\.(clj|cljs|cljc|cljx|edn)$/;
+
+function resolveBin(): string {
+	return process.env.CLJFORM_BIN || "cljform";
+}
+
+/** Parse the CLI's JSON envelope; tolerate trailing output. */
+function parseEnvelope(stdout: string): CljformOutput | null {
+	const start = stdout.indexOf("{");
+	if (start === -1) return null;
+	try {
+		return JSON.parse(stdout.slice(start)) as CljformOutput;
+	} catch {
+		return null;
+	}
+}
+
+function formTableText(forms: FormRow[]): string {
+	if (forms.length === 0) return "(no top-level forms)";
+	return forms
+		.map(
+			(f) =>
+				`  ${String(f.addr).padStart(3)}  ${f.kind.padEnd(12)} ${(f.name ?? "").padEnd(24)} lines ${f.line[0]}–${f.line[1]}`,
+		)
+		.join("\n");
+}
+
+function warningsText(ws: DetectorWarning[]): string[] {
+	return ws.map((w) => `WARNING ${w.id}: ${w.message}`);
+}
+
+function errorText(out: CljformOutput): string {
+	const e = out.error!;
+	const at = e.line !== undefined ? ` @ line ${e.line}${e.col !== undefined ? ` col ${e.col}` : ""}` : "";
+	const lines = [`cljform ${e.code}${at}: ${e.message}`];
+	if (e.suggestions?.length) {
+		for (const s of e.suggestions) {
+			lines.push(
+				`  did you mean: addr ${s.addr} ${s.kind} ${s.name ?? "—"} (lines ${s.line[0]}–${s.line[1]})`,
+			);
+		}
+	}
+	if (e.hint) lines.push(`hint: ${e.hint}`);
+	lines.push("current form table (re-aim without another round-trip):");
+	if (out.forms) lines.push(formTableText(out.forms));
+	return lines.join("\n");
+}
+
+// ─── Extension ────────────────────────────────────────────────────────────────
+
+export default function ClojureForms(pi: ExtensionAPI) {
+	// Fingerprint cache for the guard hook's shape delta. Correctness never
+	// depends on it: a missing entry just means no delta line.
+	const cache = new Map<string, { forms: FormRow[]; at: number }>();
+
+	function cacheKey(path: string): string {
+		return path;
+	}
+
+	function remember(path: string, forms: FormRow[] | undefined) {
+		if (forms) cache.set(cacheKey(path), { forms, at: Date.now() });
+	}
+
+	function shapeSummary(forms: FormRow[]): string {
+		const counts = new Map<string, number>();
+		for (const f of forms) counts.set(f.kind, (counts.get(f.kind) ?? 0) + 1);
+		return [...counts.entries()].map(([k, n]) => `${k}:${n}`).join(" ");
+	}
+
+	/** Delta between two form tables, for the guard hook report. */
+	function shapeDelta(before: FormRow[], after: FormRow[]): string | null {
+		const beforeNames = new Map<string, FormRow>();
+		for (const f of before) {
+			if (f.name) beforeNames.set(`${f.kind}:${f.name}`, f);
+		}
+		const afterNames = new Set<string>();
+		for (const f of after) {
+			if (f.name) afterNames.add(`${f.kind}:${f.name}`);
+		}
+		const lost: string[] = [];
+		const gained: string[] = [];
+		for (const [key, f] of beforeNames) {
+			if (!afterNames.has(key)) lost.push(`${f.kind} ${f.name} (was line ${f.line[0]})`);
+		}
+		for (const f of after) {
+			if (f.name && !beforeNames.has(`${f.kind}:${f.name}`)) gained.push(`${f.kind} ${f.name} (line ${f.line[0]})`);
+		}
+		if (lost.length === 0 && gained.length === 0) return null;
+		const parts: string[] = [];
+		if (lost.length) parts.push(`lost: ${lost.join(", ")}`);
+		if (gained.length) parts.push(`new: ${gained.join(", ")}`);
+		return `forms: ${before.length}→${after.length}, ${parts.join("; ")}`;
+	}
+
+	// ─── clj_forms ──────────────────────────────────────────────────────────
+
+	pi.registerTool({
+		name: "clj_forms",
+		label: "Clj Forms",
+		description:
+			"List the top-level form table of a Clojure/EDN file: address, kind, name, line range, hash, " +
+			"and nesting-shape warnings (e.g. a deftest swallowed by an unclosed defn). " +
+			"Use addresses with clj-edit; prefer name-based targeting.",
+		promptSnippet: "Inspect Clojure file structure as whole forms.",
+		promptGuidelines: [
+			"Run clj_forms before editing to pick a target addr or name.",
+			"Address WARNING D1/D2/D4 lines: they mean a form is nested inside another defn/let — almost always wrong.",
+		],
+		parameters: Type.Object({
+			path: Type.String({ description: "Path to the .clj/.cljs/.cljc/.edn file" }),
+		}),
+
+		async execute(_toolCallId, params, _signal, _onUpdate) {
+			const result = await pi.exec(resolveBin(), ["forms", params.path, "--json"], {
+				timeout: 15_000,
+			});
+			const out = parseEnvelope(result.stdout);
+			if (!out || !out.ok) {
+				const text = out?.error ? errorText(out) : `cljform failed: ${result.stderr || result.stdout}`;
+				return { content: [{ type: "text", text }], isError: true };
+			}
+			remember(params.path, out.forms);
+			const lines = [
+				`${params.path}: ${out.forms!.length} top-level forms · ${out.file_hash?.slice(0, 19)}…`,
+				formTableText(out.forms!),
+				...warningsText(out.warnings ?? []),
+			];
+			return {
+				content: [{ type: "text", text: lines.join("\n") }],
+				details: { forms: out.forms, fileHash: out.file_hash },
+			};
+		},
+	});
+
+	// ─── clj_edit ───────────────────────────────────────────────────────────
+
+	pi.registerTool({
+		name: "clj_edit",
+		label: "Clj Edit",
+		description:
+			"Whole-form edit for Clojure/EDN files: replace a form by name or addr, insert before/after, " +
+			"append/prepend, or delete. Content may be unbalanced — brackets are repaired from indentation " +
+			"when unambiguous, and markdown fences are stripped. The file is written only if the result " +
+			"parses and every untouched form is byte-identical. Shape warnings (D1: deftest nested in defn, " +
+			"etc.) are reported in-turn. Use this instead of raw edit/write for Clojure files.",
+		promptGuidelines: [
+			"Prefer name targeting (name: \"handle-thing\") over addr — it survives earlier edits.",
+			"content is the FULL replacement form, no markdown fences needed.",
+			"mode: replace (default) | insert-after (anchor: after/name, 0=before first) | insert-before | append | prepend | delete.",
+			"Read the result text: 'replaced form N kind name (was …)' tells you exactly what was touched.",
+			"Address WARNING D1/D2/D4 lines in the result — they mean wrong nesting.",
+			"dryRun: true validates and shows the outcome without writing.",
+		],
+		parameters: Type.Object({
+			path: Type.String({ description: "Path to the .clj/.cljs/.cljc/.edn file" }),
+			content: Type.String({
+				description: "Replacement or insertion content (one or more whole forms). Ignored for mode=delete.",
+			}),
+			name: Type.Optional(
+				Type.String({ description: "Target form by defined name (defn/def/deftest/…)" }),
+			),
+			addr: Type.Optional(Type.Number({ description: "Target form by 1-based address" })),
+			mode: Type.Optional(
+				Type.Union([
+					Type.Literal("replace"),
+					Type.Literal("insert-after"),
+					Type.Literal("insert-before"),
+					Type.Literal("append"),
+					Type.Literal("prepend"),
+					Type.Literal("delete"),
+				], { description: "Default replace" }),
+			),
+			after: Type.Optional(Type.Number({ description: "insert-after anchor addr (0 = before first)" })),
+			before: Type.Optional(Type.Number({ description: "insert-before anchor addr" })),
+			dryRun: Type.Optional(Type.Boolean({ description: "Validate and report without writing" })),
+		}),
+
+		async execute(_toolCallId, params, _signal, _onUpdate) {
+			const args = ["edit", params.path, "--json"];
+			args.push("--mode", params.mode ?? "replace");
+			if (params.name !== undefined) args.push("--name", params.name);
+			if (params.addr !== undefined) args.push("--addr", String(params.addr));
+			if (params.after !== undefined) args.push("--after", String(params.after));
+			if (params.before !== undefined) args.push("--before", String(params.before));
+			if (params.dryRun) args.push("--dry-run");
+			if (params.mode !== "delete") {
+				// Content via temp file: no stdin in pi.exec, no argv limits.
+				const { writeFileSync, unlinkSync } = await import("node:fs");
+				const { tmpdir } = await import("node:os");
+				const { join } = await import("node:path");
+				const tmp = join(tmpdir(), `cljform-content-${process.pid}-${Date.now()}.clj`);
+				writeFileSync(tmp, params.content ?? "");
+				args.push("--content-file", tmp);
+				try {
+					return await runEdit(args, params, tmp, () => unlinkSync(tmp));
+				} finally {
+					try {
+						unlinkSync(tmp);
+					} catch {
+						/* already removed */
+					}
+				}
+			}
+			return await runEdit(args, params, null, null);
+		},
+	});
+
+	async function runEdit(
+		args: string[],
+		params: { path: string; mode?: string; dryRun?: boolean },
+		tmpPath: string | null,
+		cleanup: (() => void) | null,
+	): Promise<{ content: { type: "text"; text: string }[]; isError?: boolean; details?: unknown }> {
+		void tmpPath;
+		void cleanup;
+		const result = await pi.exec(resolveBin(), args, { timeout: 20_000 });
+		const out = parseEnvelope(result.stdout);
+		if (!out || !out.ok) {
+			const text = out?.error ? errorText(out) : `cljform failed: ${result.stderr || result.stdout}`;
+			return { content: [{ type: "text", text }], isError: true };
+		}
+		if (!params.dryRun) remember(params.path, out.forms);
+
+		const r = out.result ?? {};
+		const lines: string[] = [r.text ?? "done"];
+		if (r.repaired) {
+			lines.push("");
+			lines.push("content was REPAIRED (brackets inferred from indentation) — verify the result:");
+			if (r.repairDiff) lines.push(r.repairDiff);
+		}
+		if (out.forms) {
+			lines.push(`file now: ${out.forms.length} forms · ${shapeSummary(out.forms)}`);
+		}
+		lines.push(...warningsText(out.warnings ?? []));
+		for (const n of out.notes ?? []) lines.push(`note: ${n}`);
+		if (r.changed !== undefined) lines.push(`changed: ${r.changed}, untouched: ${r.untouched}`);
+		if (params.dryRun) lines.push("(dry run — nothing written)");
+		return { content: [{ type: "text", text: lines.join("\n") }], details: { forms: out.forms, result: r } };
+	}
+
+	// ─── guard hook on built-in edit/write ──────────────────────────────────
+
+	pi.on("tool_result", async (event) => {
+		if (event.type !== "tool_result") return;
+		if (event.toolName !== "edit" && event.toolName !== "write") return;
+		const path = (event.input as { path?: string }).path;
+		if (!path || !CLJ_EXT.test(path)) return;
+
+		// Only when the file exists (write may create; edit always targets).
+		const { existsSync } = await import("node:fs");
+		const { resolve } = await import("node:path");
+		if (!existsSync(path)) return;
+		const abs = resolve(path);
+
+		const result = await pi.exec(resolveBin(), ["check", abs, "--json"], {
+			timeout: 2_000,
+		});
+		const out = parseEnvelope(result.stdout);
+		const report: string[] = ["── cljform shape report ──"];
+
+		if (!out) {
+			report.push("(check skipped: cljform unavailable or timed out)");
+		} else if (!out.ok) {
+			const e = out.error!;
+			report.push(
+				`BLOCKING: the file no longer parses — ${e.message}${e.line ? ` (line ${e.line}, col ${e.col ?? 1})` : ""}`,
+			);
+			report.push("Fix the bracket structure immediately; nothing else about this edit is verified.");
+		} else {
+			remember(abs, out.forms);
+			const prev = cache.get(cacheKey(abs));
+			const delta = prev ? shapeDelta(prev.forms, out.forms) : null;
+			const warnings = warningsText(out.warnings ?? []);
+			if (delta) {
+				report.push(delta);
+			} else if (warnings.length > 0) {
+				report.push(`shape (${out.forms!.length} forms: ${shapeSummary(out.forms!)})`);
+			} else {
+				report.push(`shape ok (${out.forms!.length} forms: ${shapeSummary(out.forms!)})`);
+			}
+			report.push(...warnings);
+		}
+
+		return {
+			content: [...event.content, { type: "text" as const, text: report.join("\n") }],
+		};
+	});
+
+	// ─── system prompt note ─────────────────────────────────────────────────
+
+	let probed = false;
+	let hasClojureFiles = false;
+
+	pi.on("before_agent_start", async (_event, ctx) => {
+		if (!probed) {
+			probed = true;
+			hasClojureFiles = await probeForClojure(ctx.cwd);
+		}
+		if (!hasClojureFiles) return;
+		return {
+			systemPrompt: `${_event.systemPrompt}
+
+For Clojure/EDN files (*.clj, *.cljs, *.cljc, *.edn) prefer the clj_forms/clj_edit tools over raw text
+edits: they address whole forms by name or address, repair unbalanced brackets automatically, and never
+write a file that does not parse. Shape reports in tool results are binding: a "BLOCKING: the file no
+longer parses" line, lost forms in the guard report, or D1–D4 nesting warnings must be fixed or
+explicitly justified in your next action. After editing, prefer clj-check semantics already built into
+clj_edit's output over re-reading the whole file.`,
+		};
+	});
+}
+
+/** Cheap probe: does this project contain Clojure-ish files? Depth-limited. */
+async function probeForClojure(cwd: string): Promise<boolean> {
+	const { readdirSync } = await import("node:fs");
+	const { join } = await import("node:path");
+	const exts = [".clj", ".cljs", ".cljc", ".cljx", ".edn"];
+	const skip = new Set(["node_modules", ".git", "target", ".cpcache", ".lsp", ".shadow-cljs", "dist"]);
+	let budget = 400;
+	function scan(dir: string, depth: number): boolean {
+		if (depth > 4 || budget <= 0) return false;
+		let entries: string[];
+		try {
+			entries = readdirSync(dir);
+		} catch {
+			return false;
+		}
+		for (const e of entries) {
+			budget -= 1;
+			if (exts.some((x) => e.endsWith(x))) return true;
+			if (skip.has(e)) continue;
+			const full = join(dir, e);
+			try {
+				if (readdirSync(full).length >= 0 && budget > 0) {
+					if (scan(full, depth + 1)) return true;
+				}
+			} catch {
+				/* not a directory */
+			}
+		}
+		return false;
+	}
+	return scan(cwd, 0);
+}

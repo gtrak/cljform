@@ -58,7 +58,8 @@ on a 64 MB-stack worker thread — 50k-deep data is fine.
 
 ## The pi extension
 
-`~/.pi/agent/extensions/clojure-forms.ts` registers:
+Lives in this repo at `extension/clojure-forms.ts` (with the
+`extension/agents/clojure-worker.md` subagent definition). It registers:
 
 - **clj_forms / clj_edit** — the table and the whole-form editor (content
   via temp file; names survive earlier edits better than addresses).
@@ -70,17 +71,31 @@ on a 64 MB-stack worker thread — 50k-deep data is fine.
 - **System-prompt note** — injected only when the project contains
   Clojure-ish files.
 
+### Install
+
+```sh
+cargo install --path .
+ln -s "$PWD/extension/clojure-forms.ts" ~/.pi/agent/extensions/clojure-forms.ts
+ln -s "$PWD/extension/agents/clojure-worker.md"   ~/.pi/agent/agents/clojure-worker.md
+```
+
+The symlink keeps the installed extension live-tracking this repo — edits
+here apply on the next pi session (or `/reload`).
+
 Subagents: builtin agents (e.g. `worker`) have strict tool allowlists and do
 not inherit extension tools, but the guard hook still fires for them. For
-form-addressed editing in subagents use the `clojure-worker` agent
-(`~/.pi/agent/agents/clojure-worker.md`), whose allowlist includes the clj
-tools.
+form-addressed editing in subagents use the `clojure-worker` agent, whose
+allowlist includes the clj tools. Verified against the builtin `worker` and
+`clojure-worker` with adversarial drills on a local model: bracket-mismatch
+refusals and self-corrections, stale-address recovery via the `was …`
+result field, D1 bait compliance/justification, and `BLOCKING:` recovery —
+see SPEC.md §14.
 
 ## Building
 
 ```
-cargo install --path cljform        # binary → ~/.cargo/bin/cljform
-cargo test  --path cljform          # 48 tests: cli, golden, repair,
+cargo install --path .              # binary → ~/.cargo/bin/cljform
+cargo test                          # 48 tests: cli, golden, repair,
                                     # adversarial, fuzz, F1 regression
 ```
 
