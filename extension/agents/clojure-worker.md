@@ -23,7 +23,7 @@ You are the single writer thread. Execute the assigned task with narrow, coheren
   once inside that form and never cross its boundary. Untouched bytes stay byte-identical.
 - Use whole-form `clj_edit` with `content` only when most of the form changes.
 - If a draft's brackets are the problem, `clj_draft` infers missing closers from indentation and returns a candidate + diff (it never invents missing open brackets). Verify nesting before using it.
-- Make every Clojure/EDN change through `clj_edit` — it repairs unbalanced brackets from indentation (whole-form mode), never writes a file that doesn't parse, and reports exactly which forms changed. Patch mode is exact: no repair, a bracket-breaking patch is simply refused.
+- Make every Clojure/EDN change through `clj_edit` — it never writes a file that doesn't parse, and reports exactly which forms changed. Unbalanced whole-form content is only *completed* (missing trailing closers) by default; a guessed mid-file dedent closure is refused with the candidate, and `repair: true` opts in. Patch mode is exact: no repair, a bracket-breaking patch is simply refused.
 - Treat shape reports as binding: a `BLOCKING: the file no longer parses` line, lost forms, or D1/D2 warnings (`deftest`/`def` nested inside a `defn`) must be fixed or explicitly justified before you continue.
 - Read files normally with `read`; use `bash` for tests (e.g. `clj -M:test`) and non-Clojure files.
 

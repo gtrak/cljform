@@ -35,6 +35,10 @@ pub enum PrepareError {
     /// `--strict`: content is unbalanced and would have been repaired;
     /// refusal instead, carrying the repair diff that was not applied.
     RepairRefused { diff: String },
+    /// Repair would have to close an inner form at a mid-file dedent. That
+    /// placement is a guess from indentation alone, so it is refused unless
+    /// the caller explicitly opts in (`--repair`).
+    DedentRepairRefused { candidate: String, diff: String },
 }
 
 impl PrepareError {
@@ -59,6 +63,10 @@ impl PrepareError {
             PrepareError::TruncatedFence => "content starts with a markdown fence that is never \
                  closed — the paste looks truncated, so it was not repaired"
                 .to_string(),
+            PrepareError::DedentRepairRefused { .. } => "content is unbalanced and can only be \
+                 completed by closing an inner form at a dedent — that placement is a guess, so \
+                 it was refused"
+                .to_string(),
         }
     }
 
@@ -68,7 +76,8 @@ impl PrepareError {
             PrepareError::Materialize(e) => Some((e.line, e.col)),
             PrepareError::Empty
             | PrepareError::TruncatedFence
-            | PrepareError::RepairRefused { .. } => None,
+            | PrepareError::RepairRefused { .. }
+            | PrepareError::DedentRepairRefused { .. } => None,
         }
     }
 }
@@ -88,7 +97,12 @@ pub fn normalize_draft(raw: &str) -> (String, Vec<String>, bool) {
 }
 
 /// Normalize raw content into spliceable, parseable bytes.
-pub fn prepare(raw: &str, allow_empty: bool, strict: bool) -> Result<Prepared, PrepareError> {
+pub fn prepare(
+    raw: &str,
+    allow_empty: bool,
+    strict: bool,
+    allow_dedent: bool,
+) -> Result<Prepared, PrepareError> {
     // 1. Strip fences and trim edges.
     let (text, mut notes, truncated_fence) = normalize_draft(raw);
 
@@ -116,21 +130,29 @@ pub fn prepare(raw: &str, allow_empty: bool, strict: bool) -> Result<Prepared, P
         return Err(PrepareError::TruncatedFence);
     }
 
-    // 3. Unbalanced: indent-mode repair — unless `--strict` refuses it. A
-    //    non-repair (indent mode had nothing to add) is a plain parse error.
-    match materialize::indent_mode(&text) {
+    // 3. Unbalanced: indent-mode repair. Forced completion (appending missing
+    //    trailing closers) is applied; closing an inner form at a mid-file
+    //    dedent is a guess from indentation alone, so it needs explicit opt-in
+    //    (`--repair`). `--strict` refuses any repair.
+    match materialize::indent_mode_full(&text) {
         Err(e) => Err(PrepareError::Materialize(e)),
-        Ok(repaired) if repaired == text => {
-            Err(PrepareError::Unparseable(parser::parse(text.as_bytes()).expect_err("parse failed above")))
-        }
-        Ok(repaired) => {
-            let diff = materialize::unified_diff(&text, &repaired, "submitted", "repaired");
+        Ok(r) if r.text == text => Err(PrepareError::Unparseable(
+            parser::parse(text.as_bytes()).expect_err("parse failed above"),
+        )),
+        Ok(r) => {
+            let diff = materialize::unified_diff(&text, &r.text, "submitted", "repaired");
             if strict {
                 return Err(PrepareError::RepairRefused { diff });
             }
+            if r.dedent_closures && !allow_dedent {
+                return Err(PrepareError::DedentRepairRefused {
+                    candidate: r.text,
+                    diff,
+                });
+            }
             notes.push("content unbalanced; brackets repaired by indentation".to_string());
-            match parser::parse(repaired.as_bytes()) {
-                Ok(parsed) => finish(&repaired, parsed.forms.len(), true, diff, notes),
+            match parser::parse(r.text.as_bytes()) {
+                Ok(parsed) => finish(&r.text, parsed.forms.len(), true, diff, notes),
                 // Repair didn't take: surface the direct parse error (more precise).
                 Err(_) => Err(PrepareError::Unparseable(
                     parser::parse(text.as_bytes()).expect_err("parse failed above"),

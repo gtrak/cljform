@@ -1,6 +1,6 @@
 # cljform — form-addressed Clojure editing: spec
 
-Status: **implemented (v1; v0.3 patch mode, strict repair refusal, clj_draft)** · Created: 2026-09-29
+Status: **implemented (v1; patch mode, bounded repair, strict, clj_draft)** · Created: 2026-09-29
 Shape: standalone Rust CLI (`cljform`) + pi extension wrapper (`clojure-forms`)
 
 ## 1. Problem
@@ -449,20 +449,22 @@ design):
   structurally ambiguous content is refused (exit 1, line/col, nothing
   written). Comments-only/empty content is still rejected (interpolation
   accidents).
-- **Repair is opt-out and truncated content is never repaired (v0.3).**
-  Unbalanced content is still repaired by indent-mode inference with a
-  reported diff, but `--strict` refuses any repair (exit 3,
-  `repair-refused`, carrying the declined diff). Content from an opening
-  markdown fence with no closing fence is refused outright (exit 1,
-  `truncated-content`) rather than repaired — a dangling fence means the
-  paste was likely cut off, and closing a truncated form is exactly the
-  guessed repair this tool exists to avoid. Complete content under a
-  dangling fence is still accepted.
-- **Indent mode fixed (v0.3).** The completer compared an *absolute* byte
-  column against a *per-line* indent, so an inner form closed a line early
-  and its body escaped it (`(let [y 2])` followed by the body). Now `col` is
+- **Repair is bounded and truncated content is never repaired.** Unbalanced
+  content is repaired by indent-mode inference with a reported diff, but the
+  scope is deliberately narrow. The default only **completes** content the
+  forced way: appending missing trailing closers. A repair that would close
+  an inner form at a mid-file **dedent** is a placement guessed from
+  indentation alone, so it is refused (exit 3, `dedent-repair`, carrying the
+  candidate and diff); `--repair` opts in. `--strict` refuses **any** repair
+  (exit 3, `repair-refused`). Content from an opening markdown fence with no
+  closing fence is refused outright (exit 1, `truncated-content`) rather
+  than repaired — a dangling fence means the paste was likely cut off.
+  Complete content under a dangling fence is still accepted.
+- **Indent mode fixed.** The completer compared an *absolute* byte column
+  against a *per-line* indent, so an inner form closed a line early and its
+  body escaped it (`(let [y 2])` followed by the body). Now `col` is
   line-relative; repair is asserted on nesting, not just paren balance.
-- **`materialize` sees the real draft (v0.3).** The op pre-repaired through
+- **`materialize` sees the real draft.** The op pre-repaired through
   `prepare` and then inferred again, so a pre-repaired draft always looked
   like a no-op. It now runs on the fence-stripped raw draft. Scope is
   deliberately conservative: it completes missing **closers** from
@@ -500,7 +502,7 @@ design):
   prompt note as specced. Builtin subagents don't inherit extension tools
   (strict allowlists) but the guard hook fires for them; a
   `clojure-worker` user agent ships with the clj tools allowed.
-- **Tests:** 56 green (cli, golden, repair, adversarial, fuzz, F1
+- **Tests:** 57 green (cli, golden, repair, adversarial, fuzz, F1
   regression); `cargo clippy -D warnings` clean; release `check` on a
   1,081-line file < 10 ms. Dogfooded end-to-end by a local model via the
   wrapper (4 tasks, tests green, shape reports binding) including a live

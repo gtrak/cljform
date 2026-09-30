@@ -5,8 +5,19 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 fn edit_content(file: &str, name: &str, content: &str) -> (i32, serde_json::Value) {
+    edit_content_extra(file, name, content, &[])
+}
+
+fn edit_content_extra(
+    file: &str,
+    name: &str,
+    content: &str,
+    extra: &[&str],
+) -> (i32, serde_json::Value) {
+    let mut args = vec!["edit", file, "--name", name, "--content", content, "--json"];
+    args.extend_from_slice(extra);
     let mut child = Command::new(env!("CARGO_BIN_EXE_cljform"))
-        .args(["edit", file, "--name", name, "--content", content, "--json"])
+        .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -196,6 +207,33 @@ fn repair_keeps_bare_body_inside_inner_form() {
     assert_eq!(
         g["result"]["form"].as_str().unwrap(),
         "(defn target [x]\n  (let [y 2]\n    y))"
+    );
+}
+
+#[test]
+fn mid_file_dedent_repair_requires_opt_in() {
+    // Closing an inner form at a dedent is a guess from indentation alone.
+    // Default refuses it (with the candidate); --repair applies it.
+    let content = "(defn target [x]\n  (let [y 2]\n    (+ x y)\n  (inc x)";
+    let p = fixture("r12.clj");
+    let before = std::fs::read_to_string(&p).unwrap();
+    let (code, d) = edit_content(p.to_str().unwrap(), "target", content);
+    assert_eq!(code, 3, "{d}");
+    assert_eq!(d["error"]["code"], "dedent-repair");
+    assert!(d["error"]["message"].as_str().unwrap().contains("candidate:"));
+    assert_eq!(std::fs::read_to_string(&p).unwrap(), before, "nothing written");
+
+    let (code, d) = edit_content_extra(p.to_str().unwrap(), "target", content, &["--repair"]);
+    assert_eq!(code, 0, "{d}");
+    assert_eq!(d["result"]["repaired"], true);
+    let get = Command::new(env!("CARGO_BIN_EXE_cljform"))
+        .args(["get", p.to_str().unwrap(), "--name", "target", "--json"])
+        .output()
+        .unwrap();
+    let g: serde_json::Value = serde_json::from_slice(&get.stdout).unwrap();
+    assert_eq!(
+        g["result"]["form"].as_str().unwrap(),
+        "(defn target [x]\n  (let [y 2]\n    (+ x y))\n  (inc x))"
     );
 }
 

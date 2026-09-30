@@ -125,6 +125,11 @@ enum Op {
         /// Hard-fail on warnings (detector hits, stale --expect).
         #[arg(long)]
         strict: bool,
+        /// Allow repair to close an inner form at a mid-file dedent. That
+        /// placement is inferred from indentation alone; by default only
+        /// missing trailing closers are completed.
+        #[arg(long)]
+        repair: bool,
     },
     /// Infer brackets from indentation (candidate only; never writes).
     Materialize {
@@ -728,9 +733,10 @@ fn dispatch(cli: &Cli) -> Result<Output, Fail> {
             expect,
             dry_run,
             strict,
+            repair,
         } => run_edit(
             file, *mode, *addr, *after, *before, name, content, content_file, old_text, new_text,
-            expect, *dry_run, *strict,
+            expect, *dry_run, *strict, *repair,
         ),
     }
 }
@@ -767,6 +773,22 @@ fn prepare_fail(p: content::PrepareError) -> Fail {
                 suggestions: None,
             },
         ),
+        content::PrepareError::DedentRepairRefused { candidate, diff } => Fail(
+            3,
+            ErrorBody {
+                code: "dedent-repair",
+                line: None,
+                col: None,
+                message: format!(
+                    "content can only be balanced by closing an inner form at a dedent — that placement is a guess, so it was refused\n{diff}\ncandidate:\n{candidate}"
+                ),
+                hint: Some(
+                    "submit balanced content, run clj_draft, or pass --repair to apply the guessed repair"
+                        .into(),
+                ),
+                suggestions: None,
+            },
+        ),
         other => Fail(
             1,
             ErrorBody {
@@ -799,6 +821,7 @@ fn run_edit(
     expect: &Option<String>,
     dry_run: bool,
     strict: bool,
+    repair: bool,
 ) -> Result<Output, Fail> {
     let (bytes, had_bom) = read_file(file)?;
     let parsed = parse_or_fail(&bytes, "file")?;
@@ -961,7 +984,7 @@ fn run_edit(
         _ => {
             let raw = read_content(content, content_file)?;
             Some(Payload::Prepared(
-                content::prepare(&raw, false, strict).map_err(prepare_fail)?,
+                content::prepare(&raw, false, strict, repair).map_err(prepare_fail)?,
             ))
         }
     };

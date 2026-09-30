@@ -30,12 +30,13 @@ cljform [--json|--human] <op> …
 | `forms <file>` | Top-level form table: addr, kind, name, lines, blake3, `contains` shape summary, D-warnings |
 | `get <file> [--addr N\|--name sym]` | One form's exact bytes + metadata |
 | `check [file]` | Parse + table + nesting warnings (file or stdin) |
-| `edit <file> --name s\|--addr N [--mode M] [--content C\|--content-file F]` | Whole-form edit; modes `replace` (default), `insert-after` (`--after`, 0=before first), `insert-before` (`--before`), `append`, `prepend`, `delete` |
+| `edit <file> --name s\|--addr N [--mode M] [--content C\|--content-file F] [--repair]` | Whole-form edit; modes `replace` (default), `insert-after` (`--after`, 0=before first), `insert-before` (`--before`), `append`, `prepend`, `delete`. `--repair` allows a guessed mid-file dedent closure |
 | `edit <file> --name s\|--addr N --mode patch --old-text T [--new-text U]` | Surgical text patch inside one form: `T` must occur exactly once in the form's byte range and never cross its boundary; `U` (default empty) replaces it. Bytes outside the match are untouched; no bracket repair, but I1–I3 still gate the write |
 | `materialize --content C` | Indent-mode bracket completion → labeled candidate + diff (never writes). Completes missing **closers** implied by indentation; it does not invent missing openers, so a fully bracket-less draft comes back unchanged with a note |
 
 Exit codes: `0` ok · `1` parse/structure failure (nothing written) · `2`
-usage · `3` name not found / ambiguous / stale `--expect` under `--strict` ·
+usage · `3` targeting failure or refused repair (not found / ambiguous /
+stale `--expect` under `--strict` / `repair-refused` / `dedent-repair`) ·
 `4` I/O.
 
 Guards: `--expect <hash-prefix>` (12+ hex chars, `blake3:` optional) is
@@ -45,10 +46,14 @@ turns mismatches, detector warnings, **and content repairs** into refusals
 (exit 3, `repair-refused`, with the diff it declined to apply). `--dry-run`
 validates and writes nothing.
 
-Refusal beats guessed repair. Unbalanced content is repaired from
-indentation only when that is safe; two cases are refused outright instead:
-content from an **unterminated markdown fence** (a likely truncated paste —
-never repaired, exit 1 `truncated-content`), and `--strict`.
+Refusal beats guessed repair. By default cljform only *completes* unbalanced
+content the forced way — appending missing trailing closers. A repair that
+would close an inner form at a mid-file **dedent** is a placement guessed
+from indentation, so it is refused with the candidate diff (exit 3,
+`dedent-repair`); pass `--repair` to apply it. Two more cases are refused
+outright: content from an **unterminated markdown fence** (a likely
+truncated paste — exit 1, `truncated-content`), and any repair under
+`--strict`.
 
 ## Detectors
 
@@ -109,7 +114,7 @@ see SPEC.md §14.
 
 ```
 cargo install --path .              # binary → ~/.cargo/bin/cljform
-cargo test                          # 56 tests: cli, golden, repair,
+cargo test                          # 57 tests: cli, golden, repair,
                                     # adversarial, fuzz, F1 regression
 ```
 
@@ -133,5 +138,7 @@ evaluated.
   balance. Indent mode once compared an absolute byte column against a
   per-line indent, closing an inner form a line early (`(let [y 2])` with
   the body escaping it); balance-only assertions passed the wrong output.
-  Now the repaired form text is compared exactly, and an unterminated
-  markdown fence around unbalanced content is refused, not repaired.
+  Now the repaired form text is compared exactly; an unterminated
+  markdown fence around unbalanced content is refused, not repaired; and a
+  mid-file **dedent** closure (the last guessed placement) is refused unless
+  `--repair` opts in.

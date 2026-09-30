@@ -322,6 +322,7 @@ export default function ClojureForms(pi: ExtensionAPI) {
 			"Address WARNING D1/D2 lines in the result — they mean a form is nested inside another defn/let.",
 			"dryRun: true validates and shows the outcome without writing.",
 			"strict: true (CI mode) refuses detector warnings, --expect mismatches, and content repairs instead of applying them.",
+			"repair: true allows a guessed mid-file (dedent) closure; by default only missing trailing closers are completed — a dedent-repair refusal shows the candidate.",
 		],
 		parameters: Type.Object({
 			path: Type.String({ description: "Path to the .clj/.cljs/.cljc/.edn file" }),
@@ -364,6 +365,12 @@ export default function ClojureForms(pi: ExtensionAPI) {
 						"Refuse mismatches, detector warnings, and content repairs instead of applying them (CI mode)",
 				}),
 			),
+			repair: Type.Optional(
+				Type.Boolean({
+					description:
+						"Allow repair to close an inner form at a mid-file dedent (guessed placement). By default only missing trailing closers are completed",
+				}),
+			),
 		}),
 
 		async execute(_toolCallId, params, _signal, _onUpdate) {
@@ -396,6 +403,7 @@ export default function ClojureForms(pi: ExtensionAPI) {
 			if (params.before !== undefined) args.push("--before", String(params.before));
 			if (params.dryRun) args.push("--dry-run");
 			if (params.strict) args.push("--strict");
+			if (params.repair) args.push("--repair");
 			if (mode === "patch") {
 				args.push("--old-text", params.oldText!);
 				args.push("--new-text", params.newText ?? "");
