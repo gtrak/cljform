@@ -5,44 +5,14 @@
 //! Must report the reduced top-level count AND fire D1 with exact line
 //! ranges. This test exists because nothing else caught F1.
 
-use std::process::Command;
+mod common;
 
-fn run_json(args: &[&str]) -> serde_json::Value {
-    let out = Command::new(env!("CARGO_BIN_EXE_cljform"))
-        .args(args)
-        .output()
-        .expect("spawn cljform");
-    assert!(out.status.success(), "check must succeed on a balanced file");
-    serde_json::from_slice(&out.stdout).expect("json envelope")
-}
-
-/// A node's handle, found by def name (top-level).
-fn handle_of(file: &str, name: &str) -> String {
-    let out = Command::new(env!("CARGO_BIN_EXE_cljform"))
-        .args(["tree", file, "--json"])
-        .output()
-        .expect("spawn cljform");
-    assert!(out.status.success(), "tree must succeed");
-    let d: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json envelope");
-    d["result"]["nodes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|n| n["name"].as_str() == Some(name))
-        .unwrap_or_else(|| panic!("no node named {name:?}"))
-        ["handle"]
-        .as_str()
-        .unwrap()
-        .to_string()
-}
+use common::{fixture, handle_of, run_json};
 
 #[test]
 fn swallowed_deftests_are_detected_with_exact_lines() {
-    let dir = std::env::temp_dir().join("cljform-regression");
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("swallowed.clj");
-    std::fs::write(
-        &path,
+    let path = fixture(
+        "swallowed.clj",
         r#"(ns app.bad)
 
 (defn make-widget [x]
@@ -51,11 +21,12 @@ fn swallowed_deftests_are_detected_with_exact_lines() {
 (deftest t-one (is true))
 (deftest t-two (is true))
 (deftest t-three (is true)))
-"#,
-    )
-    .unwrap();
+"#
+        .as_bytes(),
+    );
 
-    let d = run_json(&["check", path.to_str().unwrap(), "--json"]);
+    let (code, d, err) = run_json(&["check", &path, "--json"], None);
+    assert_eq!(code, 0, "check must succeed on a balanced file: {d} {err}");
 
     // The file parses "fine" — that's the trap.
     assert_eq!(d["ok"], true);
@@ -90,30 +61,25 @@ fn swallowed_deftests_are_detected_with_exact_lines() {
 
 #[test]
 fn edit_carrying_the_bug_fires_d1_in_result() {
-    let dir = std::env::temp_dir().join("cljform-regression");
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("swallowed-edit.clj");
-    std::fs::write(
-        &path,
-        "(ns app.bad)\n\n(defn make-widget [x]\n  {:w x})\n\n(deftest t-real (is true))\n",
-    )
-    .unwrap();
+    let path = fixture(
+        "swallowed-edit.clj",
+        b"(ns app.bad)\n\n(defn make-widget [x]\n  {:w x})\n\n(deftest t-real (is true))\n",
+    );
 
-    let h = handle_of(path.to_str().unwrap(), "make-widget");
-    let out = Command::new(env!("CARGO_BIN_EXE_cljform"))
-        .args([
+    let h = handle_of(&path, "make-widget");
+    let (code, d, err) = run_json(
+        &[
             "edit",
-            path.to_str().unwrap(),
+            &path,
             "--handle",
             &h,
             "--content",
             "(defn make-widget [x]\n  {:w x}\n(deftest stray (is true)))",
             "--json",
-        ])
-        .output()
-        .expect("spawn cljform");
-    assert!(out.status.success());
-    let d: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "{d} {err}");
 
     // The edit applies (balanced), and D1 fires on the result — the agent
     // sees it in-turn.
@@ -133,25 +99,22 @@ fn edit_carrying_the_bug_fires_d1_in_result() {
 
 #[test]
 fn the_same_edit_via_strict_mode_refuses() {
-    let dir = std::env::temp_dir().join("cljform-regression");
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("swallowed-strict.clj");
-    std::fs::write(&path, "(ns s)\n\n(defn f [x] x)\n").unwrap();
+    let path = fixture("swallowed-strict.clj", b"(ns s)\n\n(defn f [x] x)\n");
 
-    let out = Command::new(env!("CARGO_BIN_EXE_cljform"))
-        .args([
+    let (code, d, err) = run_json(
+        &[
             "edit",
-            path.to_str().unwrap(),
+            &path,
             "--handle",
-            &handle_of(path.to_str().unwrap(), "f"),
+            &handle_of(&path, "f"),
             "--content",
             "(defn f [x]\n  x\n(deftest swallowed (is true)))",
             "--strict",
             "--json",
-        ])
-        .output()
-        .expect("spawn cljform");
-    assert_eq!(out.status.code(), Some(1), "strict mode: detector hit must refuse");
+        ],
+        None,
+    );
+    assert_eq!(code, 1, "strict mode: detector hit must refuse: {d} {err}");
     // Nothing written.
     assert_eq!(
         std::fs::read_to_string(&path).unwrap(),

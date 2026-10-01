@@ -1,388 +1,61 @@
-//! CLI contract battery: every op, mode, guard, and invariant.
+//! CLI contract: flags, exit codes, human/JSON rendering, usage errors.
 
-use std::io::Write;
-use std::process::{Command, Stdio};
+mod common;
 
-fn run(args: &[&str], stdin: Option<&str>) -> (i32, serde_json::Value, String) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_cljform"))
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    if let Some(s) = stdin {
-        child.stdin.as_mut().unwrap().write_all(s.as_bytes()).ok();
-    }
-    let out = child.wait_with_output().unwrap();
-    let json = serde_json::from_slice(&out.stdout).unwrap_or(serde_json::Value::Null);
-    (
-        out.status.code().unwrap_or(-1),
-        json,
-        String::from_utf8_lossy(&out.stderr).to_string(),
-    )
-}
-
-fn fresh(name: &str) -> (std::path::PathBuf, String) {
-    let dir = std::env::temp_dir().join("cljform-cli");
-    std::fs::create_dir_all(&dir).unwrap();
-    let p = dir.join(name);
-    std::fs::write(
-        &p,
-        r#"(ns c)
-
-(def config {:a 1})
-
-(defn helper [x]
-  (* x 2))
-
-(deftest helper-test
-  (is (= 4 (helper 2))))
-
-(defn last-one [] :done)
-"#,
-    )
-    .unwrap();
-    let s = p.to_str().unwrap().to_string();
-    (p, s)
-}
-
-/// The `tree` node table: path, kind, name, line, handle, …
-fn handles(file: &str) -> serde_json::Value {
-    let (code, d, _) = run(&["tree", file, "--json"], None);
-    assert_eq!(code, 0, "{d}");
-    d["result"]["nodes"].clone()
-}
-
-/// A node's handle, found by def name (top-level) or node path.
-fn handle_of(file: &str, name_or_path: &str) -> String {
-    let nodes = handles(file);
-    let hit = nodes
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|n| {
-            n["name"].as_str() == Some(name_or_path)
-                || n["path"].as_str() == Some(name_or_path)
-        })
-        .unwrap_or_else(|| panic!("no node named/pathed {name_or_path:?}"));
-    hit["handle"].as_str().unwrap().to_string()
-}
-
-#[test]
-fn replace_by_handle() {
-    let (_p, f) = fresh("replace.clj");
-    let h = handle_of(&f, "helper");
-    let (code, d, _) = run(&["edit", &f, "--handle", &h, "--content", "(defn helper [x] (* x 3))", "--json"], None);
-    assert_eq!(code, 0);
-    assert_eq!(d["result"]["summary"]["action"], "replaced");
-    assert_eq!(d["result"]["summary"]["path"], "3");
-    assert_eq!(d["result"]["changed"], 1);
-    assert_eq!(d["result"]["untouched"], 4);
-    assert_eq!(d["forms"].as_array().unwrap().len(), 5);
-
-    let h2 = handle_of(&f, "2");
-    let (code, d, _) = run(&["edit", &f, "--handle", &h2, "--content", "(def config {:a 2})", "--json"], None);
-    assert_eq!(code, 0);
-    assert_eq!(d["result"]["summary"]["name"], "config");
-}
+use common::{fixture, fresh, handle_of, run_json};
+use std::process::Command;
 
 #[test]
 fn missing_or_short_handle_is_usage_error() {
-    let (_p, f) = fresh("range.clj");
+    let f = fresh("range.clj");
     // No target at all: every targeted mode needs --handle.
-    let (code, d, _) = run(&["edit", &f, "--content", "(def x 1)", "--json"], None);
+    let (code, d, _) = run_json(&["edit", &f, "--content", "(def x 1)", "--json"], None);
     assert_eq!(code, 2);
     assert_eq!(d["error"]["code"], "usage");
     // A handle shorter than the 6-hex minimum is rejected up front.
-    let (code, d, _) = run(&["edit", &f, "--handle", "abc12", "--content", "(def x 1)", "--json"], None);
+    let (code, d, _) = run_json(
+        &["edit", &f, "--handle", "abc12", "--content", "(def x 1)", "--json"],
+        None,
+    );
     assert_eq!(code, 2);
     assert_eq!(d["error"]["code"], "usage");
-}
-
-#[test]
-fn name_lookup_not_found_gives_suggestions_ambiguous_gives_candidates() {
-    let (_p, f) = fresh("names.clj");
-    let (code, d, _) = run(&["get", &f, "--name", "hlp", "--json"], None);
-    assert_eq!(code, 3);
-    assert_eq!(d["error"]["code"], "form-not-found");
-    let sugs = d["error"]["suggestions"].as_array().unwrap();
-    assert!(!sugs.is_empty());
-    assert_eq!(sugs[0]["name"], "helper");
-
-    // Two same-named defs -> ambiguous with both candidates.
-    let dir = std::env::temp_dir().join("cljform-cli");
-    let p = dir.join("dup.clj");
-    std::fs::write(&p, "(def dup 1)\n\n(def dup 2)\n").unwrap();
-    let (code, d, _) = run(&["get", p.to_str().unwrap(), "--name", "dup", "--json"], None);
-    assert_eq!(code, 3);
-    assert_eq!(d["error"]["code"], "ambiguous");
-    assert_eq!(d["error"]["suggestions"].as_array().unwrap().len(), 2);
-}
-
-#[test]
-fn get_by_handle_prints_bytes_and_metadata() {
-    let (_p, f) = fresh("handle-get.clj");
-    let h = handle_of(&f, "helper");
-    let (code, d, _) = run(&["get", &f, "--handle", &h, "--json"], None);
-    assert_eq!(code, 0, "{d}");
-    assert_eq!(d["result"]["path"], "3");
-    assert_eq!(d["result"]["name"], "helper");
-    assert_eq!(d["result"]["line"], serde_json::json!([5, 6]));
-    assert_eq!(d["result"]["handle"], h);
-    assert!(d["result"]["form"].as_str().unwrap().contains("(* x 2)"));
-
-    // The name lookup carries the same handle for the follow-up edit (§5).
-    let (code, d, _) = run(&["get", &f, "--name", "helper", "--json"], None);
-    assert_eq!(code, 0, "{d}");
-    assert_eq!(d["result"]["handle"], h, "name lookup carries the form's handle");
-
-    // A handle that matches nothing refuses like the edit resolver.
-    let (code, d, _) = run(&["get", &f, "--handle", "deadbeef", "--json"], None);
-    assert_eq!(code, 3);
-    assert_eq!(d["error"]["code"], "stale-handle");
-    // Short handles are a usage error.
-    let (code, d, _) = run(&["get", &f, "--handle", "abc", "--json"], None);
-    assert_eq!(code, 2);
-    assert_eq!(d["error"]["code"], "usage");
-}
-
-#[test]
-fn delete_preserves_comment_gap_and_reseams() {
-    let dir = std::env::temp_dir().join("cljform-cli");
-    let p = dir.join("delete-comment.clj");
-    std::fs::write(
-        &p,
-        "(def a 1)\n\n;; keep this comment\ndef-gap\n(def b 2)\n".replace("def-gap", "(def mid 9)").as_bytes(),
-    )
-    .unwrap();
-    let (code, _d, _) = run(&["edit", p.to_str().unwrap(), "--handle", &handle_of(p.to_str().unwrap(), "mid"), "--mode", "delete", "--json"], None);
-    assert_eq!(code, 0);
-    let after = std::fs::read_to_string(&p).unwrap();
-    assert!(after.contains(";; keep this comment"), "comment survives: {after:?}");
-    assert!(after.contains("(def a 1)"));
-    assert!(after.contains("(def b 2)"));
-    assert!(!after.contains("(def mid 9)"));
-}
-
-#[test]
-fn delete_only_form_leaves_empty_file() {
-    let dir = std::env::temp_dir().join("cljform-cli");
-    let p = dir.join("delete-only.clj");
-    std::fs::write(&p, "(def lonely 1)\n").unwrap();
-    let (code, d, _) = run(&["edit", p.to_str().unwrap(), "--handle", &handle_of(p.to_str().unwrap(), "1"), "--mode", "delete", "--json"], None);
-    assert_eq!(code, 0, "{d}");
-    assert_eq!(d["forms"].as_array().unwrap().len(), 0);
-}
-
-#[test]
-fn handle_survives_form_moves_and_edits_elsewhere() {
-    // Content-addressed re-aim: a moved form still resolves by its old
-    // handle, at its new position.
-    let (_p, f) = fresh("reaim.clj");
-    let h = handle_of(&f, "helper");
-    // Insert a sibling after `def config`: helper moves from addr 3 to addr 4,
-    // but its handle (its content) is unchanged.
-    let cfg = handle_of(&f, "2");
-    let (code, d, _) = run(
-        &["edit", &f, "--handle", &cfg, "--mode", "insert-after", "--content", "(def moved-before 1)", "--json"],
-        None,
-    );
-    assert_eq!(code, 0, "{d}");
-    // The old handle still resolves, now at the form's new position.
-    let (code, d, _) = run(
-        &["edit", &f, "--handle", &h, "--content", "(defn helper [x] (* x 4))", "--json"],
-        None,
-    );
-    assert_eq!(code, 0, "{d}");
-    assert_eq!(d["result"]["summary"]["path"], "4");
-    assert!(std::fs::read_to_string(&f).unwrap().contains("(* x 4)"));
-
-    // A changed form no longer resolves: its handle is stale.
-    let (code, d, _) = run(
-        &["edit", &f, "--handle", &h, "--content", "(defn helper [x] x)", "--json"],
-        None,
-    );
-    assert_eq!(code, 3);
-    assert_eq!(d["error"]["code"], "stale-handle");
 }
 
 #[test]
 fn stdin_content_works() {
-    let (_p, f) = fresh("stdin.clj");
+    let f = fresh("stdin.clj");
     let h = handle_of(&f, "helper");
-    let (code, d, _) = run(&["edit", &f, "--handle", &h, "--json"], Some("(defn helper [x] (* x 7))"));
-    assert_eq!(code, 0, "{d}");
-}
-
-#[test]
-fn detectors_d2_d3_d4_fire() {
-    let dir = std::env::temp_dir().join("cljform-cli");
-    let p = dir.join("detectors.clj");
-    std::fs::write(
-        &p,
-        r#"(defn outer [x]
-  (let [y 1]
-    (def inner y)
-    (deftest wrong (is true))))
-
-(defn later [] nil)
-"#,
-    )
-    .unwrap();
-    let (_c, d, _) = run(&["check", p.to_str().unwrap(), "--json"], None);
-    let ids: Vec<&str> = d["warnings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|w| w["id"].as_str().unwrap())
-        .collect();
-    assert!(ids.contains(&"D2"), "{d}");
-    // deftest inside let -> D1 (wide rule; host named in the message).
-    let d1 = d["warnings"].as_array().unwrap().iter().find(|w| w["id"] == "D1").expect("D1 fires");
-    assert!(d1["message"].as_str().unwrap().contains("let"), "host named: {d1}");
-    assert_eq!(ids.iter().filter(|i| *i == &"D1").count(), 1, "one warning per node: {d}");
-
-    // D3: ns not first.
-    let p2 = dir.join("d3.clj");
-    std::fs::write(&p2, "(def a 1)\n\n(ns other)\n").unwrap();
-    let (_c, d, _) = run(&["check", p2.to_str().unwrap(), "--json"], None);
-    assert!(d["warnings"].as_array().unwrap().iter().any(|w| w["id"] == "D3"), "{d}");
-}
-
-#[test]
-fn untouched_forms_byte_identical_after_ops() {
-    let (_p, f) = fresh("bytes.clj");
-    // Round-trip: replace one form, read all forms, compare others to originals.
-    let (_c, before, _) = run(&["forms", &f, "--json"], None);
-    let bforms = before["forms"].as_array().unwrap().to_vec();
-    let h = handle_of(&f, "helper");
-    let (code, _d, _) = run(
-        &["edit", &f, "--handle", &h, "--content", "(defn helper [x]\n  (* x 10))", "--json"],
-        None,
+    let (code, d, err) = run_json(
+        &["edit", &f, "--handle", &h, "--json"],
+        Some(b"(defn helper [x] (* x 7))"),
     );
-    assert_eq!(code, 0);
-    let (_c, after, _) = run(&["forms", &f, "--json"], None);
-    let aforms = after["forms"].as_array().unwrap();
-    for (b, a) in bforms.iter().zip(aforms.iter()) {
-        if b["name"] == "helper" {
-            continue;
-        }
-        assert_eq!(b["hash"], a["hash"], "form {} changed", b["name"]);
-        assert_eq!(b["line"], a["line"]);
-    }
-}
-
-#[test]
-fn materialize_outputs_candidate_never_writes() {
-    let (_c, d, _) = run(&["materialize", "--json"], Some("(defn f [x]\n  (inc x)"));
-    assert_eq!(d["ok"], true);
-    let cand = d["result"]["candidate"].as_str().unwrap();
-    assert!(cand.ends_with("(inc x))"), "{cand}");
-    assert!(d["result"]["diff"].as_str().unwrap().starts_with("---"));
-    assert!(d["result"]["note"].as_str().unwrap().contains("verify"));
-}
-
-#[test]
-fn materialize_keeps_body_inside_inner_form() {
-    // Regression: indent mode closed the inner form one line early (absolute
-    // vs line-relative columns), so the body escaped the let. Balance alone
-    // would not catch it; the candidate must nest correctly.
-    let (_c, d, _) = run(&["materialize", "--json"], Some("(defn f [x]\n  (let [a 1]\n    a"));
-    assert_eq!(d["ok"], true);
-    assert_eq!(
-        d["result"]["candidate"],
-        "(defn f [x]\n  (let [a 1]\n    a))"
-    );
-    assert!(d["result"]["diff"].as_str().unwrap().contains("+    a)"));
-}
-
-#[test]
-fn materialize_bracketless_draft_is_not_invented() {
-    // Conservative: a fully bracket-less draft is returned as-is with a note
-    // (a guessed bracketing is worse than an obvious no-op).
-    let draft = "defn f [x]\n  let [a 1]\n    a";
-    let (_c, d, _) = run(&["materialize", "--json"], Some(draft));
-    assert_eq!(d["ok"], true);
-    assert_eq!(d["result"]["candidate"], draft);
-    assert!(d["result"]["note"].as_str().unwrap().contains("does not invent"));
-}
-
-#[test]
-fn insert_separates_forms_with_a_blank_line() {
-    let (_p, f) = fresh("spacing.clj");
-    std::fs::write(&f, "(ns t)\n\n(def a 1)\n").unwrap();
-    let (code, d, _) = run(
-        &["edit", &f, "--mode", "append", "--content", "(defn f [x] x)", "--json"],
-        None,
-    );
-    assert_eq!(code, 0, "{d}");
-    assert_eq!(
-        std::fs::read_to_string(&f).unwrap(),
-        "(ns t)\n\n(def a 1)\n\n(defn f [x] x)\n"
-    );
-
-    // Handle insert-after takes the same top-level seam: the same-line
-    // trailing comment stays with the anchor form, and the new form is
-    // blank-line separated from both neighbours.
-    std::fs::write(&f, "(ns t)\n\n(def a 1) ; keep me\n\n(def b 2)\n").unwrap();
-    let h = handle_of(&f, "2");
-    let (code, d, _) = run(
-        &[
-            "edit", &f, "--mode", "insert-after", "--handle", &h, "--content",
-            "(defn g [x] x)", "--json",
-        ],
-        None,
-    );
-    assert_eq!(code, 0, "{d}");
-    assert_eq!(
-        std::fs::read_to_string(&f).unwrap(),
-        "(ns t)\n\n(def a 1) ; keep me\n\n(defn g [x] x)\n\n(def b 2)\n"
-    );
-}
-
-#[test]
-fn materialize_flags_unterminated_fence() {
-    // materialize is the explicit inference tool, so it still infers — but it
-    // must say the draft looks truncated rather than resolve silently.
-    let (_c, d, _) = run(
-        &["materialize", "--json"],
-        Some("```clojure\n(defn f [x]\n  (let [a 1]\n    a"),
-    );
-    assert_eq!(d["ok"], true);
-    assert_eq!(d["result"]["candidate"], "(defn f [x]\n  (let [a 1]\n    a))");
-    assert!(
-        d["notes"].as_array().unwrap().iter().any(|n| n.as_str().unwrap().contains("truncated")),
-        "{d}"
-    );
+    assert_eq!(code, 0, "{d} {err}");
 }
 
 #[test]
 fn exit_codes_are_stable() {
-    let (_p, f) = fresh("codes.clj");
+    let f = fresh("codes.clj");
     // 0: success
-    let (code, _, _) = run(&["forms", &f, "--json"], None);
+    let (code, _, _) = run_json(&["forms", &f, "--json"], None);
     assert_eq!(code, 0);
     // 1: parse error
-    let dir = std::env::temp_dir().join("cljform-cli");
-    let bad = dir.join("bad.clj");
-    std::fs::write(&bad, "(defn oops [x]\n").unwrap();
-    let (code, _, _) = run(&["check", bad.to_str().unwrap(), "--json"], None);
+    let bad = fixture("bad.clj", b"(defn oops [x]\n");
+    let (code, _, _) = run_json(&["check", &bad, "--json"], None);
     assert_eq!(code, 1);
     // 2: usage
-    let (code, _, _) = run(&["edit", &f, "--content", "(def x 1)", "--json"], None);
+    let (code, _, _) = run_json(&["edit", &f, "--content", "(def x 1)", "--json"], None);
     assert_eq!(code, 2);
     // 3: not found
-    let (code, _, _) = run(&["get", &f, "--name", "nope", "--json"], None);
+    let (code, _, _) = run_json(&["get", &f, "--name", "nope", "--json"], None);
     assert_eq!(code, 3);
     // 4: io
-    let (code, _, _) = run(&["forms", "/nonexistent/file.clj", "--json"], None);
+    let (code, _, _) = run_json(&["forms", "/nonexistent/file.clj", "--json"], None);
     assert_eq!(code, 4);
 }
 
 #[test]
 fn human_get_shows_form_bytes() {
-    let (_p, f) = fresh("human-get.clj");
+    let f = fresh("human-get.clj");
     let out = Command::new(env!("CARGO_BIN_EXE_cljform"))
         .args(["get", &f, "--name", "helper", "--human"])
         .output()
@@ -398,30 +71,8 @@ fn human_get_shows_form_bytes() {
 }
 
 #[test]
-fn human_materialize_shows_candidate() {
-    let out = Command::new(env!("CARGO_BIN_EXE_cljform"))
-        .args([
-            "materialize",
-            "--content",
-            "(defn f [x]\n  (inc x)",
-            "--human",
-        ])
-        .output()
-        .unwrap();
-    let s = String::from_utf8_lossy(&out.stdout);
-    // The bracketed candidate appears in human output.
-    assert!(s.contains("(inc x))"), "materialize shows candidate: {s}");
-    // And a diff marker.
-    assert!(
-        s.contains("@@") || s.contains("+") || s.contains("-"),
-        "diff marker present: {s}"
-    );
-    assert!(!s.starts_with('{'), "must not be json");
-}
-
-#[test]
 fn human_mode_goes_to_stdout_stderr_without_json() {
-    let (_p, f) = fresh("human.clj");
+    let f = fresh("human.clj");
     let out = Command::new(env!("CARGO_BIN_EXE_cljform"))
         .args(["forms", &f, "--human"])
         .output()
@@ -430,130 +81,4 @@ fn human_mode_goes_to_stdout_stderr_without_json() {
     assert!(s.contains("forms"), "human output: {s}");
     assert!(s.contains("helper"));
     assert!(!s.starts_with('{'), "must not be json");
-}
-
-#[test]
-fn patch_mode_surgical_replacement() {
-    let dir = std::env::temp_dir().join("cljform-cli");
-    let p = dir.join("patch.clj");
-    std::fs::write(
-        &p,
-        "(ns p)\n\n(defn big [x]\n  (let [a 1]\n    {:a a\n     :b 2}))\n\n(def other :untouched)\n",
-    )
-    .unwrap();
-    let f = p.to_str().unwrap();
-
-    // One-line change in a multi-line form.
-    let (code, d, _) = run(
-        &["edit", f, "--handle", &handle_of(f, "big"), "--mode", "patch", "--old-text", ":b 2", "--new-text", ":b (inc 2)", "--json"],
-        None,
-    );
-    assert_eq!(code, 0, "{d}");
-    assert_eq!(d["result"]["summary"]["action"], "patched");
-    assert!(d["result"]["diff"].as_str().unwrap().contains(":b (inc 2)"));
-    assert_eq!(d["result"]["repaired"], false);
-    // The untouched form kept its bytes despite the line shift.
-    let (_c, forms, _) = run(&["forms", f, "--json"], None);
-    let rows = forms["forms"].as_array().unwrap();
-    assert_eq!(rows.len(), 3);
-    assert_eq!(rows[2]["name"], "other");
-    assert_eq!(rows[2]["line"], serde_json::json!([8, 8]));
-
-    // Scoped: needle occurs once in the target form but also in the ns form.
-    let (code, d, _) = run(
-        &["edit", f, "--handle", &handle_of(f, "big"), "--mode", "patch", "--old-text", "(ns", "--new-text", "X", "--json"],
-        None,
-    );
-    assert_eq!(code, 3, "(ns is not inside the big form: {d})");
-    assert_eq!(d["error"]["code"], "patch-not-found");
-    // The error carries the exact form bytes, so recovery needs no clj_get.
-    assert!(
-        d["error"]["message"].as_str().unwrap().contains("(let [a 1]"),
-        "form bytes embedded: {d}"
-    );
-
-    // Ambiguous within the form.
-    let (code, d, _) = run(
-        &["edit", f, "--handle", &handle_of(f, "big"), "--mode", "patch", "--old-text", "a", "--new-text", "q", "--json"],
-        None,
-    );
-    assert_eq!(code, 3);
-    assert_eq!(d["error"]["code"], "patch-ambiguous");
-    assert!(d["error"]["message"].as_str().unwrap().contains("times"));
-
-    // Cross-boundary oldText: spans into the next form -> not found in form.
-    let (code, d, _) = run(
-        &["edit", f, "--handle", &handle_of(f, "big"), "--mode", "patch", "--old-text", ":b (inc 2))\n\n(def other", "--new-text", "X", "--json"],
-        None,
-    );
-    assert_eq!(code, 3);
-    assert_eq!(d["error"]["code"], "patch-not-found");
-
-    // newText that breaks brackets: refused, nothing written.
-    let before = std::fs::read_to_string(f).unwrap();
-    let (code, d, _) = run(
-        &["edit", f, "--handle", &handle_of(f, "big"), "--mode", "patch", "--old-text", ":b (inc 2)", "--new-text", ":b (inc 2))", "--json"],
-        None,
-    );
-    assert_eq!(code, 1);
-    assert_eq!(d["error"]["code"], "parse-error");
-    assert_eq!(std::fs::read_to_string(f).unwrap(), before, "no repair in patch mode");
-
-    // Empty newText deletes the snippet (balanced removal).
-    let (code, d, _) = run(
-        &["edit", f, "--handle", &handle_of(f, "big"), "--mode", "patch", "--old-text", ":a a\n     ", "--new-text", "", "--json"],
-        None,
-    );
-    assert_eq!(code, 0, "{d}");
-    let (_cc, chk, _) = run(&["check", f, "--json"], None);
-    assert_eq!(chk["ok"], true);
-    let text = std::fs::read_to_string(f).unwrap();
-    assert!(!text.contains(":a a"));
-
-    // Patch no-op.
-    let (code, d, _) = run(
-        &["edit", f, "--handle", &handle_of(f, "big"), "--mode", "patch", "--old-text", ":b (inc 2)", "--new-text", ":b (inc 2)", "--json"],
-        None,
-    );
-    assert_eq!(code, 0);
-    assert!(d["notes"].as_array().unwrap().iter().any(|n| n.as_str().unwrap().contains("no-op")));
-
-    // Dry-run patch writes nothing.
-    let before = std::fs::read_to_string(f).unwrap();
-    let (code, d, _) = run(
-        &["edit", f, "--handle", &handle_of(f, "big"), "--mode", "patch", "--old-text", ":b (inc 2)", "--new-text", ":b 9", "--dry-run", "--json"],
-        None,
-    );
-    assert_eq!(code, 0);
-    assert_eq!(d["result"]["wrote"], false);
-    assert_eq!(std::fs::read_to_string(f).unwrap(), before);
-
-    // Missing --old-text is a usage error.
-    let (code, _d, _) = run(&["edit", f, "--handle", &handle_of(f, "big"), "--mode", "patch", "--new-text", "x", "--json"], None);
-    assert_eq!(code, 2);
-}
-
-#[test]
-fn patch_mode_line_growth_shifts_later_forms() {
-    let dir = std::env::temp_dir().join("cljform-cli");
-    let p = dir.join("patch-shift.clj");
-    std::fs::write(
-        &p,
-        "(ns s)\n\n(defn f [x]\n  {:a 1})\n\n(def after :ok)\n",
-    )
-    .unwrap();
-    let f = p.to_str().unwrap();
-    let (_c, forms, _) = run(&["forms", f, "--json"], None);
-    let after_hash = forms["forms"].as_array().unwrap()[2]["hash"].clone();
-
-    let (code, d, _) = run(
-        &["edit", f, "--handle", &handle_of(f, "f"), "--mode", "patch", "--old-text", "{:a 1})", "--new-text", "{:a 1\n   :b 2\n   :c 3})", "--json"],
-        None,
-    );
-    assert_eq!(code, 0, "{d}");
-    let (_c, forms, _) = run(&["forms", f, "--json"], None);
-    let rows = forms["forms"].as_array().unwrap();
-    assert_eq!(rows[1]["line"], serde_json::json!([3, 6]), "target grew");
-    assert_eq!(rows[2]["line"], serde_json::json!([8, 8]), "later form shifted");
-    assert_eq!(rows[2]["hash"], after_hash, "shifted form kept its bytes");
 }

@@ -47,8 +47,9 @@ Guards: the `⟦handle⟧` is a content pin — resolution either matches the on
 form it names or refuses (`stale-handle` / `ambiguous-handle`, exit 3,
 "re-run `tree`"), so a stale view can never target the wrong form. Handles
 are content-addressed: an unchanged form keeps its handle across edits
-elsewhere. `--strict` turns detector warnings and **content repairs** into
-refusals (exit 3, `repair-refused`, with the diff it declined to apply).
+elsewhere. `--strict` turns detector warnings into a refusal (exit 1,
+`detector-fatal`) and **content repairs** into a refusal (exit 3,
+`repair-refused`, with the diff it declined to apply).
 `--dry-run` validates and writes nothing.
 
 Refusal beats guessed repair. By default cljform only *completes* unbalanced

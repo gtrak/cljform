@@ -5,32 +5,15 @@
 //! asserts byte equality. It SKIPS (does not fail) when the binary is
 //! absent, so the suite stays hermetic.
 
+mod common;
+
+use common::{fixture, run_json};
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-fn run(args: &[&str], stdin: Option<&str>) -> (i32, serde_json::Value, String) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_cljform"))
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    if let Some(s) = stdin {
-        child.stdin.as_mut().unwrap().write_all(s.as_bytes()).ok();
-    }
-    let out = child.wait_with_output().unwrap();
-    let json = serde_json::from_slice(&out.stdout).unwrap_or(serde_json::Value::Null);
-    (
-        out.status.code().unwrap_or(-1),
-        json,
-        String::from_utf8_lossy(&out.stderr).to_string(),
-    )
-}
-
 /// `cljform format --json` on stdin; returns the candidate string.
 fn format_stdin(input: &str) -> (i32, serde_json::Value, String) {
-    run(&["format", "--json"], Some(input))
+    run_json(&["format", "--json"], Some(input.as_bytes()))
 }
 
 /// The existing fixtures from the other suites, reused as corpus entries.
@@ -250,14 +233,11 @@ fn format_skips_string_interiors() {
 
 #[test]
 fn format_is_candidate_only() {
+    let before = "(defn f [x]\n(inc x))\n";
     // Never writes: the file is byte-identical after the op, and the
     // result mirrors materialize's shape (candidate, diff, note).
-    let dir = std::env::temp_dir().join("cljform-format");
-    std::fs::create_dir_all(&dir).unwrap();
-    let p = dir.join("candidate.clj");
-    let before = "(defn f [x]\n(inc x))\n";
-    std::fs::write(&p, before).unwrap();
-    let (code, d, err) = run(&["format", p.to_str().unwrap(), "--json"], None);
+    let dir = fixture("format-candidate.clj", before.as_bytes());
+    let (code, d, err) = run_json(&["format", &dir, "--json"], None);
     assert_eq!(code, 0, "{d} {err}");
     assert_eq!(d["ok"], true);
     assert!(d["result"]["candidate"].as_str().is_some(), "{d}");
@@ -267,7 +247,7 @@ fn format_is_candidate_only() {
     );
     assert!(d["result"]["note"].as_str().is_some(), "{d}");
     assert_eq!(
-        std::fs::read_to_string(&p).unwrap(),
+        std::fs::read_to_string(&dir).unwrap(),
         before,
         "format must never write"
     );
@@ -277,7 +257,7 @@ fn format_is_candidate_only() {
     assert_eq!(code, 0, "{d} {err}");
     assert_eq!(
         d["result"]["candidate"],
-        run(&["format", p.to_str().unwrap(), "--json"], None).1["result"]["candidate"]
+        run_json(&["format", &dir, "--json"], None).1["result"]["candidate"]
     );
 
     // A candidate that cannot pass verification is refused (format-error,
@@ -324,7 +304,7 @@ fn format_token_stream_unchanged() {
             token_stream(input),
             "{name}: token stream changed"
         );
-        let (code, d, err) = run(&["check"], Some(candidate));
+        let (code, d, err) = run_json(&["check"], Some(candidate.as_bytes()));
         assert_eq!(code, 0, "{name}: candidate does not parse: {d} {err}");
     }
 }
