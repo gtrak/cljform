@@ -26,11 +26,15 @@ Sequence (one worker subagent per issue):
   `strip(tree(x)) == x`. Foundation.
 - **03 — handle edit** (`issue-03-handle-edit.md`): `edit --handle H` resolving
   content-addressed (safe re-aim, else `stale-handle`), boundary-check
-  invariant, marker auto-strip on content/oldText/newText ingest, new handles
-  in mutation results. Depends on 02.
+  invariant, marker auto-strip on content/oldText/newText ingest, **base-shift
+  reindent** (Rust manages the base indent; the caller sends an isolated form),
+  new handles in mutation results. Depends on 02.
 - **04 — v1 removal** (`issue-04-v1-removal.md`): drop `--addr`/`--expect` and
   numeric insert anchors from `edit`; make `edit` handle-only and `--name` a
   read lookup on `get`/`forms`. Depends on 03.
 - **05 — wrapper + docs** (`issue-05-wrapper-docs.md`): pi extension gains
   `clj_tree`, drops `addr`/`expect`, adds `handle`; README + SPEC status.
   Depends on 04.
+- **06 — `format` op** (`issue-06-format.md`): explicit, candidate-first
+  parinfer paren-mode formatter (rules adopted from `../parinfer-rust`,
+  differential-tested against the installed binary). Independent of 03–05.

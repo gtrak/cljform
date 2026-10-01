@@ -453,9 +453,10 @@ collection delimiter:
   refuse to annotate (`annotate-conflict`, exit 1) and fall back to `--json`.
 - Markers go only at AST delimiter positions, never inside strings, regexes,
   comments, or char literals.
-- `tree --json` emits the flat node table (`path`, `kind`, `head`, `line`,
-  `handle`) derived from the same tree. Annotated source is the canonical read
-  view; JSON is derived.
+- `tree --json` emits the flat node table (`path`, `kind`, `head`, `name`,
+  `line`, `depth`, `handle`; null `head`/`name` omitted, internal hash and
+  byte offsets not serialized) derived from the same tree. Annotated source
+  is the canonical read view; JSON is derived.
 
 ### 10.3 Edit contract
 
