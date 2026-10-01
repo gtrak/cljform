@@ -8,11 +8,15 @@
  * Philosophy: the agent should never have to bracket-count. clj_edit does
  * what it means, repairs unbalanced content when the fix is unambiguous,
  * never writes a file that doesn't parse, and reports exactly what changed.
+ * clj_edit reindents the content it submits (via `cljform format` on stdin,
+ * autoFormat, default on) before the CLI base-shifts it to the target column;
+ * patch oldText/newText are exact text and are never reformatted.
  *
  * Binary discovery: CLJFORM_BIN env override, then PATH (cargo install).
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import type { ChildProcess } from "node:child_process";
 import { Type } from "@sinclair/typebox";
 
 interface FormRow {
@@ -85,6 +89,73 @@ function parseEnvelope(stdout: string): CljformOutput | null {
 	} catch {
 		return null;
 	}
+}
+
+/**
+ * Run `cljform format --json` with `text` on stdin (candidate-only reindent;
+ * the CLI reads stdin when no file arg is given). pi.exec closes the child's
+ * stdin, so the binary is spawned directly (same CLJFORM_BIN/PATH resolution).
+ * Returns the reindented `candidate`, or null with `binMissing` when the
+ * binary is absent/unspawnable (caller falls back, never fails the edit) or
+ * `error` when format refuses the input (e.g. a parse error on unbalanced
+ * content the edit path would still repair).
+ */
+async function formatContentStdin(
+	text: string,
+): Promise<{ candidate: string | null; binMissing: boolean; error: string | null }> {
+	const { spawn } = await import("node:child_process");
+	return new Promise((resolve) => {
+		let proc: ChildProcess;
+		try {
+			proc = spawn(resolveBin(), ["format", "--json"], {
+				stdio: ["pipe", "pipe", "pipe"],
+			});
+		} catch {
+			resolve({ candidate: null, binMissing: true, error: null });
+			return;
+		}
+		let stdout = "";
+		let binMissing = false;
+		let settled = false;
+		const timer = setTimeout(() => {
+			proc.kill("SIGTERM");
+			finish(null, false, "timed out");
+		}, 10_000);
+		function finish(candidate: string | null, missing: boolean, error: string | null) {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			resolve({ candidate, binMissing: missing, error });
+		}
+		proc.on("error", (err) => {
+			const isENOENT =
+				typeof err === "object" && err !== null && (err as { code?: string }).code === "ENOENT";
+			binMissing = isENOENT;
+			finish(
+				null,
+				isENOENT,
+				isENOENT
+					? null
+					: `cannot run ${resolveBin()}: ${err instanceof Error ? err.message : String(err)}`,
+			);
+		});
+		proc.stdout?.on("data", (d: Buffer) => (stdout += d.toString()));
+		proc.on("close", (code) => {
+			if (code !== 0) {
+				const out = parseEnvelope(stdout);
+				finish(null, binMissing, out?.error ? `${out.error.code}: ${out.error.message}` : `exit ${code}`);
+				return;
+			}
+			const out = parseEnvelope(stdout);
+			if (!out || !out.ok || typeof out.result?.candidate !== "string") {
+				finish(null, false, "malformed envelope");
+				return;
+			}
+			finish(out.result.candidate, false, null);
+		});
+		proc.stdin?.write(text);
+		proc.stdin?.end();
+	});
 }
 
 function formTableText(forms: FormRow[]): string {
@@ -429,7 +500,9 @@ export default function ClojureForms(pi: ExtensionAPI) {
 			"(2) REPLACE (or insert/delete via mode): pass content — the full replacement form; content may be " +
 			"unbalanced (brackets repaired from indentation when unambiguous) and markdown fences are stripped. " +
 			"The file is written only if the result parses and every untouched form is byte-identical. " +
-			"Submitted content is reindented to the target's column automatically.",
+			"Submitted content is reindented to the target's column automatically, and (autoFormat, default on) " +
+			"reindented in parinfer paren mode before editing — content that fails to parse is sent verbatim with a " +
+			"note; patch oldText/newText are never reformatted.",
 		promptGuidelines: [
 			"Read the file with clj_tree first; copy a ⟦handle⟧ and pass it as handle — handles are the only edit target.",
 			"Handles are content-addressed: an unchanged form keeps its handle across edits elsewhere; if it changed, the edit refuses with stale-handle — re-run clj_tree.",
@@ -441,6 +514,7 @@ export default function ClojureForms(pi: ExtensionAPI) {
 			"dryRun: true validates and shows the outcome without writing.",
 			"strict: true (CI mode) refuses detector warnings and content repairs instead of applying them.",
 			"repair: true allows a guessed mid-file (dedent) closure; by default only missing trailing closers are completed — a dedent-repair refusal shows the candidate.",
+			"autoFormat (default true) reindents content in parinfer paren mode before editing; set it false to send content verbatim. Patch oldText/newText are exact text and are never reindented.",
 		],
 		parameters: Type.Object({
 			path: Type.String({ description: "Path to the .clj/.cljs/.cljc/.edn file" }),
@@ -487,6 +561,12 @@ export default function ClojureForms(pi: ExtensionAPI) {
 				Type.Boolean({
 					description:
 						"Allow repair to close an inner form at a mid-file dedent (guessed placement). By default only missing trailing closers are completed",
+				}),
+			),
+			autoFormat: Type.Optional(
+				Type.Boolean({
+					description:
+						"Reindent content with cljform format (parinfer paren mode, via stdin) before editing (default true; false sends content verbatim; patch oldText/newText are never touched)",
 				}),
 			),
 		}),
@@ -546,15 +626,35 @@ export default function ClojureForms(pi: ExtensionAPI) {
 			if (mode === "delete") {
 				return await runEdit(args, params);
 			}
+			// Content modes only reach here (patch/delete returned above); oldText/
+			// newText were never touched. autoFormat (default on) reindents the
+			// content via `cljform format` on stdin — a candidate-only parinfer
+			// paren-mode reindent; the Rust edit path then base-shifts the
+			// parinfer-shaped content to the target column.
+			let contentToSend = params.content!;
+			const preNotes: string[] = [];
+			if (params.autoFormat !== false && contentToSend.trim().length > 0) {
+				const fmt = await formatContentStdin(contentToSend);
+				if (fmt.candidate !== null && fmt.candidate !== contentToSend) {
+					contentToSend = fmt.candidate;
+					preNotes.push("reindented content (parinfer paren mode) before editing");
+				} else if (fmt.error !== null) {
+					// format refused the input (e.g. a parse error on unbalanced
+					// content the edit path would still repair): send it verbatim
+					// and say so. A missing binary (binMissing) falls back silently
+					// — the edit call itself surfaces the install hint.
+					preNotes.push(`note: content was not reindented (cljform format: ${fmt.error})`);
+				}
+			}
 			// Content via temp file: no stdin in pi.exec, no argv limits.
 			const { writeFileSync, unlinkSync } = await import("node:fs");
 			const { tmpdir } = await import("node:os");
 			const { join } = await import("node:path");
 			const tmp = join(tmpdir(), `cljform-content-${process.pid}-${Date.now()}.clj`);
-			writeFileSync(tmp, params.content ?? "");
+			writeFileSync(tmp, contentToSend);
 			args.push("--content-file", tmp);
 			try {
-				return await runEdit(args, params);
+				return await runEdit(args, params, preNotes);
 			} finally {
 				try {
 					unlinkSync(tmp);
@@ -568,6 +668,7 @@ export default function ClojureForms(pi: ExtensionAPI) {
 	async function runEdit(
 		args: string[],
 		params: { path: string; mode?: string; dryRun?: boolean },
+		preNotes: string[] = [],
 	): Promise<{ content: { type: "text"; text: string }[]; isError?: boolean; details?: unknown }> {
 		const result = await execCljform(args, { timeout: 20_000 });
 		if (result.execError) {
@@ -582,6 +683,7 @@ export default function ClojureForms(pi: ExtensionAPI) {
 
 		const r = out.result ?? {};
 		const lines: string[] = [r.text ?? "done"];
+		lines.push(...preNotes);
 		if (r.repaired) {
 			lines.push("");
 			lines.push("content was REPAIRED (brackets inferred from indentation) — verify the result:");
