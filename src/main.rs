@@ -9,6 +9,7 @@
 #![allow(clippy::result_large_err)]
 
 mod content;
+mod format;
 mod handle;
 mod hashutil;
 mod invariants;
@@ -129,6 +130,13 @@ enum Op {
         content: Option<String>,
         #[arg(long)]
         content_file: Option<PathBuf>,
+    },
+    /// Reformat indentation the way parinfer paren mode does (the only op
+    /// that imposes a style; the edit path only base-shifts). Candidate-
+    /// first: candidate + diff + note, never writes.
+    Format {
+        /// File, or omit and read stdin.
+        file: Option<PathBuf>,
     },
     /// Annotated form view: the source with `⟦handle⟧` after each marked
     /// collection's opening delimiter, or the node table with --json.
@@ -298,6 +306,7 @@ fn static_op_name(op: &Op) -> &'static str {
         Op::Check { .. } => "check",
         Op::Edit { .. } => "edit",
         Op::Materialize { .. } => "materialize",
+        Op::Format { .. } => "format",
         Op::Tree { .. } => "tree",
         Op::Strip { .. } => "strip",
     }
@@ -378,7 +387,7 @@ fn print_human(out: &Output) {
                 }
             }
         }
-    } else if out.op == "materialize" {
+    } else if out.op == "materialize" || out.op == "format" {
         // The candidate (and its diff) are the payload; the note goes in notes.
         if let Some(r) = &out.result {
             if let Some(cand) = r.get("candidate").and_then(|v| v.as_str()) {
@@ -902,6 +911,7 @@ fn dispatch(cli: &Cli) -> Result<Output, Fail> {
                 error: None,
             })
         }
+        Op::Format { file } => run_format(file),
         Op::Edit {
             file,
             mode,
@@ -996,6 +1006,108 @@ fn dispatch(cli: &Cli) -> Result<Output, Fail> {
         }
         Op::Strip { .. } => unreachable!("strip is handled in main() before the envelope"),
     }
+}
+
+/// `cljform format [file]` (issue 06): parinfer paren-mode reindent.
+/// Candidate-first — mirrors `materialize`'s result shape
+/// (`candidate`, `diff`, `note`) and never writes. The candidate must
+/// re-parse clean and carry the input's token stream; anything less is a
+/// `format-error` (exit 1) and is never emitted.
+fn run_format(file: &Option<PathBuf>) -> Result<Output, Fail> {
+    let (raw, file_path) = match file {
+        Some(p) => {
+            let (bytes, _bom) = read_file(p)?;
+            let text = String::from_utf8(bytes).map_err(|e| Fail(
+                4,
+                ErrorBody {
+                    code: "io",
+                    line: None,
+                    col: None,
+                    message: format!("{} is not valid UTF-8: {e}", p.display()),
+                    hint: None,
+                    suggestions: None,
+                },
+            ))?;
+            (text, Some(p.display().to_string()))
+        }
+        None => (read_content(&None, &None)?, None),
+    };
+    if raw.trim().is_empty() {
+        return Err(Fail(
+            1,
+            ErrorBody {
+                code: "format-error",
+                line: None,
+                col: None,
+                message: "input is empty".into(),
+                hint: None,
+                suggestions: None,
+            },
+        ));
+    }
+    // The input must parse clean: format reindents code, it does not repair
+    // structure (that is `materialize`'s job).
+    parse_or_fail(raw.as_bytes(), "input")?;
+    let candidate = format::format_paren(&raw).map_err(|e| Fail(
+        1,
+        ErrorBody {
+            code: "format-error",
+            line: Some(e.line),
+            col: Some(e.col),
+            message: e.message,
+            hint: None,
+            suggestions: None,
+        },
+    ))?;
+    // Verification gates: re-parse clean + token stream equality. Only
+    // whitespace and the position of closing delimiters may change.
+    if let Err(e) = parser::parse(candidate.as_bytes()) {
+        return Err(Fail(
+            1,
+            ErrorBody {
+                code: "format-error",
+                line: Some(e.line),
+                col: Some(e.col),
+                message: format!("candidate does not parse: {}", e.message),
+                hint: Some("format must never change structure; report this as a cljform bug".into()),
+                suggestions: None,
+            },
+        ));
+    }
+    if format::token_stream(&candidate) != format::token_stream(&raw) {
+        return Err(Fail(
+            1,
+            ErrorBody {
+                code: "format-error",
+                line: None,
+                col: None,
+                message: "candidate's token stream differs from the input; refusing to emit it".into(),
+                hint: Some("report this as a cljform bug".into()),
+                suggestions: None,
+            },
+        ));
+    }
+    let diff = materialize::unified_diff(&raw, &candidate, "input", "candidate");
+    let note = if candidate == raw {
+        "already formatted (parinfer paren-mode); candidate is unchanged — not written"
+    } else {
+        "candidate reformatted to parinfer paren-mode indentation; token stream verified unchanged — not written"
+    };
+    Ok(Output {
+        ok: true,
+        op: "format",
+        file: file_path,
+        file_hash: Some(hashutil::tagged(&hashutil::file_hash(raw.as_bytes()))),
+        forms: None,
+        result: Some(serde_json::json!({
+            "candidate": candidate,
+            "diff": diff,
+            "note": note,
+        })),
+        warnings: None,
+        notes: None,
+        error: None,
+    })
 }
 
 fn prepare_fail(p: content::PrepareError) -> Fail {
