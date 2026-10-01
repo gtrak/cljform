@@ -9,6 +9,7 @@
 #![allow(clippy::result_large_err)]
 
 mod content;
+mod handle;
 mod hashutil;
 mod invariants;
 mod materialize;
@@ -139,6 +140,24 @@ enum Op {
         #[arg(long)]
         content_file: Option<PathBuf>,
     },
+    /// Annotated form view: the source with `⟦handle⟧` after each marked
+    /// collection's opening delimiter, or the node table with --json.
+    Tree {
+        /// Clojure/EDN file.
+        file: PathBuf,
+        /// Nesting depth to mark: N (top-level = 1) or "all".
+        #[arg(long, value_name = "N|all", conflicts_with = "full")]
+        depth: Option<String>,
+        /// Mark every collection (alias for --depth all).
+        #[arg(long)]
+        full: bool,
+    },
+    /// Delete every `⟦...⟧` marker span; the stripped bytes go to stdout
+    /// raw (a pure filter, no envelope).
+    Strip {
+        /// File, or omit and read stdin.
+        file: Option<PathBuf>,
+    },
 }
 
 #[derive(Serialize)]
@@ -190,26 +209,95 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     let json = if cli.human { false } else { cli.json || !atty_stdout() };
     let op_name = static_op_name(&cli.op);
+    // `strip` is a pure filter: its output is the raw stripped bytes on
+    // stdout with NO envelope, so it is handled here before dispatch.
+    if let Op::Strip { file } = &cli.op {
+        return run_strip(file, json);
+    }
     match dispatch(&cli) {
         Ok(out) => {
             print_envelope(&out, json);
             ExitCode::from(0)
         }
-        Err(Fail(exit, ebody)) => {
-            let out = Output {
-                ok: false,
-                op: op_name,
-                file: None,
-                file_hash: None,
-                forms: None,
-                result: None,
-                warnings: None,
-                notes: None,
-                error: Some(ebody),
-            };
-            print_envelope(&out, json);
-            ExitCode::from(exit)
+        Err(Fail(exit, ebody)) => fail_envelope(exit, ebody, op_name, json),
+    }
+}
+
+/// Failure path shared by the envelope ops and `strip`: one JSON object
+/// (or the human error line) and the op's exit code.
+fn fail_envelope(exit: u8, ebody: ErrorBody, op: &'static str, json: bool) -> ExitCode {
+    let out = Output {
+        ok: false,
+        op,
+        file: None,
+        file_hash: None,
+        forms: None,
+        result: None,
+        warnings: None,
+        notes: None,
+        error: Some(ebody),
+    };
+    print_envelope(&out, json);
+    ExitCode::from(exit)
+}
+
+/// `cljform strip [file]`: read the file (or stdin), delete every
+/// `⟦...⟧` span, and write the raw bytes to stdout (exit 0, no envelope).
+/// Read errors use the normal io error (exit 4).
+fn run_strip(file: &Option<PathBuf>, json: bool) -> ExitCode {
+    let text: Result<String, Fail> = match file {
+        Some(p) => std::fs::read_to_string(p).map_err(|e| Fail(
+            4,
+            ErrorBody {
+                code: "io",
+                line: None,
+                col: None,
+                message: format!("cannot read {}: {e}", p.display()),
+                hint: None,
+                suggestions: None,
+            },
+        )),
+        None => {
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .map_err(|e| Fail(
+                    4,
+                    ErrorBody {
+                        code: "io",
+                        line: None,
+                        col: None,
+                        message: format!("cannot read stdin: {e}"),
+                        hint: None,
+                        suggestions: None,
+                    },
+                ))
+                .map(|_| buf)
         }
+    };
+    match text {
+        Ok(t) => {
+            use std::io::Write;
+            let out = handle::strip(&t);
+            let mut stdout = std::io::stdout().lock();
+            match stdout.write_all(out.as_bytes()).and_then(|_| stdout.flush()) {
+                Ok(()) => ExitCode::from(0),
+                Err(e) => fail_envelope(
+                    4,
+                    ErrorBody {
+                        code: "io",
+                        line: None,
+                        col: None,
+                        message: format!("write failed: {e}"),
+                        hint: None,
+                        suggestions: None,
+                    },
+                    "strip",
+                    json,
+                ),
+            }
+        }
+        Err(Fail(exit, ebody)) => fail_envelope(exit, ebody, "strip", json),
     }
 }
 
@@ -220,6 +308,8 @@ fn static_op_name(op: &Op) -> &'static str {
         Op::Check { .. } => "check",
         Op::Edit { .. } => "edit",
         Op::Materialize { .. } => "materialize",
+        Op::Tree { .. } => "tree",
+        Op::Strip { .. } => "strip",
     }
 }
 
@@ -802,6 +892,84 @@ fn dispatch(cli: &Cli) -> Result<Output, Fail> {
             file, *mode, *addr, *after, *before, name, content, content_file, old_text, new_text,
             expect, *dry_run, *strict, *repair,
         ),
+        Op::Tree { file, depth, full } => {
+            let (bytes, had_bom) = read_file(file)?;
+            // Same parse the resolver uses: unparseable files get no view.
+            parse_or_fail(&bytes, "file")?;
+            let nodes = handle::collect(&bytes);
+            let d = if *full {
+                handle::Depth::All
+            } else {
+                match depth {
+                    Some(s) if s.eq_ignore_ascii_case("all") => handle::Depth::All,
+                    Some(s) => match s.parse::<usize>() {
+                        Ok(n) => handle::Depth::Levels(n),
+                        Err(_) => {
+                            return Err(Fail(
+                                2,
+                                ErrorBody {
+                                    code: "usage",
+                                    line: None,
+                                    col: None,
+                                    message: format!("--depth expects a number or 'all', got {s:?}"),
+                                    hint: None,
+                                    suggestions: None,
+                                },
+                            ))
+                        }
+                    },
+                    None => handle::Depth::Heuristic,
+                }
+            };
+            let human_mode = cli.human || (!cli.json && atty_stdout());
+            if human_mode {
+                let annotated = handle::annotate(&bytes, d).map_err(|_| Fail(
+                    1,
+                    ErrorBody {
+                        code: "annotate-conflict",
+                        line: None,
+                        col: None,
+                        message: format!(
+                            "the source already contains marker glyphs ({}/{}) and the view cannot be stripped losslessly",
+                            handle::MARKER_OPEN, handle::MARKER_CLOSE
+                        ),
+                        hint: Some("use --json to list the nodes without markers".into()),
+                        suggestions: None,
+                    },
+                ))?;
+                // Re-prepend the BOM so `strip` recovers the exact on-disk
+                // bytes of BOM-prefixed files.
+                let mut text = if had_bom {
+                    String::from('\u{feff}')
+                } else {
+                    String::new()
+                };
+                text.push_str(&annotated);
+                return Ok(Output {
+                    ok: true,
+                    op: "tree",
+                    file: Some(file.display().to_string()),
+                    file_hash: Some(hashutil::tagged(&hashutil::file_hash(&bytes))),
+                    forms: None,
+                    result: Some(serde_json::json!({ "text": text })),
+                    warnings: None,
+                    notes: None,
+                    error: None,
+                });
+            }
+            Ok(Output {
+                ok: true,
+                op: "tree",
+                file: Some(file.display().to_string()),
+                file_hash: Some(hashutil::tagged(&hashutil::file_hash(&bytes))),
+                forms: None,
+                result: Some(serde_json::json!({ "nodes": nodes })),
+                warnings: None,
+                notes: None,
+                error: None,
+            })
+        }
+        Op::Strip { .. } => unreachable!("strip is handled in main() before the envelope"),
     }
 }
 

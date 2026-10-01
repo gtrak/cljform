@@ -85,8 +85,9 @@ pub struct Parsed {
 }
 
 /// Run `f` on a thread with a large stack and join. Input/output must be
-/// owned (we copy the source bytes in and move results out).
-fn with_big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+/// owned (we copy the source bytes in and move results out). Shared with
+/// `handle::collect`, which walks trees with the same recursion risk.
+pub fn with_big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
     std::thread::Builder::new()
         .stack_size(PARSE_STACK_BYTES)
         .spawn(f)
