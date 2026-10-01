@@ -24,6 +24,17 @@ interface FormRow {
 	contains: Record<string, number>;
 }
 
+/** One collection node from `cljform tree --json` (SPEC §10.2). */
+interface TreeNode {
+	path: string;
+	kind: string;
+	head?: string;
+	name?: string;
+	line: [number, number];
+	depth: number;
+	handle: string;
+}
+
 interface DetectorWarning {
 	id: string;
 	line: number;
@@ -161,10 +172,10 @@ export default function ClojureForms(pi: ExtensionAPI) {
 		description:
 			"List the top-level form table of a Clojure/EDN file: address, kind, name, line range, hash, " +
 			"and nesting-shape warnings (e.g. a deftest swallowed by an unclosed defn). " +
-			"Use addresses with clj-edit; prefer name-based targeting.",
+			"Use clj_tree to get the ⟦handles⟧ you pass to clj_edit.",
 		promptSnippet: "Inspect Clojure file structure as whole forms.",
 		promptGuidelines: [
-			"Run clj_forms before editing to pick a target addr or name.",
+			"Run clj_tree (annotated source with ⟦handles⟧) before editing; it is the primary way to discover edit targets.",
 			"Address WARNING D1/D2/D4 lines: they mean a form is nested inside another defn/let — almost always wrong.",
 		],
 		parameters: Type.Object({
@@ -193,33 +204,97 @@ export default function ClojureForms(pi: ExtensionAPI) {
 		},
 	});
 
+	// ─── clj_tree ────────────────────────────────────────────────────────────
+
+	pi.registerTool({
+		name: "clj_tree",
+		label: "Clj Tree",
+		description:
+			"Read-only annotated view of a Clojure/EDN file: the source with a ⟦handle⟧ after each marked " +
+			"collection's opening delimiter. This is the PRIMARY way an agent discovers handles — the only " +
+			"edit targets for clj_edit. Handles are content-addressed: they survive edits elsewhere in the " +
+			"file and refuse (stale-handle) when their own form changed.",
+		promptSnippet: "Read a Clojure file annotated with ⟦handle⟧ markers (the only edit targets).",
+		promptGuidelines: [
+			"Run clj_tree before any clj_edit; copy the ⟦handle⟧ you want to edit and pass it as handle.",
+			"Single-line forms usually have no handle: address them by text (oldText/newText patch) inside their parent form.",
+			"A stale-handle error means the form changed — re-run clj_tree, never retry the old handle.",
+		],
+		parameters: Type.Object({
+			path: Type.String({ description: "Path to the .clj/.cljs/.cljc/.edn file" }),
+			depth: Type.Optional(
+				Type.Union([Type.Number(), Type.Literal("all")], {
+					description:
+						"Nesting depth to mark (top-level = 1). Default is a heuristic (top-level + multi-line forms); 'all' marks every collection",
+				}),
+			),
+			json: Type.Optional(
+				Type.Boolean({
+					description:
+						"Return the structured node list instead of the annotated source (only when a machine-readable table is explicitly wanted)",
+				}),
+			),
+		}),
+
+		async execute(_toolCallId, params, _signal, _onUpdate) {
+			const args = ["tree", params.path, params.json ? "--json" : "--human"];
+			if (params.depth !== undefined) {
+				args.push("--depth", params.depth === "all" ? "all" : String(params.depth));
+			}
+			const result = await pi.exec(resolveBin(), args, { timeout: 15_000 });
+			const out = parseEnvelope(result.stdout);
+			if (!out || !out.ok) {
+				const text = out?.error ? errorText(out) : `cljform failed: ${result.stderr || result.stdout}`;
+				return { content: [{ type: "text", text }], isError: true };
+			}
+			const r = out.result ?? {};
+			if (params.json) {
+				const nodes: TreeNode[] = (r.nodes as TreeNode[]) ?? [];
+				const lines = [
+					`${params.path}: ${nodes.length} nodes · ${out.file_hash?.slice(0, 19)}…`,
+					...nodes.map(
+						(n) =>
+							`${"  ".repeat(Math.max(0, n.depth - 1))}⟦${n.handle}⟧ ${n.kind}${n.name ? ` ${n.name}` : ""} · lines ${n.line[0]}–${n.line[1]} · path ${n.path}`,
+					),
+				];
+				return { content: [{ type: "text", text: lines.join("\n") }], details: { nodes } };
+			}
+			return {
+				content: [{ type: "text", text: (r.text ?? "").replace(/^\uFEFF/, "").trimEnd() }],
+				details: { fileHash: out.file_hash },
+			};
+		},
+	});
+
 	// ─── clj_get ────────────────────────────────────────────────────────────
 
 	pi.registerTool({
 		name: "clj_get",
 		label: "Clj Get",
 		description:
-			"Fetch one top-level form from a Clojure/EDN file: its EXACT bytes plus address, kind, name, " +
-			"line range, and blake3 hash. Use this before editing: modify the fetched bytes rather than " +
-			"re-typing form content, then clj_edit with the same hash via expect — transcription errors " +
-			"become impossible.",
-		promptSnippet: "Fetch a Clojure form's exact bytes before editing it.",
+			"Fetch one form from a Clojure/EDN file by name (top-level def-like) or by ⟦handle⟧ (any " +
+			"collection): its EXACT bytes plus kind, name, line range, and handle. Use this before editing: " +
+			"modify the fetched bytes rather than re-typing form content, then pass the result's handle to " +
+			"clj_edit — transcription errors become impossible.",
+		promptSnippet: "Fetch a Clojure form's exact bytes and handle before editing it.",
 		promptGuidelines: [
-			"Fetch with clj_get, make your change against the exact bytes, then clj_edit — never re-type a form from memory.",
+			"Fetch with clj_get, make your change against the exact bytes, then clj_edit with the form's handle — never re-type a form from memory.",
 			"For small changes inside a large form, prefer clj_edit patch mode (oldText/newText) over resending the whole form.",
 		],
 		parameters: Type.Object({
 			path: Type.String({ description: "Path to the .clj/.cljs/.cljc/.edn file" }),
 			name: Type.Optional(
-				Type.String({ description: "Form by defined name (defn/def/deftest/…)" }),
+				Type.String({ description: "Top-level form by defined name (defn/def/deftest/…)" }),
 			),
-			addr: Type.Optional(Type.Number({ description: "Form by 1-based address" })),
+			handle: Type.Optional(
+				Type.String({ description: "Node by ⟦handle⟧ (from clj_tree; any nesting depth)" }),
+			),
 		}),
 
 		async execute(_toolCallId, params, _signal, _onUpdate) {
 			const args = ["get", params.path, "--json"];
 			if (params.name !== undefined) args.push("--name", params.name);
-			if (params.addr !== undefined) args.push("--addr", String(params.addr));
+			if (params.handle !== undefined) args.push("--handle", params.handle);
 			const result = await pi.exec(resolveBin(), args, { timeout: 15_000 });
 			const out = parseEnvelope(result.stdout);
 			if (!out || !out.ok) {
@@ -228,8 +303,11 @@ export default function ClojureForms(pi: ExtensionAPI) {
 			}
 			remember(params.path, out.forms);
 			const r = out.result ?? {};
+			const handleLine = r.handle
+				? ` · handle ⟦${r.handle}⟧ — pass it to clj_edit as handle`
+				: "";
 			const lines = [
-				`${params.path} · addr ${r.addr} ${r.kind}${r.name ? ` ${r.name}` : ""} · lines ${r.line?.[0]}–${r.line?.[1]} · ${r.hash}`,
+				`${params.path} · ${r.kind}${r.name ? ` ${r.name}` : ""} · lines ${r.line?.[0]}–${r.line?.[1]} · ${r.hash}${handleLine}`,
 				"",
 				r.form ?? "(empty form)",
 			];
@@ -305,31 +383,37 @@ export default function ClojureForms(pi: ExtensionAPI) {
 		name: "clj_edit",
 		label: "Clj Edit",
 		description:
-			"Whole-form editing for Clojure/EDN files. Two ways to change a form:\n" +
+			"Whole-form editing for Clojure/EDN files. The target is always a ⟦handle⟧ from clj_tree — the " +
+			"only edit target (content-addressed: it keeps resolving across edits elsewhere, and refuses with " +
+			"stale-handle when the form it names changed). Two ways to change a form:\n" +
 			"(1) PATCH (preferred for small changes): pass oldText + newText — oldText must occur exactly once " +
 			"inside the target form (scope is the form only; matches elsewhere are ignored); the replacement is " +
 			"verified with the full pipeline (file must still parse, every other form byte-identical). No bracket " +
 			"repair in patch mode — fetch exact bytes with clj_get if unsure.\n" +
 			"(2) REPLACE (or insert/delete via mode): pass content — the full replacement form; content may be " +
 			"unbalanced (brackets repaired from indentation when unambiguous) and markdown fences are stripped. " +
-			"The file is written only if the result parses and every untouched form is byte-identical. Target " +
-			"forms by name or addr; name survives earlier edits better.",
+			"The file is written only if the result parses and every untouched form is byte-identical. " +
+			"Submitted content is reindented to the target's column automatically.",
 		promptGuidelines: [
+			"Read the file with clj_tree first; copy a ⟦handle⟧ and pass it as handle — handles are the only edit target.",
+			"Handles are content-addressed: an unchanged form keeps its handle across edits elsewhere; if it changed, the edit refuses with stale-handle — re-run clj_tree.",
+			"Send content as an isolated form; the tool reindents it to the target.",
 			"Small change in a big form → patch mode (oldText/newText); full rewrite → content.",
 			"Fetch exact bytes with clj_get first; edit against them, never re-type from memory.",
-			"Prefer name targeting over addr — addrs shift after insert/delete; the result's 'was …' field tells you exactly what was replaced.",
-			"mode: replace (default) | patch (needs oldText/newText) | insert-after (anchor: after/name, 0=before first) | insert-before | append | prepend | delete.",
+			"mode: replace (default) | patch (needs oldText/newText) | insert-after (anchor: handle) | insert-before (anchor: handle) | append | prepend (file ends, no handle) | delete (needs handle).",
 			"Address WARNING D1/D2 lines in the result — they mean a form is nested inside another defn/let.",
 			"dryRun: true validates and shows the outcome without writing.",
-			"strict: true (CI mode) refuses detector warnings, --expect mismatches, and content repairs instead of applying them.",
+			"strict: true (CI mode) refuses detector warnings and content repairs instead of applying them.",
 			"repair: true allows a guessed mid-file (dedent) closure; by default only missing trailing closers are completed — a dedent-repair refusal shows the candidate.",
 		],
 		parameters: Type.Object({
 			path: Type.String({ description: "Path to the .clj/.cljs/.cljc/.edn file" }),
-			name: Type.Optional(
-				Type.String({ description: "Target form by defined name (defn/def/deftest/…)" }),
+			handle: Type.Optional(
+				Type.String({
+					description:
+						"The ⟦handle⟧ of the target form from clj_tree (required for replace/patch/delete/insert-after/insert-before; append/prepend take none)",
+				}),
 			),
-			addr: Type.Optional(Type.Number({ description: "Target form by 1-based address" })),
 			oldText: Type.Optional(
 				Type.String({
 					description:
@@ -356,13 +440,11 @@ export default function ClojureForms(pi: ExtensionAPI) {
 					Type.Literal("delete"),
 				], { description: "Default replace" }),
 			),
-			after: Type.Optional(Type.Number({ description: "insert-after anchor addr (0 = before first)" })),
-			before: Type.Optional(Type.Number({ description: "insert-before anchor addr" })),
 			dryRun: Type.Optional(Type.Boolean({ description: "Validate and report without writing" })),
 			strict: Type.Optional(
 				Type.Boolean({
 					description:
-						"Refuse mismatches, detector warnings, and content repairs instead of applying them (CI mode)",
+						"Refuse detector warnings and content repairs instead of applying them (CI mode)",
 				}),
 			),
 			repair: Type.Optional(
@@ -396,11 +478,27 @@ export default function ClojureForms(pi: ExtensionAPI) {
 					isError: true,
 				};
 			}
+			// Target validation (SPEC §5): --handle is the only target; only
+			// append/prepend are target-less.
+			const needsHandle = mode !== "append" && mode !== "prepend";
+			if (params.handle !== undefined && !needsHandle) {
+				return {
+					content: [
+						{ type: "text", text: "append/prepend are file-level and take no handle — use insert-after/insert-before to place the form next to a node" },
+					],
+					isError: true,
+				};
+			}
+			if (needsHandle && params.handle === undefined) {
+				return {
+					content: [
+						{ type: "text", text: `clj_edit ${mode} requires handle — run clj_tree and copy the ⟦handle⟧ of the target form` },
+					],
+					isError: true,
+				};
+			}
 			const args = ["edit", params.path, "--json", "--mode", mode];
-			if (params.name !== undefined) args.push("--name", params.name);
-			if (params.addr !== undefined) args.push("--addr", String(params.addr));
-			if (params.after !== undefined) args.push("--after", String(params.after));
-			if (params.before !== undefined) args.push("--before", String(params.before));
+			if (params.handle !== undefined) args.push("--handle", params.handle);
 			if (params.dryRun) args.push("--dry-run");
 			if (params.strict) args.push("--strict");
 			if (params.repair) args.push("--repair");
@@ -527,13 +625,15 @@ export default function ClojureForms(pi: ExtensionAPI) {
 		return {
 			systemPrompt: `${_event.systemPrompt}
 
-For Clojure/EDN files (*.clj, *.cljs, *.cljc, *.edn) prefer the clj_forms/clj_get/clj_edit tools over raw text
-edits: they address whole forms by name or address, fetch exact bytes, patch inside a form (oldText/newText),
-repair unbalanced content by indentation, and never write a file that does not parse. clj_draft recovers
-brackets from an indentation-only draft (candidate + diff, never writes). Shape reports in tool results are
-binding: a "BLOCKING: the file no longer parses" line, lost forms in the guard report, or D1–D4 nesting
-warnings must be fixed or explicitly justified in your next action. After editing, prefer clj-check semantics
-already built into clj_edit's output over re-reading the whole file.`,
+For Clojure/EDN files (*.clj, *.cljs, *.cljc, *.edn) prefer the clj_tree/clj_get/clj_edit tools over raw text
+edits: clj_tree annotates the source with ⟦handles⟧ — the only edit targets (content-addressed, stable
+across edits elsewhere); clj_edit replaces, patches (oldText/newText), inserts, or deletes whole forms by
+handle, reindents submitted content to the target, repairs unbalanced content by indentation when
+unambiguous, and never writes a file that does not parse. A stale-handle refusal means the form changed —
+re-run clj_tree. clj_draft recovers brackets from an indentation-only draft (candidate + diff, never
+writes). Shape reports in tool results are binding: a "BLOCKING: the file no longer parses" line, lost forms
+in the guard report, or D1–D4 nesting warnings must be fixed or explicitly justified in your next action.
+After editing, prefer clj-check semantics already built into clj_edit's output over re-reading the whole file.`,
 		};
 	});
 }
