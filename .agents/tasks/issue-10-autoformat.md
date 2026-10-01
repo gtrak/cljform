@@ -46,3 +46,29 @@ no whole-file reformat.
 Commands + outcome; the exact wrapper note text; what happens when the content
 is unbalanced (the fallback path); confirmation that `oldText`/`newText` are
 never reformatted.
+
+## Observation (2026-10-01)
+
+Two fresh `clojure-worker` (local/local) runs submitted deliberately flat
+content (every line at column 0) to `clj_edit` with `autoFormat` default on.
+
+- **Balanced flat content** (`(when (pos? a)` / `(dec x)` / `(println x))`):
+  the wrapper reindented it to parinfer shape (body +1) and the Rust edit path
+  base-shifted line 0 to the target column, so the file read
+  `    (when (pos? a)` / `     (dec x)` / `     (println x))))` — body at
+  target+1. The agent reported the indentation did not match what it
+  submitted, but was **not surprised**: it cited the docs and the result notes
+  ("reindented content (parinfer paren mode) before editing" and "reindented
+  submitted content to the target column"). 1 form changed, others untouched,
+  file parses.
+- **Unbalanced flat content** (missing the `when` closer): `format` refused
+  (`parse-error`), so the wrapper fell back to verbatim with
+  `note: content was not reindented (cljform format: unclosed open-paren)`;
+  the edit path then repaired the closer and base-shifted. The agent again
+  reported the mismatch and was not derailed, because the note and the
+  submitted-vs-repaired diff showed it.
+
+Conclusion: auto-format is **not** surprising to the agent — the explicit
+notes carry it. The observable effect is a style choice: parinfer's +1 body
+indent, not cljfmt's +2. If that style is unwanted, `autoFormat: false`
+disables it.
