@@ -120,6 +120,13 @@ enum Op {
         /// --strict; enables re-aim when a stale view is recoverable).
         #[arg(long)]
         expect: Option<String>,
+        /// Resolve the target collection node by its `tree` handle instead of
+        /// a top-level form (SPEC §10.3).
+        #[arg(
+            long,
+            conflicts_with_all = ["addr", "name", "after", "before"]
+        )]
+        handle: Option<String>,
         /// Validate only; write nothing.
         #[arg(long)]
         dry_run: bool,
@@ -583,6 +590,14 @@ struct Target {
     form: Form,
 }
 
+/// Payload of one edit: prepared whole-form content (normalized/repaired) or
+/// a surgical patch scoped to the target's bytes (no repair — patch is
+/// exact-match).
+enum Payload {
+    Prepared(content::Prepared),
+    Patch { bytes: Vec<u8>, diff: String, noop: bool },
+}
+
 /// Resolve a target form by addr or name, with did-you-mean on name misses.
 fn resolve_target(
     forms: &[Form],
@@ -885,12 +900,13 @@ fn dispatch(cli: &Cli) -> Result<Output, Fail> {
             old_text,
             new_text,
             expect,
+            handle,
             dry_run,
             strict,
             repair,
         } => run_edit(
             file, *mode, *addr, *after, *before, name, content, content_file, old_text, new_text,
-            expect, *dry_run, *strict, *repair,
+            expect, handle, *dry_run, *strict, *repair,
         ),
         Op::Tree { file, depth, full } => {
             let (bytes, had_bom) = read_file(file)?;
@@ -1051,6 +1067,7 @@ fn run_edit(
     old_text: &Option<String>,
     new_text: &Option<String>,
     expect: &Option<String>,
+    handle_opt: &Option<String>,
     dry_run: bool,
     strict: bool,
     repair: bool,
@@ -1059,9 +1076,101 @@ fn run_edit(
     let parsed = parse_or_fail(&bytes, "file")?;
     let before_forms = parsed.forms.clone();
 
-    // Resolve target per mode.
+    // --handle path (SPEC §10.3): resolve the target collection node and
+    // splice its exact byte range; the top-level --addr/--name machinery
+    // below is bypassed (issue 04 removes it).
+    let handle_node: Option<handle::Node> = match handle_opt {
+        Some(h) if h.len() < 6 => {
+            return Err(Fail(
+                2,
+                ErrorBody {
+                    code: "usage",
+                    line: None,
+                    col: None,
+                    message: format!("--handle must be at least 6 hex characters, got {h:?}"),
+                    hint: Some("run tree to list current handles".into()),
+                    suggestions: None,
+                },
+            ))
+        }
+        Some(h) if matches!(mode, Mode::Append | Mode::Prepend) => {
+            return Err(Fail(
+                2,
+                ErrorBody {
+                    code: "usage",
+                    line: None,
+                    col: None,
+                    message: "--handle cannot target append/prepend: they are file-level; use insert-before/insert-after to place the new form next to the node".into(),
+                    hint: None,
+                    suggestions: None,
+                },
+            ))
+        }
+        Some(h) => {
+            let nodes = handle::collect(&bytes);
+            let hits: Vec<&handle::Node> =
+                nodes.iter().filter(|n| n.raw.starts_with(h.as_str())).collect();
+            match hits.len() {
+                0 => {
+                    return Err(Fail(
+                        3,
+                        ErrorBody {
+                            code: "stale-handle",
+                            line: None,
+                            col: None,
+                            message: format!(
+                                "handle {h:?} does not match any form in {} — the form it names changed or is gone",
+                                file.display()
+                            ),
+                            hint: Some("re-run tree to get current handles".into()),
+                            suggestions: None,
+                        },
+                    ));
+                }
+                1 => Some(hits[0].clone()),
+                n => {
+                    let paths: Vec<&str> = hits.iter().map(|x| x.path.as_str()).collect();
+                    return Err(Fail(
+                        3,
+                        ErrorBody {
+                            code: "ambiguous-handle",
+                            line: None,
+                            col: None,
+                            message: format!(
+                                "handle {h:?} matches {n} forms (paths: {}) — extend the prefix to disambiguate",
+                                paths.join(", ")
+                            ),
+                            hint: Some("re-run tree and copy a longer prefix".into()),
+                            suggestions: None,
+                        },
+                    ));
+                }
+            }
+        }
+        None => None,
+    };
+
+    // Resolve target per mode. The --handle path targets the containing
+    // top-level form (for --expect and the I2 window); the splice itself
+    // uses the node's byte range.
     let resolved_by_name = name.is_some();
-    let target = match mode {
+    let target = if let Some(node) = handle_node.as_ref() {
+        let top_level = node
+            .path
+            .split('.')
+            .next()
+            .and_then(|s| s.parse().ok())
+            .expect("handle node path indexes a top-level form");
+        debug_assert!(
+            (1..=before_forms.len()).contains(&top_level),
+            "handle path must index a top-level form"
+        );
+        Target {
+            addr: top_level,
+            form: before_forms[top_level - 1].clone(),
+        }
+    } else {
+        match mode {
         Mode::Replace | Mode::Patch | Mode::Delete => resolve_target(&before_forms, &addr, name)?,
         Mode::InsertAfter | Mode::InsertBefore | Mode::Append | Mode::Prepend => {
             // Anchor: explicit index, name, or file edges.
@@ -1126,18 +1235,18 @@ fn run_edit(
                 }
             }
         }
+    }
     };
 
     // Payload: whole-form content (normalized/repaired) or a surgical patch
     // scoped to the target form's bytes (no repair — patch is exact).
-    enum Payload {
-        Prepared(content::Prepared),
-        Patch { bytes: Vec<u8>, diff: String, noop: bool },
-    }
+    // Notes accumulate here (marker-strip / reindent) and gain the --expect
+    // notes after the payload is built.
+    let mut notes: Vec<String> = Vec::new();
     let payload: Option<Payload> = match mode {
         Mode::Delete => None,
         Mode::Patch => {
-            let Some(old) = old_text.as_deref().filter(|s| !s.is_empty()) else {
+            let Some(old_raw) = old_text.as_deref().filter(|s| !s.is_empty()) else {
                 return Err(Fail(
                     2,
                     ErrorBody {
@@ -1150,30 +1259,56 @@ fn run_edit(
                     },
                 ));
             };
-            let new = new_text.as_deref().unwrap_or("");
-            let form_bytes = &bytes[target.form.start_byte..target.form.end_byte];
-            let needle = old.as_bytes();
-            let hits = find_all(form_bytes, needle);
-            let form_label = match &target.form.name {
-                Some(n) => format!("{} {n}", target.form.kind),
-                None => target.form.kind.clone(),
+            // §10.4: view markers never reach the file.
+            let (old, old_gone) = strip_view_markers(old_raw);
+            let (new, new_gone) = strip_view_markers(new_text.as_deref().unwrap_or(""));
+            if old_gone || new_gone {
+                notes.push(
+                    "stripped \u{27E6}…\u{27E7} view markers from the submitted text".to_string(),
+                );
+            }
+            // Scope: the whole top-level form on the --addr/--name path, the
+            // target node's exact bytes on the --handle path.
+            let scoped = match handle_node.as_ref() {
+                Some(node) => &bytes[node.start_byte..node.end_byte],
+                None => &bytes[target.form.start_byte..target.form.end_byte],
             };
+            let (line_range, scope_label, scope_bytes) = match handle_node.as_ref() {
+                Some(node) => (
+                    node.line,
+                    node.kind.clone(),
+                    String::from_utf8_lossy(scoped).to_string(),
+                ),
+                None => {
+                    let form_label = match &target.form.name {
+                        Some(n) => format!("{} {n}", target.form.kind),
+                        None => target.form.kind.clone(),
+                    };
+                    (
+                        target.form.line,
+                        form_label,
+                        String::from_utf8_lossy(scoped).to_string(),
+                    )
+                }
+            };
+            let needle = old.as_bytes();
+            let hits = find_all(scoped, needle);
             match hits.len() {
                 0 => {
                     return Err(Fail(
                         3,
                         ErrorBody {
                             code: "patch-not-found",
-                            line: Some(target.form.line[0]),
+                            line: Some(line_range[0]),
                             col: None,
                             // Hand back the exact form bytes: the dominant
                             // failure is oldText re-typed from a sed/cat read,
                             // and this makes recovery one call, no clj_get.
                             message: format!(
-                                "--old-text not found inside form {form_label} (lines {}–{}); occurrences elsewhere in the file do not count\n\nexact form bytes (copy oldText from these):\n{}",
-                                target.form.line[0],
-                                target.form.line[1],
-                                String::from_utf8_lossy(form_bytes)
+                                "--old-text not found inside {scope_label} (lines {}–{}); occurrences elsewhere in the file do not count\n\nexact form bytes (copy oldText from these):\n{}",
+                                line_range[0],
+                                line_range[1],
+                                scope_bytes
                             ),
                             hint: Some(
                                 "use the exact bytes above verbatim; only re-fetch with clj_get if the file changed since you read it"
@@ -1189,10 +1324,10 @@ fn run_edit(
                         3,
                         ErrorBody {
                             code: "patch-ambiguous",
-                            line: Some(target.form.line[0]),
+                            line: Some(line_range[0]),
                             col: None,
                             message: format!(
-                                "--old-text occurs {n} times inside form {form_label} — include more surrounding lines to make it unique"
+                                "--old-text occurs {n} times inside {scope_label} — include more surrounding lines to make it unique"
                             ),
                             hint: None,
                             suggestions: None,
@@ -1201,16 +1336,16 @@ fn run_edit(
                 }
             }
             let i = hits[0];
-            let mut nb = Vec::with_capacity(form_bytes.len() - needle.len() + new.len());
-            nb.extend_from_slice(&form_bytes[..i]);
+            let mut nb = Vec::with_capacity(scoped.len() - needle.len() + new.len());
+            nb.extend_from_slice(&scoped[..i]);
             nb.extend_from_slice(new.as_bytes());
-            nb.extend_from_slice(&form_bytes[i + needle.len()..]);
-            let noop = nb == form_bytes;
+            nb.extend_from_slice(&scoped[i + needle.len()..]);
+            let noop = nb == scoped;
             let diff = if noop {
                 String::new()
             } else {
                 materialize::unified_diff(
-                    &String::from_utf8_lossy(form_bytes),
+                    &scope_bytes,
                     &String::from_utf8_lossy(&nb),
                     "before",
                     "after",
@@ -1220,15 +1355,65 @@ fn run_edit(
         }
         _ => {
             let raw = read_content(content, content_file)?;
-            Some(Payload::Prepared(
-                content::prepare(&raw, false, strict, repair).map_err(prepare_fail)?,
-            ))
+            // §10.4: view markers never reach the file.
+            let (stripped, markers_gone) = strip_view_markers(&raw);
+            if markers_gone {
+                notes.push(
+                    "stripped \u{27E6}…\u{27E7} view markers from the submitted text".to_string(),
+                );
+            }
+            // Base-shift reindent for the --handle path: dedent the content
+            // by its common leading whitespace and land every line after
+            // line 0 at the splice column. It runs before prepare, which
+            // trims blank edges and would mask the caller's indentation;
+            // a top-level target (column 0) is a no-op, so v1 behavior is
+            // unchanged there.
+            let (reind_text, reind_changed) = match handle_node.as_ref() {
+                Some(node) => {
+                    let start = node.start_byte;
+                    let line_start = bytes[..start]
+                        .iter()
+                        .rposition(|&b| b == b'\n')
+                        .map_or(0, |p| p + 1);
+                    let target_col = start - line_start;
+                    if target_col > 0 || matches!(mode, Mode::InsertAfter) {
+                        let (reind, changed) = reindent_to_column(&stripped, target_col);
+                        (reind, changed)
+                    } else {
+                        (stripped.clone(), false)
+                    }
+                }
+                None => (stripped.clone(), false),
+            };
+            let mut prepared =
+                content::prepare(&reind_text, false, strict, repair).map_err(prepare_fail)?;
+            // The insert-after leading newline is appended after prepare:
+            // prepare's blank-edge trim would swallow it, and it is what
+            // lands the new form as a sibling on its own line.
+            let mut leading_newline_added = false;
+            if handle_node.is_some()
+                && matches!(mode, Mode::InsertAfter)
+                && prepared.bytes.first() != Some(&b'\n')
+            {
+                let mut b = Vec::with_capacity(prepared.bytes.len() + 1);
+                b.push(b'\n');
+                b.append(&mut prepared.bytes);
+                prepared.bytes = b;
+                leading_newline_added = true;
+            }
+            if reind_changed || leading_newline_added {
+                notes.push(
+                    "reindented submitted content to the target column".to_string(),
+                );
+            }
+            Some(Payload::Prepared(prepared))
         }
     };
 
     // --expect guard (advisory by default).
-    let (_expect_prefix, mut notes) =
+    let (_expect_prefix, expect_notes) =
         check_expect(&target, expect, &before_forms, strict, resolved_by_name);
+    notes.extend(expect_notes);
     if strict {
         if let Some(e) = expect {
             if hashutil::parse_hash_prefix(e).is_ok()
@@ -1257,7 +1442,59 @@ fn run_edit(
     }
 
     // Build splice + allowed-change window.
-    let (sp, allowed) = match mode {
+    let (sp, allowed) = if let Some(node) = handle_node.as_ref() {
+        // Nested edits never change the top-level form count, so every mode
+        // gets the same I2 window: the containing top-level form may change.
+        let top_level = node.path.split('.').next().unwrap().parse::<usize>().unwrap();
+        let (start, end) = (node.start_byte, node.end_byte);
+        let sp = match mode {
+            Mode::Replace | Mode::InsertBefore | Mode::InsertAfter => {
+                let Payload::Prepared(ref p) = payload.as_ref().unwrap() else {
+                    unreachable!("whole-form modes carry prepared content")
+                };
+                let content = p.bytes.clone();
+                match mode {
+                    Mode::Replace => splice::Splice::Range {
+                        start,
+                        end,
+                        content,
+                    },
+                    Mode::InsertBefore => splice::Splice::Range {
+                        start,
+                        end: start,
+                        content,
+                    },
+                    _ => splice::Splice::Range {
+                        start: end,
+                        end,
+                        content,
+                    },
+                }
+            }
+            Mode::Patch => {
+                let Payload::Patch { bytes: content, .. } =
+                    payload.as_ref().unwrap()
+                else {
+                    unreachable!("patch carries patched node bytes")
+                };
+                splice::Splice::Range {
+                    start,
+                    end,
+                    content: content.clone(),
+                }
+            }
+            Mode::Delete => splice::Splice::Range {
+                start,
+                end,
+                content: Vec::new(),
+            },
+            Mode::Append | Mode::Prepend => {
+                unreachable!("append/prepend are refused for --handle")
+            }
+        };
+        (sp, invariants::Allowed::Replace { addr: top_level, n: 1 })
+    } else {
+        match mode {
         Mode::Replace => {
             let Some(Payload::Prepared(p)) = payload.as_ref() else {
                 unreachable!("replace carries prepared content")
@@ -1324,9 +1561,32 @@ fn run_edit(
                 invariants::Allowed::Insert { at, n: p.forms },
             )
         }
+    }
     };
 
     let new_bytes = splice::apply(&bytes, &before_forms, &sp);
+
+    // §10.3 boundary check (I2 extension): the splice may only touch
+    // [start, end). True by construction; this is the explicit proof.
+    if let Some(node) = handle_node.as_ref() {
+        let (start, end) = (node.start_byte, node.end_byte);
+        let content_len = new_bytes.len() - start - (bytes.len() - end);
+        if new_bytes[..start] != bytes[..start]
+            || new_bytes[start + content_len..] != bytes[end..]
+        {
+            return Err(Fail(
+                1,
+                ErrorBody {
+                    code: "shape-violation",
+                    line: None,
+                    col: None,
+                    message: "boundary check failed: the splice changed bytes outside the target range; nothing was written".into(),
+                    hint: None,
+                    suggestions: None,
+                },
+            ));
+        }
+    }
 
     // No-op detection.
     match (&payload, mode) {
@@ -1361,7 +1621,7 @@ fn run_edit(
         ))?;
 
     // Detectors on the result.
-    let warnings = after_parsed.warnings;
+    let warnings = after_parsed.warnings.clone();
     if strict && !warnings.is_empty() {
         return Err(Fail(
             1,
@@ -1389,67 +1649,15 @@ fn run_edit(
     }
 
     // Summary of what sits at the target after the op.
-    let summary = match mode {
-        Mode::Replace => {
-            let f = &after_parsed.forms[target.addr - 1];
-            let content_forms = match &payload {
-                Some(Payload::Prepared(p)) => p.forms,
-                _ => unreachable!("replace carries prepared content"),
-            };
-            serde_json::json!({
-                "action": "replaced",
-                "addr": target.addr,
-                "kind": f.kind,
-                "name": f.name,
-                "line": f.line,
-                "hash": hashutil::tagged(&f.hash),
-                "wasKind": target.form.kind,
-                "wasName": target.form.name,
-                "wasLine": target.form.line,
-                "hashBefore": hashutil::tagged(&target.form.hash),
-                "contentForms": content_forms,
-            })
-        }
-        Mode::Patch => {
-            let f = &after_parsed.forms[target.addr - 1];
-            serde_json::json!({
-                "action": "patched",
-                "addr": target.addr,
-                "kind": f.kind,
-                "name": f.name,
-                "line": f.line,
-                "hash": hashutil::tagged(&f.hash),
-                "hashBefore": hashutil::tagged(&target.form.hash),
-            })
-        }
-        Mode::Delete => serde_json::json!({
-            "action": "deleted",
-            "addr": target.addr,
-            "kind": target.form.kind,
-            "name": target.form.name,
-            "lineBefore": target.form.line,
-            "hashBefore": hashutil::tagged(&target.form.hash),
-        }),
-        _ => {
-            let (at, n) = match allowed {
-                invariants::Allowed::Insert { at, n } => (at, n),
-                _ => unreachable!(),
-            };
-            let inserted: Vec<serde_json::Value> = after_parsed.forms[at - 1..at - 1 + n]
-                .iter()
-                .map(|f| {
-                    serde_json::json!({
-                        "addr": f.addr, "kind": f.kind, "name": f.name, "line": f.line,
-                    })
-                })
-                .collect();
-            serde_json::json!({
-                "action": "inserted",
-                "at": at,
-                "forms": inserted,
-            })
-        }
+    let (summary, summary_notes) = if let Some(node) = handle_node.as_ref() {
+        build_handle_summary(mode, node, &bytes, &new_bytes, &payload)
+    } else {
+        (
+            handle_target_summary(&mode, &after_parsed, &target, &allowed, &payload),
+            Vec::new(),
+        )
     };
+    notes.extend(summary_notes);
 
     let mut text = human_summary(&summary, &shape);
     match &payload {
@@ -1510,6 +1718,230 @@ fn run_edit(
     })
 }
 
+/// §10.4: strip `⟦…⟧` view markers from submitted text; reports whether
+/// anything was removed.
+fn strip_view_markers(text: &str) -> (String, bool) {
+    let stripped = handle::strip(text);
+    let changed = stripped != text;
+    (stripped, changed)
+}
+
+/// Base-shift reindent for the `--handle` path: the caller sends an isolated
+/// form (any indentation); land it at the splice column. Dedent the content
+/// by its common leading whitespace across non-blank lines, emit line 0
+/// with no leading whitespace (it lands at the splice point, after the
+/// existing line prefix) and prefix every later line with `target_col`
+/// spaces. Whitespace-only and deterministic; both a caller-indented and a
+/// flat block normalize to the same result.
+fn reindent_to_column(content: &str, target_col: usize) -> (String, bool) {
+    let mut lines: Vec<&str> = content.split('\n').collect();
+    // A trailing newline does not create a phantom final line.
+    let trailing_nl = lines.last().copied().unwrap_or("").is_empty();
+    if trailing_nl {
+        lines.pop();
+    }
+    let out = if lines.is_empty() || lines.iter().all(|l| is_blank_line(l)) {
+        content.to_string()
+    } else {
+        // Common leading whitespace across non-blank lines.
+        let mut common: Option<String> = None;
+        for l in &lines {
+            if is_blank_line(l) {
+                continue;
+            }
+            let indent: String = l.bytes().take_while(|&b| b == b' ' || b == b'\t').map(char::from).collect();
+            common = Some(match common {
+                None => indent,
+                Some(c) => {
+                    let n = c.bytes().zip(indent.bytes()).take_while(|(a, b)| a == b).count();
+                    c[..n].to_string()
+                }
+            });
+        }
+        let common = common.unwrap_or_default();
+        let prefix = " ".repeat(target_col);
+        let mut out_lines = Vec::with_capacity(lines.len());
+        for (i, l) in lines.iter().enumerate() {
+            let body = if l.len() >= common.len() { &l[common.len()..] } else { l };
+            out_lines.push(if i == 0 {
+                body.to_string()
+            } else {
+                format!("{prefix}{body}")
+            });
+        }
+        let mut out = out_lines.join("\n");
+        if trailing_nl {
+            out.push('\n');
+        }
+        out
+    };
+    let changed = out != content;
+    (out, changed)
+}
+
+fn is_blank_line(l: &str) -> bool {
+    l.bytes().all(|b| b == b' ' || b == b'\t' || b == b'\r')
+}
+
+/// Summary of the top-level (addr/name) path: what sits at the target after
+/// the op.
+fn handle_target_summary(
+    mode: &Mode,
+    after_parsed: &parser::Parsed,
+    target: &Target,
+    allowed: &invariants::Allowed,
+    payload: &Option<Payload>,
+) -> serde_json::Value {
+    match mode {
+        Mode::Replace => {
+            let f = &after_parsed.forms[target.addr - 1];
+            let content_forms = match payload {
+                Some(Payload::Prepared(p)) => p.forms,
+                _ => unreachable!("replace carries prepared content"),
+            };
+            serde_json::json!({
+                "action": "replaced",
+                "addr": target.addr,
+                "kind": f.kind,
+                "name": f.name,
+                "line": f.line,
+                "hash": hashutil::tagged(&f.hash),
+                "wasKind": target.form.kind,
+                "wasName": target.form.name,
+                "wasLine": target.form.line,
+                "hashBefore": hashutil::tagged(&target.form.hash),
+                "contentForms": content_forms,
+            })
+        }
+        Mode::Patch => {
+            let f = &after_parsed.forms[target.addr - 1];
+            serde_json::json!({
+                "action": "patched",
+                "addr": target.addr,
+                "kind": f.kind,
+                "name": f.name,
+                "line": f.line,
+                "hash": hashutil::tagged(&f.hash),
+                "hashBefore": hashutil::tagged(&target.form.hash),
+            })
+        }
+        Mode::Delete => serde_json::json!({
+            "action": "deleted",
+            "addr": target.addr,
+            "kind": target.form.kind,
+            "name": target.form.name,
+            "lineBefore": target.form.line,
+            "hashBefore": hashutil::tagged(&target.form.hash),
+        }),
+        _ => {
+            let (at, n) = match allowed {
+                invariants::Allowed::Insert { at, n } => (*at, *n),
+                _ => unreachable!(),
+            };
+            let inserted: Vec<serde_json::Value> = after_parsed.forms[at - 1..at - 1 + n]
+                .iter()
+                .map(|f| {
+                    serde_json::json!({
+                        "addr": f.addr, "kind": f.kind, "name": f.name, "line": f.line,
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "action": "inserted",
+                "at": at,
+                "forms": inserted,
+            })
+        }
+    }
+}
+
+/// Summary of the `--handle` path: where the node sits in the new file and
+/// the new handle(s). Handle computation is best-effort — when it cannot be
+/// computed the field is omitted and a note is added; the edit never fails
+/// over it.
+fn build_handle_summary(
+    mode: Mode,
+    node: &handle::Node,
+    bytes: &[u8],
+    new_bytes: &[u8],
+    payload: &Option<Payload>,
+) -> (serde_json::Value, Vec<String>) {
+    let mut notes: Vec<String> = Vec::new();
+    let new_nodes = handle::collect(new_bytes);
+    let at_path = new_nodes.iter().find(|n| n.path == node.path);
+    match mode {
+        Mode::Replace | Mode::Patch => {
+            let line = at_path.map(|n| n.line).unwrap_or(node.line);
+            let mut summary = serde_json::json!({
+                "action": if mode == Mode::Replace { "replaced" } else { "patched" },
+                "path": node.path,
+                "kind": node.kind,
+                "name": node.name,
+                "line": line,
+                "wasKind": node.kind,
+                "wasLine": node.line,
+                "wasHandle": node.handle,
+            });
+            match at_path {
+                Some(n) => {
+                    summary["handle"] = serde_json::json!(n.handle);
+                }
+                None => notes.push(
+                    "could not compute the new handle at the same path; re-run tree".to_string(),
+                ),
+            }
+            if mode == Mode::Replace {
+                if let Some(Payload::Prepared(p)) = payload {
+                    summary["contentForms"] = serde_json::json!(p.forms);
+                }
+            }
+            (summary, notes)
+        }
+        Mode::Delete => (
+            serde_json::json!({
+                "action": "deleted",
+                "path": node.path,
+                "wasKind": node.kind,
+                "name": node.name,
+                "lineBefore": node.line,
+                "wasHandle": node.handle,
+            }),
+            notes,
+        ),
+        Mode::InsertBefore | Mode::InsertAfter => {
+            // The inserted span in the new file: the node's start (insert
+            // before) or end (insert after) — the splice is pure, so the
+            // anchor is the same offset in both files.
+            let anchor = if mode == Mode::InsertBefore {
+                node.start_byte
+            } else {
+                node.end_byte
+            };
+            let content_len = new_bytes.len() - anchor - (bytes.len() - anchor);
+            let handles: Vec<String> = new_nodes
+                .iter()
+                .filter(|n| n.start_byte >= anchor && n.start_byte < anchor + content_len)
+                .map(|n| n.handle.clone())
+                .collect();
+            let mut summary = serde_json::json!({
+                "action": "inserted",
+                "path": node.path,
+                "side": if mode == Mode::InsertBefore { "before" } else { "after" },
+                "wasHandle": node.handle,
+            });
+            if handles.is_empty() {
+                notes.push("could not compute handles for the inserted form(s)".to_string());
+            } else {
+                summary["handles"] = serde_json::json!(handles);
+            }
+            (summary, notes)
+        }
+        Mode::Append | Mode::Prepend => {
+            unreachable!("append/prepend are refused for --handle")
+        }
+    }
+}
+
 /// All byte offsets where `needle` occurs in `haystack` (overlapping not
 /// expected for text patches; non-overlapping scan is correct here).
 fn find_all(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
@@ -1547,6 +1979,31 @@ fn placeholder_form(forms: &[Form]) -> Form {
 }
 
 fn human_summary(summary: &serde_json::Value, shape: &invariants::ShapeCheck) -> String {
+    // The --handle path carries the node's path; render it separately.
+    if let Some(path) = summary.get("path").and_then(|v| v.as_str()) {
+        return match summary["action"].as_str().unwrap_or("") {
+            "replaced" | "patched" => format!(
+                "{} form at {path} (lines {}–{}) — {} changed, {} untouched",
+                summary["action"].as_str().unwrap_or(""),
+                summary["line"][0],
+                summary["line"][1],
+                shape.changed,
+                shape.untouched
+            ),
+            "deleted" => format!(
+                "deleted form at {path} (was lines {}–{}) — {} untouched",
+                summary["lineBefore"][0],
+                summary["lineBefore"][1],
+                shape.untouched
+            ),
+            "inserted" => format!(
+                "inserted form(s) {} the form at {path} — {} untouched",
+                summary["side"].as_str().unwrap_or(""),
+                shape.untouched
+            ),
+            _ => String::new(),
+        };
+    }
     let action = summary["action"].as_str().unwrap_or("");
     match action {
         "replaced" => {

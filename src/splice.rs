@@ -15,6 +15,9 @@ pub enum Splice {
     InsertBefore { before: usize, content: Vec<u8> },
     /// Remove the target form's byte range and re-seam the gap.
     Delete { addr: usize },
+    /// Replace the raw byte range `[start, end)` with `content` (used by the
+    /// `--handle` path; `start == end` is an insert, empty `content` a delete).
+    Range { start: usize, end: usize, content: Vec<u8> },
 }
 
 /// Apply the splice to the original bytes, returning the new file bytes.
@@ -90,6 +93,22 @@ pub fn apply(bytes: &[u8], forms: &[Form], splice: &Splice) -> Vec<u8> {
                 b""
             };
             splice_with(bytes, prev_end, next_start, seam, b"")
+        }
+        Splice::Range { start, end, content } => {
+            // Same trailing-comment guard as `Edit`: a comment without a
+            // newline would swallow whatever follows on the same line.
+            let mut content = content.clone();
+            if materialize::ends_in_comment(&content)
+                && *end < bytes.len()
+                && bytes[*end] != b'\n'
+            {
+                content.push(b'\n');
+            }
+            let mut out = Vec::with_capacity(bytes.len() + content.len());
+            out.extend_from_slice(&bytes[..*start]);
+            out.extend_from_slice(&content);
+            out.extend_from_slice(&bytes[*end..]);
+            out
         }
     }
 }

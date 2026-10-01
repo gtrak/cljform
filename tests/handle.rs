@@ -179,3 +179,256 @@ fn annotate_conflict_is_refused() {
     assert_eq!(v["ok"], true);
     assert!(!v["result"]["nodes"].as_array().unwrap().is_empty());
 }
+
+// ==============================================================
+// --handle edit resolution (issue 03, SPEC §10.3/§10.4)
+// ==============================================================
+
+const HEDIT_FIXTURE: &[u8] =
+    b"(ns t)\n\n(def config {:a 1})\n\n(defn helper [x]\n  (let [y [1 2]]\n    (when x\n      (+ y 1))))\n\n(def after :ok)\n";
+
+fn run_json(args: &[&str]) -> (i32, serde_json::Value, String) {
+    let (code, out, err) = run(args, None);
+    let v = serde_json::from_slice(&out).unwrap_or(serde_json::Value::Null);
+    (code, v, err)
+}
+
+fn tree_nodes(file: &str) -> Vec<serde_json::Value> {
+    let (code, out, stderr) = run_json(&["tree", file, "--full", "--json"]);
+    assert_eq!(code, 0, "{stderr}");
+    out["result"]["nodes"]
+        .as_array()
+        .cloned()
+        .expect("tree --json carries result.nodes")
+}
+
+fn node_by_path<'a>(nodes: &'a [serde_json::Value], path: &str) -> &'a serde_json::Value {
+    nodes
+        .iter()
+        .find(|n| n["path"] == path)
+        .unwrap_or_else(|| panic!("no node at path {path}: {nodes:?}"))
+}
+
+fn handle_at(file: &str, path: &str) -> String {
+    let nodes = tree_nodes(file);
+    node_by_path(&nodes, path)["handle"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn edit_handle_replaces_nested_form() {
+    let f = write("he-replace.clj", HEDIT_FIXTURE);
+    let nodes = tree_nodes(&f);
+    let h = node_by_path(&nodes, "3.3.2")["handle"].as_str().unwrap();
+
+    let (code, d, stderr) =
+        run_json(&["edit", &f, "--handle", h, "--content", "(if x y 0)", "--json"]);
+    assert_eq!(code, 0, "{d} {stderr}");
+    assert_eq!(d["result"]["summary"]["action"], "replaced");
+    assert_eq!(d["result"]["summary"]["path"], "3.3.2");
+    // The node now at the same path reports its new handle.
+    assert!(d["result"]["summary"]["handle"].is_string(), "{d}");
+    // Only the target range changed: the file is the fixture with just the
+    // when-form swapped (the splice is exact — no whitespace re-flow).
+    let expected = "(ns t)\n\n(def config {:a 1})\n\n(defn helper [x]\n  (let [y [1 2]]\n    (if x y 0)))\n\n(def after :ok)\n";
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), expected);
+}
+
+#[test]
+fn edit_handle_patch_delete_insert() {
+    let f = write("he-modes.clj", HEDIT_FIXTURE);
+    let h = handle_at(&f, "3.3.1.1"); // [1 2]
+
+    // Patch scoped to the node's bytes.
+    let (code, d, stderr) = run_json(&[
+        "edit", &f, "--handle", &h, "--mode", "patch", "--old-text", "2", "--new-text", "9", "--json",
+    ]);
+    assert_eq!(code, 0, "{d} {stderr}");
+    assert_eq!(d["result"]["summary"]["action"], "patched");
+    assert!(d["result"]["summary"]["handle"].is_string(), "{d}");
+    let text = std::fs::read_to_string(&f).unwrap();
+    assert!(text.contains("[1 9]"), "{text}");
+
+    // Re-fetch: the patched node got a new handle.
+    let h2 = handle_at(&f, "3.3.1.1");
+    assert_ne!(h2, h);
+
+    // Insert-after: the new form lands as a sibling on its own line, at the
+    // target's indentation.
+    let (code, d, stderr) = run_json(&[
+        "edit", &f, "--handle", &h2, "--mode", "insert-after", "--content", "(inc 0)", "--json",
+    ]);
+    assert_eq!(code, 0, "{d} {stderr}");
+    assert_eq!(d["result"]["summary"]["side"], "after");
+    let text = std::fs::read_to_string(&f).unwrap();
+    assert!(text.contains("(inc 0)"), "{text}");
+    assert!(
+        !text.contains("[1 9](inc 0)"),
+        "insert-after must start on its own line: {text}"
+    );
+
+    // Delete the node's byte range (re-fetched: the insert-after changed it).
+    let h3 = handle_at(&f, "3.3.1.1");
+    let (code, d, stderr) =
+        run_json(&["edit", &f, "--handle", &h3, "--mode", "delete", "--json"]);
+    assert_eq!(code, 0, "{d} {stderr}");
+    assert_eq!(d["result"]["summary"]["action"], "deleted");
+    assert!(d["result"]["summary"].get("handles").is_none(), "delete reports no handles: {d}");
+    let text = std::fs::read_to_string(&f).unwrap();
+    assert!(!text.contains("[1 9]"), "node excised: {text}");
+    // The insert-after sibling sits in the enclosing binding vector, so it
+    // survives the inner vector's deletion.
+    assert!(text.contains("(inc 0)"), "sibling kept: {text}");
+
+    // Insert before a different node: the def's map.
+    let hmap = handle_at(&f, "2.2");
+    let (code, d, stderr) = run_json(&[
+        "edit", &f, "--handle", &hmap, "--mode", "insert-before", "--content", "(def marker :ok)", "--json",
+    ]);
+    assert_eq!(code, 0, "{d} {stderr}");
+    assert_eq!(d["result"]["summary"]["action"], "inserted");
+    let handles = d["result"]["summary"]["handles"].as_array().expect("handles");
+    assert!(!handles.is_empty(), "inserted form(s) report handles: {d}");
+    let text = std::fs::read_to_string(&f).unwrap();
+    assert!(text.contains("(def config (def marker :ok){:a 1})"), "{text}");
+    // Every top-level form still parses and the count is unchanged.
+    let (code, forms, stderr) = run_json(&["forms", &f, "--json"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(forms["forms"].as_array().unwrap().len(), 4);
+}
+
+#[test]
+fn edit_handle_stale_is_refused() {
+    let f = write(
+        "he-stale.clj",
+        b"(def a 1)\n\n(defn f [x]\n  (let [q 5]\n    q))\n",
+    );
+    let h = handle_at(&f, "2.3.1");
+    // Out-of-band: form 2 is replaced entirely, so the target node's content
+    // changes (or disappears).
+    let (code, _, stderr) = run_json(&[
+        "edit", &f, "--addr", "2", "--content", "(defn f [x] (inc x))", "--json",
+    ]);
+    assert_eq!(code, 0, "{stderr}");
+    let before = std::fs::read(&f).unwrap();
+    let (code, d, _) =
+        run_json(&["edit", &f, "--handle", &h, "--content", "(def a 3)", "--json"]);
+    assert_eq!(code, 3, "{d}");
+    assert_eq!(d["error"]["code"], "stale-handle");
+    assert!(d["error"]["message"].as_str().unwrap().contains(&f));
+    assert!(
+        d["error"]["hint"].as_str().unwrap().contains("tree"),
+        "hint says re-run tree: {d}"
+    );
+    assert_eq!(std::fs::read(&f).unwrap(), before, "nothing written");
+}
+
+#[test]
+fn edit_handle_reaims_moved_form() {
+    let f = write("he-reaim.clj", HEDIT_FIXTURE);
+    let h = handle_at(&f, "2");
+    // An earlier insert moves the form from addr 2 to addr 3.
+    let (code, _, stderr) = run_json(&[
+        "edit", &f, "--mode", "insert-before", "--before", "2", "--content", "(def first :x)", "--json",
+    ]);
+    assert_eq!(code, 0, "{stderr}");
+    // Content-addressed: the old handle still resolves and can replace the
+    // form at its new position.
+    let (code, d, stderr) = run_json(&[
+        "edit", &f, "--handle", &h, "--content", "(def config {:a 2})", "--json",
+    ]);
+    assert_eq!(code, 0, "{d} {stderr}");
+    assert_eq!(d["result"]["summary"]["action"], "replaced");
+    assert_eq!(d["result"]["summary"]["path"], "3");
+    let text = std::fs::read_to_string(&f).unwrap();
+    assert!(text.contains("(def config {:a 2})"), "{text}");
+    assert!(text.contains("(def first :x)"), "earlier insert intact: {text}");
+}
+
+#[test]
+fn edit_strips_view_markers_from_content() {
+    let f = write("he-markers.clj", HEDIT_FIXTURE);
+    let h = handle_at(&f, "2");
+    // A form lifted straight from the human tree view, markers and all.
+    let (code, out, stderr) = run(&["tree", &f, "--depth", "1", "--human"], None);
+    assert_eq!(code, 0, "{stderr}");
+    let view = String::from_utf8(out).unwrap();
+    let line = view
+        .lines()
+        .find(|l| l.contains("def config"))
+        .expect("view line");
+    assert!(line.contains('\u{27E6}'), "view line carries markers: {line}");
+    let (code, d, stderr) =
+        run_json(&["edit", &f, "--handle", &h, "--content", line, "--json"]);
+    assert_eq!(code, 0, "{d} {stderr}");
+    let notes = d["notes"].as_array().expect("notes");
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.as_str().unwrap_or("").contains("view markers")),
+        "strip note present: {notes:?}"
+    );
+    let text = std::fs::read_to_string(&f).unwrap();
+    assert!(!text.contains('\u{27E6}'), "markers must not leak: {text}");
+    assert_eq!(text, std::str::from_utf8(HEDIT_FIXTURE).unwrap(), "no-op on identical form");
+
+    // And a changed, marker-laden form lands cleanly.
+    let marked = "(def config \u{27E6}junk\u{27E7} {:a 7})";
+    let (code, d, stderr) =
+        run_json(&["edit", &f, "--handle", &h, "--content", marked, "--json"]);
+    assert_eq!(code, 0, "{d} {stderr}");
+    let text = std::fs::read_to_string(&f).unwrap();
+    assert!(text.contains("(def config  {:a 7})"), "marker span removed: {text:?}");
+    assert!(!text.contains('\u{27E6}'), "{text}");
+}
+
+#[test]
+fn edit_handle_boundary() {
+    // Every top-level form except the containing one stays byte-identical
+    // (the untouched_forms_byte_identical_after_ops pattern, nested edition).
+    let f = write("he-boundary.clj", HEDIT_FIXTURE);
+    let (_c, before, _) = run_json(&["forms", &f, "--json"]);
+    let bforms = before["forms"].as_array().unwrap().to_vec();
+    let h = handle_at(&f, "3.3.2");
+    let (code, d, stderr) =
+        run_json(&["edit", &f, "--handle", &h, "--content", "(if x [7 8] 0)", "--json"]);
+    assert_eq!(code, 0, "{d} {stderr}");
+    let (_c, after, _) = run_json(&["forms", &f, "--json"]);
+    let aforms = after["forms"].as_array().unwrap();
+    assert_eq!(aforms.len(), bforms.len(), "nested edit keeps the form count");
+    for (b, a) in bforms.iter().zip(aforms.iter()) {
+        if b["addr"] == 3 {
+            assert_ne!(b["hash"], a["hash"], "containing form changed");
+        } else {
+            // Form bytes are content-hashed: identical hashes mean the form
+            // is byte-identical (lines may shift inside a changed form).
+            assert_eq!(b["hash"], a["hash"], "form {} drifted", b["addr"]);
+        }
+    }
+}
+
+#[test]
+fn edit_reindents_isolated_content() {
+    let f = write("he-reindent.clj", b"(def x {:a 1})\n");
+    let h = handle_at(&f, "1.2");
+    // Isolated form at column 0; the target node sits at column 7.
+    let (code, d, stderr) =
+        run_json(&["edit", &f, "--handle", &h, "--content", "(defn f [a]\n  a)\n", "--json"]);
+    assert_eq!(code, 0, "{d} {stderr}");
+    let text = std::fs::read_to_string(&f).unwrap();
+    // Line 0 lands at the splice point (column 7); the body line carries the
+    // target column plus the content's relative 2-space indent.
+    assert_eq!(text, "(def x (defn f [a]\n         a))\n", "{:?}", text);
+    let notes = d["notes"].as_array().expect("notes");
+    assert!(
+        notes.iter().any(|n| n.as_str().unwrap_or("").contains("reindented")),
+        "reindent is reported: {notes:?}"
+    );
+
+    // A caller-indented block normalizes to the same result.
+    std::fs::write(&f, b"(def x {:a 1})\n").unwrap();
+    let (code, d, stderr) = run_json(&[
+        "edit", &f, "--handle", &h, "--content", "  (defn f [a]\n    a)\n", "--json",
+    ]);
+    assert_eq!(code, 0, "{d} {stderr}");
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), "(def x (defn f [a]\n         a))\n");
+}
