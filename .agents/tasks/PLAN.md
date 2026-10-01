@@ -60,3 +60,9 @@ Sequence (one worker subagent per issue):
   Rust edit path then base-shifts the parinfer-shaped content to the target
   column. Experiment: observe whether the reindentation surprises the agent.
   Depends on 06 and 05.
+- **11 — reindent inside `cljform edit`** (`issue-11-edit-format.md`): move the
+  parinfer reindent into the edit CLI (default on, `--no-format-content`),
+  applied to prepared content before the base-shift; the pi extension drops
+  its separate `cljform format` call and just maps `autoFormat: false` to
+  `--no-format-content`. Supersedes issue 10's wrapper-side mechanism.
+  Depends on 10.

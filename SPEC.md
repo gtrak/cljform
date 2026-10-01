@@ -161,7 +161,7 @@ The `forms` array is the **top-level listing**. The **nested view** is the
 | `strip [file]` | delete every `⟦…⟧` marker → the exact original bytes; pure stdout filter, no envelope (§10.2) | no | file or stdin |
 | `get <file>` | one form's exact bytes + metadata, including its handle | no | `--name sym` \| `--handle H` |
 | `check [file]` | parse + form table + nesting warnings | no | file or stdin |
-| `edit <file>` | whole-form / patch / insert / delete, handle-targeted (§5, §10.3) | yes | `--handle H` (append/prepend excepted), `--mode replace\|patch\|insert-after\|insert-before\|append\|prepend\|delete`, `--content` / `--content-file` / stdin, `--old-text`/`--new-text` (patch), `--strict`, `--repair`, `--dry-run` |
+| `edit <file>` | whole-form / patch / insert / delete, handle-targeted (§5, §10.3) | yes | `--handle H` (append/prepend excepted), `--mode replace\|patch\|insert-after\|insert-before\|append\|prepend\|delete`, `--content` / `--content-file` / stdin, `--old-text`/`--new-text` (patch), `--strict`, `--repair`, `--dry-run`, `--format-content` / `--no-format-content` (content reindent, §10.3; default on) |
 | `materialize` | draft→candidate via indent mode (§4.4) | no | `--content` / `--content-file` / stdin; emits candidate + unified diff |
 | `format [file]` | parinfer paren-mode reindent, candidate-first (§10.5) | no | file or stdin |
 
@@ -174,7 +174,13 @@ default only completes missing trailing closers. Refusals: `not-one-form`
 (exit 1 — needs a human eye), `truncated-content` (exit 1, an unterminated
 opening fence), `repair-refused` (exit 3, any repair under `--strict`), and
 `dedent-repair` (exit 3, a mid-file dedent closure — a guessed placement;
-`--repair` opts in, candidate + diff attached). `patch` mode is exact-match:
+`--repair` opts in, candidate + diff attached). Content modes then reindent
+the prepared content in parinfer paren mode (default on; `--no-format-content`
+disables it): the candidate must re-parse and keep the token stream (the
+`format` gates, §10.5), otherwise the prepared content is kept with a note —
+never a failure. The content is then base-shifted to the target's column.
+`patch`'s `--old-text`/`--new-text` and `delete` carry no reformat of any
+kind. `patch` mode is exact-match:
 `--old-text` must occur exactly once inside the target form's bytes,
 `--new-text` may be empty; there is no repair. `patch-not-found` (exit 3)
 returns the form's exact bytes; `patch-ambiguous` (exit 3) names the
@@ -375,17 +381,14 @@ multiple repos; behavior is cwd-agnostic; §14 wrapper entry).
 session.
 
 **Tools** (typebox schemas; edit content is sent via a temp file —
-`--content-file` — never argv, since pi's exec has no stdin channel; the one
-exception is `clj_edit`'s autoFormat step, which pipes the raw content into
-`cljform format`'s stdin via a direct spawn, because pi.exec closes the
-child's stdin):
+`--content-file` — never argv, since pi's exec has no stdin channel):
 
 | Tool | Params | Maps to |
 |------|--------|---------|
 | `clj_forms` | `{path}` | `cljform forms --json`; refreshes the fingerprint cache |
 | `clj_tree` | `{path, depth?, json?}` | `cljform tree` — the primary handle-discovery view (`--depth N\|all`); `json` returns the structured node list |
 | `clj_get` | `{path, name? / handle?}` | `cljform get --json` — exact bytes + the form's `⟦handle⟧` |
-| `clj_edit` | `{path, handle?, mode?, content? / oldText? + newText?, dryRun?, strict?, repair?, autoFormat?}` | `cljform edit --handle …` — mode auto-selects `patch` when `oldText` is present; append/prepend take no handle; `dryRun` ⇒ `--dry-run`, `strict` ⇒ `--strict`, `repair` ⇒ `--repair`; `autoFormat` (default true) reindents `content` by piping it into `cljform format`'s stdin before the edit (candidate-only parinfer paren-mode reindent, §10.5; on format refusal or a missing binary the original content is sent verbatim, the edit never fails for it; a changed content adds the note `reindented content (parinfer paren mode) before editing`); `oldText`/`newText` are exact patch text and are never reformatted |
+| `clj_edit` | `{path, handle?, mode?, content? / oldText? + newText?, dryRun?, strict?, repair?, autoFormat?}` | `cljform edit --handle …` — mode auto-selects `patch` when `oldText` is present; append/prepend take no handle; `dryRun` ⇒ `--dry-run`, `strict` ⇒ `--strict`, `repair` ⇒ `--repair`; `autoFormat` (default true) maps to the in-edit content reindent: `false` passes `--no-format-content`, `true` (the default) passes nothing and lets `cljform edit` reindent the content itself in parinfer paren mode (§10.3/§10.5; a refused reindent is reported by the CLI as a note, the edit never fails for it); the wrapper no longer runs a separate `cljform format` call; `oldText`/`newText` are exact patch text and are never reformatted |
 | `clj_draft` | `{content}` | `cljform materialize --content-file …` — returns candidate + diff; never writes |
 
 **Fingerprint cache:** in-memory `Map<realpath, forms>`. Refreshed on every
@@ -540,6 +543,16 @@ collection delimiter:
   - **I3** form-count window.
 - Unknown or stale handle -> `stale-handle`, exit 3, nothing written, with a
   "re-run `tree`" note.
+- **In-edit reindent (issue 11):** for content modes (replace / insert-
+  before / insert-after / append / prepend — never patch or delete), the
+  prepared content is reindented with the `format` parinfer paren-mode pass
+  (§10.5) **by default**, gated exactly as `format` gates (candidate must
+  re-parse and keep the token stream; on refusal the prepared content is
+  kept and a note added, the edit never fails), and the result is then
+  base-shifted to the target's column. `--no-format-content` disables the
+  reindent (`--format-content` is accepted as explicit opt-in); the wrapper's
+  `autoFormat: false` maps to that flag, and the wrapper no longer runs a
+  separate `cljform format` call.
 
 ### 10.4 Content ingest
 
@@ -560,8 +573,10 @@ unchanged (trimmed) and fail the usual handle checks.
 ### 10.5 format (paren-mode reindent)
 
 Built. `format <file>` (or stdin) reindents the whole file the way
-parinfer's **paren mode** does — the only op that imposes a style; the edit
-path only base-shifts. Adopted rules (reference: the local parinfer-rust
+parinfer's **paren mode** does — the only op that imposes a style on a whole
+file; the edit path reindents its submitted content with the same pass (by
+default; `--no-format-content` disables it, §10.3) and then base-shifts it.
+Adopted rules (reference: the local parinfer-rust
 checkout's `src/parinfer.rs`, not added as a dependency):
 
 - at a line's first code character (not inside a string, comment, regex,

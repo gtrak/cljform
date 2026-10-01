@@ -33,10 +33,10 @@ cljform [--json|--human] <op> …
 | `strip [file]` | Delete every `⟦…⟧` marker span → recovers the exact original bytes (BOM/CRLF preserved). Pure filter on stdout, no envelope; file or stdin |
 | `get <file> [--name sym\|--handle H]` | One form's exact bytes + metadata, including its `⟦handle⟧` (pass it to `edit`). `--name` is a top-level read lookup — names are extracted for var-defining `def…` heads (`defn`, `defapifn`, …; not `defmethod`, which extends an existing multimethod); `--handle` reads any collection node |
 | `check [file]` | Parse + table + nesting warnings (file or stdin) |
-| `edit <file> --handle H [--mode M] [--content C\|--content-file F] [--repair]` | Whole-form edit; modes `replace` (default), `insert-after` / `insert-before` (anchor: `--handle`), `append`, `prepend` (file ends, no target), `delete`. Submitted content is reindented to the target's column. `--repair` allows a guessed mid-file dedent closure |
+| `edit <file> --handle H [--mode M] [--content C\|--content-file F] [--repair] [--no-format-content]` | Whole-form edit; modes `replace` (default), `insert-after` / `insert-before` (anchor: `--handle`), `append`, `prepend` (file ends, no target), `delete`. Submitted content is reindented in parinfer paren mode (default on; `--no-format-content` sends it verbatim, and patch/delete never reformat) and then base-shifted to the target's column. `--repair` allows a guessed mid-file dedent closure |
 | `edit <file> --handle H --mode patch --old-text T [--new-text U]` | Surgical text patch inside one form: `T` must occur exactly once in the form's byte range and never cross its boundary; `U` (default empty) replaces it. Bytes outside the match are untouched; no bracket repair, but I1–I3 still gate the write. A mismatch error returns the form's **exact bytes**, so recovery needs no `clj_get` round-trip |
 | `materialize --content C` | Indent-mode bracket completion → labeled candidate + diff (never writes). Completes missing **closers** implied by indentation; it does not invent missing openers, so a fully bracket-less draft comes back unchanged with a note |
-| `format [file]` | Reformat indentation the way parinfer paren mode does — the **only op that imposes a style** (the edit path only base-shifts). Candidate-first: candidate + unified diff vs the input + note, never writes. The candidate must re-parse clean and keep the input's token stream (only whitespace and closing-delimiter position may move); otherwise `format-error`, exit 1, nothing emitted |
+| `format [file]` | Reformat indentation the way parinfer paren mode does — the only op that imposes a style on a whole file (the edit path reindents its submitted content with the same pass, by default, then base-shifts it). Candidate-first: candidate + unified diff vs the input + note, never writes. The candidate must re-parse clean and keep the input's token stream (only whitespace and closing-delimiter position may move); otherwise `format-error`, exit 1, nothing emitted |
 
 Exit codes: `0` ok · `1` parse/structure failure or `annotate-conflict`
 (nothing written) · `2` usage · `3` targeting failure or refused repair
@@ -87,11 +87,12 @@ Lives in this repo at `extension/clojure-forms.ts` (with the
   `⟦handle⟧` and takes whole-form `content` or a surgical
   `oldText`/`newText` patch (mode auto-selects `patch`), reindenting
   submitted content to the target's column — a four-line change in a 60-line
-  form no longer means re-transcribing 60 lines. By default it also reindents
-  the `content` being submitted in parinfer paren mode (`autoFormat`, via
-  `cljform format` on stdin; the CLI `edit` itself only base-shifts, and
-  `format` remains the explicit whole-file op — unparseable content is sent
-  verbatim with a note, and patch `oldText`/`newText` are never touched). `clj_draft` runs the
+  form no longer means re-transcribing 60 lines. `cljform edit` itself also
+  reindents the `content` being submitted in parinfer paren mode (default on,
+  `--no-format-content` to disable; `autoFormat: false` maps to that flag —
+  the wrapper no longer makes a separate `cljform format` call, and content
+  the reindent refuses is sent verbatim with a note; patch
+  `oldText`/`newText` are never touched). `clj_draft` runs the
   indent-mode completer on an indentation-only draft and returns candidate +
   diff (never writes). Content is passed via temp file; handles survive
   edits elsewhere, so a copied handle keeps working until its own form
