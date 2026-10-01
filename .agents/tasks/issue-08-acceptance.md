@@ -52,3 +52,32 @@ unintended forms untouched. Aggregate a first-try rate.
 The repo gates (`cargo build`/`clippy`/`test`) must still be green before the
 run, and the working tree clean (the acceptance run only touches scratch
 files outside the repo).
+
+## Results (2026-10-01)
+
+Installed binary `~/.cargo/bin/cljform` (v2, at commit 4a4a1b2); extension and
+agent symlinks live. Six fresh `clojure-worker` runs (local/local, thinking
+medium) on disjoint scratch files, graded on the resulting file:
+
+| Task | Adversarial property | Outcome |
+|------|----------------------|---------|
+| T1 | nested multi-line replace by handle | pass, first try (used the decorated `⟦H⟧`) |
+| T2 | duplicate forms (`[1 1]` x4) | pass, first try — picked the 2nd binding vector, left the identical 1st and both deftest vectors |
+| T3 | stale handle | pass — exact `stale-handle`, re-ran `tree`, recovered |
+| T4 | flat (unindented) submission | pass — base-shift preserved relative shape (flat stays flat at the target column) |
+| T5 | three-edit session | pass, first try — insert-after + two replaces, no stale handles |
+| T6 | content copied from the view | pass — no marker glyph leaked; one over-reaching patch (`:a 1` -> `:42`) was caught via the diff and fixed after a fresh `tree` |
+
+First-try: 5/6 (T6 self-corrected; T3's stale attempt was intentional).
+
+- **Tool bug found and fixed:** the decorated `⟦H⟧` token from `tree` was
+  rejected as `stale-handle` even though the wrapper guidance says to copy it.
+  Fixed in `4a4a1b2` (`handle::bare_handle`); re-verified.
+- **Harness quirk (not cljform):** a run whose only writer is `clj_edit` is
+  reported "completed without making edits for an implementation task" (the
+  pi-subagents check counts built-in `edit`/`write` only), i.e. a false
+  failure. It would mislead an orchestrator; worth a harness-side fix.
+- **Design note:** T4 (deliberately flat) stays flat — base-shift preserves
+  the submitted relative shape and does not invent nesting. Not a failure
+  (parseable, correct semantics), but the trigger to consider adding parinfer
+  raise-only min-indent to the edit path if real submissions arrive flat.
