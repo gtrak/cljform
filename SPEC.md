@@ -357,7 +357,7 @@ make-widget (line 28–101) — intended?"` and decides.
   - *Fuzz:* unbalanced/garbage inputs → structured JSON error, exit 1/4,
     never a panic, never a partial write.
   - *Regression (mandatory, named):*
-    `tests/regression_swallowed_deftest.rs`
+    `tests/regression.rs` (`swallowed_deftests_are_detected_with_exact_lines`)
     — feeds a fixture reproducing the F1 shape exactly (an unclosed `defn`
     swallowing the following `deftest`s): must report the reduced top-level
     count **and** fire D1 with the exact line range. This test exists because
@@ -418,7 +418,7 @@ documented in subagent briefs — acceptable, not a blocker.
 `before_agent_start` (only when cwd is inside a git repo containing `.clj`
 files — cheap probe, cached per session): "For Clojure files prefer the
 clj-* tools over raw text edits; after any change, shape reports in tool
-results are binding: lost forms and D1–D4 warnings must be addressed or
+results are binding: lost forms and D1–D3 warnings must be addressed or
 explicitly justified."
 
 ## 9. End-to-end workflow (example)
@@ -544,7 +544,7 @@ Markers are stripped from `--content`, `--old-text`, and `--new-text` before
 use (lossless and deterministic, with a note), so annotated text can be copied
 straight back into an edit without leaking markers into the file.
 
-`--handle` values are normalized the same spirit: surrounding whitespace is
+`--handle` values are normalized in the same spirit: surrounding whitespace is
 trimmed, and a value given as a single `⟦X⟧` span (no marker glyphs inside
 `X`) has its marker glyphs removed so the bare `X` is resolved — this is why
 copying a `⟦handle⟧` straight from the `tree` view and passing it as

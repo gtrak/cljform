@@ -133,6 +133,30 @@ export default function ClojureForms(pi: ExtensionAPI) {
 		if (forms) cache.set(cacheKey(path), { forms, at: Date.now() });
 	}
 
+	/**
+	 * pi.exec wrapper that never rejects: a missing/unspawnable cljform binary
+	 * (ENOENT) or any spawn failure yields execError=true so the caller returns
+	 * a single-line install hint instead of crashing the session. Normal CLI
+	 * JSON-error surfacing is untouched (the envelope still carries ok:false).
+	 */
+	async function execCljform(
+		args: string[],
+		opts: { timeout: number },
+	): Promise<{ stdout: string; stderr: string; execError: boolean }> {
+		try {
+			const result = await pi.exec(resolveBin(), args, opts);
+			return { stdout: result.stdout, stderr: result.stderr, execError: false };
+		} catch (err) {
+			const isENOENT =
+				typeof err === "object" && err !== null && (err as { code?: string }).code === "ENOENT";
+			const bin = resolveBin();
+			const stderr = isENOENT
+				? `${bin} not found — run \`cargo install --path .\` or set CLJFORM_BIN to the cljform binary`
+				: `cljform failed to run: ${err instanceof Error ? err.message : String(err)}`;
+			return { stdout: "", stderr, execError: true };
+		}
+	}
+
 	function shapeSummary(forms: FormRow[]): string {
 		const counts = new Map<string, number>();
 		for (const f of forms) counts.set(f.kind, (counts.get(f.kind) ?? 0) + 1);
@@ -176,16 +200,19 @@ export default function ClojureForms(pi: ExtensionAPI) {
 		promptSnippet: "Inspect Clojure file structure as whole forms.",
 		promptGuidelines: [
 			"Run clj_tree (annotated source with ⟦handles⟧) before editing; it is the primary way to discover edit targets.",
-			"Address WARNING D1/D2/D4 lines: they mean a form is nested inside another defn/let — almost always wrong.",
+			"Address WARNING D1/D2/D3 lines: they mean a form is nested inside another defn/let — almost always wrong.",
 		],
 		parameters: Type.Object({
 			path: Type.String({ description: "Path to the .clj/.cljs/.cljc/.edn file" }),
 		}),
 
 		async execute(_toolCallId, params, _signal, _onUpdate) {
-			const result = await pi.exec(resolveBin(), ["forms", params.path, "--json"], {
+			const result = await execCljform(["forms", params.path, "--json"], {
 				timeout: 15_000,
 			});
+			if (result.execError) {
+				return { content: [{ type: "text", text: result.stderr }], isError: true };
+			}
 			const out = parseEnvelope(result.stdout);
 			if (!out || !out.ok) {
 				const text = out?.error ? errorText(out) : `cljform failed: ${result.stderr || result.stdout}`;
@@ -241,7 +268,10 @@ export default function ClojureForms(pi: ExtensionAPI) {
 			if (params.depth !== undefined) {
 				args.push("--depth", params.depth === "all" ? "all" : String(params.depth));
 			}
-			const result = await pi.exec(resolveBin(), args, { timeout: 15_000 });
+			const result = await execCljform(args, { timeout: 15_000 });
+			if (result.execError) {
+				return { content: [{ type: "text", text: result.stderr }], isError: true };
+			}
 			const out = parseEnvelope(result.stdout);
 			if (!out || !out.ok) {
 				const text = out?.error ? errorText(out) : `cljform failed: ${result.stderr || result.stdout}`;
@@ -295,7 +325,10 @@ export default function ClojureForms(pi: ExtensionAPI) {
 			const args = ["get", params.path, "--json"];
 			if (params.name !== undefined) args.push("--name", params.name);
 			if (params.handle !== undefined) args.push("--handle", params.handle);
-			const result = await pi.exec(resolveBin(), args, { timeout: 15_000 });
+			const result = await execCljform(args, { timeout: 15_000 });
+			if (result.execError) {
+				return { content: [{ type: "text", text: result.stderr }], isError: true };
+			}
 			const out = parseEnvelope(result.stdout);
 			if (!out || !out.ok) {
 				const text = out?.error ? errorText(out) : `cljform failed: ${result.stderr || result.stdout}`;
@@ -346,9 +379,12 @@ export default function ClojureForms(pi: ExtensionAPI) {
 			const tmp = join(tmpdir(), `cljform-draft-${process.pid}-${Date.now()}.clj`);
 			writeFileSync(tmp, params.content);
 			try {
-				const result = await pi.exec(resolveBin(), ["materialize", "--content-file", tmp, "--json"], {
+				const result = await execCljform(["materialize", "--content-file", tmp, "--json"], {
 					timeout: 15_000,
 				});
+				if (result.execError) {
+					return { content: [{ type: "text", text: result.stderr }], isError: true };
+				}
 				const out = parseEnvelope(result.stdout);
 				if (!out || !out.ok) {
 					const text = out?.error ? errorText(out) : `cljform failed: ${result.stderr || result.stdout}`;
@@ -533,7 +569,10 @@ export default function ClojureForms(pi: ExtensionAPI) {
 		args: string[],
 		params: { path: string; mode?: string; dryRun?: boolean },
 	): Promise<{ content: { type: "text"; text: string }[]; isError?: boolean; details?: unknown }> {
-		const result = await pi.exec(resolveBin(), args, { timeout: 20_000 });
+		const result = await execCljform(args, { timeout: 20_000 });
+		if (result.execError) {
+			return { content: [{ type: "text", text: result.stderr }], isError: true };
+		}
 		const out = parseEnvelope(result.stdout);
 		if (!out || !out.ok) {
 			const text = out?.error ? errorText(out) : `cljform failed: ${result.stderr || result.stdout}`;
@@ -577,7 +616,7 @@ export default function ClojureForms(pi: ExtensionAPI) {
 		if (!existsSync(path)) return;
 		const abs = resolve(path);
 
-		const result = await pi.exec(resolveBin(), ["check", abs, "--json"], {
+		const result = await execCljform(["check", abs, "--json"], {
 			timeout: 2_000,
 		});
 		const out = parseEnvelope(result.stdout);
@@ -632,7 +671,7 @@ handle, reindents submitted content to the target, repairs unbalanced content by
 unambiguous, and never writes a file that does not parse. A stale-handle refusal means the form changed —
 re-run clj_tree. clj_draft recovers brackets from an indentation-only draft (candidate + diff, never
 writes). Shape reports in tool results are binding: a "BLOCKING: the file no longer parses" line, lost forms
-in the guard report, or D1–D4 nesting warnings must be fixed or explicitly justified in your next action.
+in the guard report, or D1–D3 nesting warnings must be fixed or explicitly justified in your next action.
 After editing, prefer clj-check semantics already built into clj_edit's output over re-reading the whole file.`,
 		};
 	});

@@ -123,26 +123,27 @@ bait compliance/justification, and `BLOCKING:` recovery — see SPEC.md §14.
 
 ```
 cargo install --path .              # binary → ~/.cargo/bin/cljform
-cargo test                          # cli, golden, repair,
-                                    # adversarial, fuzz, F1 regression
+cargo test                          # cli, forms, repair,
+                                    # robustness, F1 regression
 ```
 
 Dependencies: `tree-sitter` + `tree-sitter-clojure` (pinned via Cargo.lock —
 golden tables are grammar-sensitive), `clap`, `serde`/`serde_json`,
-`blake3`, `tempfile`. No network, no Clojure runtime, nothing is ever
-evaluated.
+`blake3`, `tempfile`, `unicode-width`, `unicode-segmentation` (the last two
+back `format`'s display-width / grapheme handling; accepted in SPEC §11).
+No network, no Clojure runtime, nothing is ever evaluated.
 
 ## Tests worth knowing about
 
-- `tests/regression_swallowed_deftest.rs` — the F1 bug that motivated the
-  tool: a balanced file whose `defn` closer drifted to swallow three
-  `deftest`s. Must report the reduced form count **and** fire D1 with exact
-  line ranges.
-- `tests/adversarial.rs` — deep data, BOM, qualified heads, same-line
-  neighbors, CRLF, unicode, bracket look-alikes, quote/comment/discard
-  burial, reader conditionals, stale-view traps.
-- `tests/fuzz.rs` — 300 deterministic garbage inputs: structured errors,
-  never a panic, never a partial write.
+- `tests/regression.rs` — the F1 bug that motivated the tool: a balanced
+  file whose `defn` closer drifted to swallow three `deftest`s (`
+  swallowed_deftests_are_detected_with_exact_lines`). Must report the
+  reduced form count **and** fire D1 with exact line ranges.
+- `tests/robustness.rs` — adversarial + fuzz material, consolidated: deep
+  data, BOM, qualified heads, same-line neighbors, CRLF, unicode, bracket
+  look-alikes, quote/comment/discard burial, reader conditionals, stale-view
+  traps, plus deterministic garbage inputs: structured errors, never a
+  panic, never a partial write.
 - `tests/repair.rs` — repair is asserted on **nesting**, not just paren
   balance. Indent mode once compared an absolute byte column against a
   per-line indent, closing an inner form a line early (`(let [y 2])` with
