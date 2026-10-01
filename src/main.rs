@@ -48,9 +48,9 @@ enum Mode {
     /// must occur exactly once inside the form's bytes; --new-text replaces
     /// it. Full verification pipeline; no bracket repair (patch is surgical).
     Patch,
-    /// Insert after --after (0 = before first; omit = append).
+    /// Insert after the --handle target node.
     InsertAfter,
-    /// Insert before --before (omit = prepend).
+    /// Insert before the --handle target node.
     InsertBefore,
     /// Insert at end of file.
     Append,
@@ -70,12 +70,13 @@ enum Op {
     /// Print one form (exact bytes + metadata).
     Get {
         file: PathBuf,
-        /// 1-based top-level form index.
-        #[arg(long, conflicts_with = "name")]
-        addr: Option<u32>,
-        /// Def-like name (defn/def/deftest/…).
-        #[arg(long)]
+        /// Def-like name (defn/def/deftest/…). Read lookup, not an edit
+        /// target (SPEC §5); the result carries the form's handle.
+        #[arg(long, conflicts_with = "handle")]
         name: Option<String>,
+        /// `tree` handle of the node to print (SPEC §10.2).
+        #[arg(long)]
+        handle: Option<String>,
     },
     /// Parse + form table + nesting warnings.
     Check {
@@ -87,21 +88,9 @@ enum Op {
     /// untouched form is byte-identical.
     Edit {
         file: PathBuf,
-        /// replace|insert-after|insert-before|append|prepend|delete
+        /// replace|patch|insert-after|insert-before|append|prepend|delete
         #[arg(long, default_value = "replace")]
         mode: Mode,
-        /// 1-based form index (replace/delete) — or --after for insert-after.
-        #[arg(long)]
-        addr: Option<u32>,
-        /// Insert after this form (0 = before first; omit = append).
-        #[arg(long, conflicts_with = "addr")]
-        after: Option<u32>,
-        /// Insert before this form (omit = prepend).
-        #[arg(long)]
-        before: Option<u32>,
-        /// Def-like name to target (replace/delete) or anchor (inserts).
-        #[arg(long)]
-        name: Option<String>,
         /// Replacement/insertion content (else --content-file or stdin).
         /// Not used by patch (use --old-text/--new-text) or delete.
         #[arg(long)]
@@ -116,21 +105,15 @@ enum Op {
         /// Patch mode: replacement text (may be empty to delete).
         #[arg(long)]
         new_text: Option<String>,
-        /// Expected current hash prefix of the target form (advisory unless
-        /// --strict; enables re-aim when a stale view is recoverable).
+        /// The single edit target (SPEC §5): the `tree` handle of the
+        /// collection to replace/patch/delete or to insert next to. append
+        /// and prepend are file-level and take no target.
         #[arg(long)]
-        expect: Option<String>,
-        /// Resolve the target collection node by its `tree` handle instead of
-        /// a top-level form (SPEC §10.3).
-        #[arg(
-            long,
-            conflicts_with_all = ["addr", "name", "after", "before"]
-        )]
         handle: Option<String>,
         /// Validate only; write nothing.
         #[arg(long)]
         dry_run: bool,
-        /// Hard-fail on warnings (detector hits, stale --expect).
+        /// Hard-fail on detector warnings and refuse content repairs.
         #[arg(long)]
         strict: bool,
         /// Allow repair to close an inner form at a mid-file dedent. That
@@ -378,11 +361,15 @@ fn print_human(out: &Output) {
                 _ => String::new(),
             };
             let hash = r.get("hash").and_then(|v| v.as_str()).unwrap_or("");
-            let header = if line_range.is_empty() {
+            let mut header = if line_range.is_empty() {
                 format!("{file} · {label} · {hash}")
             } else {
                 format!("{file} · {label} · {line_range} · {hash}")
             };
+            // The handle is the actionable follow-up (edit --handle H).
+            if let Some(h) = r.get("handle").and_then(|v| v.as_str()) {
+                header.push_str(&format!(" · handle {h}"));
+            }
             println!("{header}");
             if let Some(form) = r.get("form").and_then(|v| v.as_str()) {
                 print!("{form}");
@@ -598,159 +585,136 @@ enum Payload {
     Patch { bytes: Vec<u8>, diff: String, noop: bool },
 }
 
-/// Resolve a target form by addr or name, with did-you-mean on name misses.
-fn resolve_target(
-    forms: &[Form],
-    addr: &Option<u32>,
-    name: &Option<String>,
-) -> Result<Target, Fail> {
-    if let Some(a) = addr {
-        if *a == 0 || *a as usize > forms.len() {
-            return Err(Fail(
-                2,
-                ErrorBody {
-                    code: "usage",
-                    line: None,
-                    col: None,
-                    message: format!("--addr {a} out of range: file has {} forms", forms.len()),
-                    hint: None,
-                    suggestions: None,
-                },
-            ));
-        }
-        return Ok(Target {
-            addr: *a as usize,
-            form: forms[*a as usize - 1].clone(),
-        });
+/// Number of top-level forms a payload contributes (1 for a patch, which
+/// keeps the target form's slot occupied).
+fn content_forms(payload: &Option<Payload>) -> usize {
+    match payload {
+        Some(Payload::Prepared(p)) => p.forms,
+        _ => 1,
     }
-    if let Some(n) = name {
-        let n = n.as_str();
-        let matches: Vec<&Form> = forms
-            .iter()
-            .filter(|f| f.name.as_deref() == Some(n))
-            .collect();
-        return match matches.len() {
-            1 => Ok(Target {
-                addr: matches[0].addr as usize,
-                form: matches[0].clone(),
-            }),
-            0 => {
-                let suggestions = suggestions_for(forms, n);
-                let hint = if suggestions.is_empty() {
-                    "no def-like forms carry names in this file".to_string()
-                } else {
-                    "pick one of the suggestions, or use --addr".to_string()
-                };
-                Err(Fail(
-                    3,
-                    ErrorBody {
-                        code: "form-not-found",
-                        line: None,
-                        col: None,
-                        message: format!("no form defines {n:?}"),
-                        hint: Some(hint),
-                        suggestions: Some(suggestions),
-                    },
-                ))
-            }
-            _ => {
-                let suggestions = matches
-                    .iter()
-                    .map(|f| Suggestion {
-                        addr: f.addr,
-                        kind: f.kind.clone(),
-                        name: f.name.clone(),
-                        line: f.line,
-                    })
-                    .collect();
-                Err(Fail(
-                    3,
-                    ErrorBody {
-                        code: "ambiguous",
-                        line: None,
-                        col: None,
-                        message: format!("{n:?} is defined {} times", matches.len()),
-                        hint: Some("use --addr to pick one".into()),
-                        suggestions: Some(suggestions),
-                    },
-                ))
-            }
-        };
-    }
-    Err(Fail(
-        2,
-        ErrorBody {
-            code: "usage",
-            line: None,
-            col: None,
-            message: "no target given: pass --addr N or --name SYM".into(),
-            hint: None,
-            suggestions: None,
-        },
-    ))
 }
 
-/// --expect handling: advisory by default; re-aims a stale addr when the
-/// expected form is still uniquely findable; --strict makes any mismatch
-/// a hard stop. Returns (matched-prefix-or-none, notes).
-fn check_expect(
-    target: &Target,
-    expect: &Option<String>,
-    forms: &[Form],
-    strict: bool,
-    resolved_by_name: bool,
-) -> (Option<String>, Vec<String>) {
-    let Some(expect) = expect else {
-        return (None, vec![]);
-    };
-    let prefix = match hashutil::parse_hash_prefix(expect) {
-        Ok(p) => p,
-        Err(m) => return (None, vec![format!("ignored --expect: {m}")]),
-    };
-    if hashutil::matches_prefix(&target.form.hash, &prefix) {
-        return (Some(prefix), vec![]);
-    }
-    if strict {
-        return (
-            Some(prefix),
-            vec![format!(
-                "--strict: --expect mismatch (target hash {}…)",
-                &target.form.hash[..12.min(target.form.hash.len())]
-            )],
-        );
-    }
-    if resolved_by_name {
-        // Identity anchored by name; content drift is fine.
-        return (
-            None,
-            vec![format!(
-                "note: {} changed since --expect was captured; applied anyway",
-                target.form.name.clone().unwrap_or_else(|| "form".into())
-            )],
-        );
-    }
-    // Stale addr: try to re-aim by hash.
-    let hits: Vec<&Form> = forms
+/// The `get --name` lookup (SPEC §5): the unique top-level form whose head
+/// defines `name`. Edits target by handle only; this is the read path.
+fn resolve_target(forms: &[Form], name: &str) -> Result<Target, Fail> {
+    let matches: Vec<&Form> = forms
         .iter()
-        .filter(|f| hashutil::matches_prefix(&f.hash, &prefix))
+        .filter(|f| f.name.as_deref() == Some(name))
         .collect();
-    if hits.len() == 1 {
-        let f = hits[0];
-        return (
-            None,
-            vec![format!(
-                "note: --addr was stale; re-aimed to form {} ({}, lines {}–{}) via --expect hash",
-                f.addr, f.kind, f.line[0], f.line[1]
-            )],
-        );
+    match matches.len() {
+        1 => Ok(Target {
+            addr: matches[0].addr as usize,
+            form: matches[0].clone(),
+        }),
+        0 => {
+            let suggestions = suggestions_for(forms, name);
+            let hint = if suggestions.is_empty() {
+                "no def-like forms carry names in this file".to_string()
+            } else {
+                "pick one of the suggestions, or run tree to list handles".to_string()
+            };
+            Err(Fail(
+                3,
+                ErrorBody {
+                    code: "form-not-found",
+                    line: None,
+                    col: None,
+                    message: format!("no form defines {name:?}"),
+                    hint: Some(hint),
+                    suggestions: Some(suggestions),
+                },
+            ))
+        }
+        _ => {
+            let suggestions = matches
+                .iter()
+                .map(|f| Suggestion {
+                    addr: f.addr,
+                    kind: f.kind.clone(),
+                    name: f.name.clone(),
+                    line: f.line,
+                })
+                .collect();
+            Err(Fail(
+                3,
+                ErrorBody {
+                    code: "ambiguous",
+                    line: None,
+                    col: None,
+                    message: format!("{name:?} is defined {} times", matches.len()),
+                    hint: Some("use --handle to pick one (run tree to list handles)".into()),
+                    suggestions: Some(suggestions),
+                },
+            ))
+        }
     }
-    (
-        None,
-        vec![format!(
-            "note: --expect matched {} forms; applied at --addr as given",
-            hits.len()
-        )],
-    )
+}
+
+/// Resolve a `tree` handle to its node (SPEC §10.3): content-addressed, so a
+/// moved form still resolves, but a changed or absent one refuses.
+fn resolve_handle(bytes: &[u8], h: &str, file: &Path) -> Result<handle::Node, Fail> {
+    if h.len() < 6 {
+        return Err(Fail(
+            2,
+            ErrorBody {
+                code: "usage",
+                line: None,
+                col: None,
+                message: format!("--handle must be at least 6 hex characters, got {h:?}"),
+                hint: Some("run tree to list current handles".into()),
+                suggestions: None,
+            },
+        ));
+    }
+    let nodes = handle::collect(bytes);
+    let hits: Vec<&handle::Node> =
+        nodes.iter().filter(|n| n.raw.starts_with(h)).collect();
+    match hits.len() {
+        0 => Err(Fail(
+            3,
+            ErrorBody {
+                code: "stale-handle",
+                line: None,
+                col: None,
+                message: format!(
+                    "handle {h:?} does not match any form in {} — the form it names changed or is gone",
+                    file.display()
+                ),
+                hint: Some("re-run tree to get current handles".into()),
+                suggestions: None,
+            },
+        )),
+        1 => Ok(hits[0].clone()),
+        n => {
+            let paths: Vec<&str> = hits.iter().map(|x| x.path.as_str()).collect();
+            Err(Fail(
+                3,
+                ErrorBody {
+                    code: "ambiguous-handle",
+                    line: None,
+                    col: None,
+                    message: format!(
+                        "handle {h:?} matches {n} forms (paths: {}) — extend the prefix to disambiguate",
+                        paths.join(", ")
+                    ),
+                    hint: Some("re-run tree and copy a longer prefix".into()),
+                    suggestions: None,
+                },
+            ))
+        }
+    }
+}
+
+fn mode_name(m: &Mode) -> &'static str {
+    match m {
+        Mode::Replace => "replace",
+        Mode::Patch => "patch",
+        Mode::InsertAfter => "insert-after",
+        Mode::InsertBefore => "insert-before",
+        Mode::Append => "append",
+        Mode::Prepend => "prepend",
+        Mode::Delete => "delete",
+    }
 }
 
 fn dispatch(cli: &Cli) -> Result<Output, Fail> {
@@ -760,12 +724,61 @@ fn dispatch(cli: &Cli) -> Result<Output, Fail> {
             let parsed = parse_or_fail(&bytes, "file")?;
             Ok(forms_output("forms", file, &bytes, parsed.forms, vec![]))
         }
-        Op::Get { file, addr, name } => {
+        Op::Get { file, name, handle } => {
             let (bytes, _bom) = read_file(file)?;
             let parsed = parse_or_fail(&bytes, "file")?;
-            let target = resolve_target(&parsed.forms, addr, name)?;
+            if let Some(h) = handle {
+                // The read counterpart of the edit resolver (SPEC §5/§10.2):
+                // resolve the node via handle::collect, print its bytes + metadata.
+                let node = resolve_handle(&bytes, h, file)?;
+                let form =
+                    String::from_utf8_lossy(&bytes[node.start_byte..node.end_byte]).to_string();
+                let hash = hashutil::file_hash(&bytes[node.start_byte..node.end_byte]);
+                return Ok(Output {
+                    ok: true,
+                    op: "get",
+                    file: Some(file.display().to_string()),
+                    file_hash: Some(hashutil::tagged(&hashutil::file_hash(&bytes))),
+                    forms: Some(parsed.forms),
+                    result: Some(serde_json::json!({
+                        "path": node.path,
+                        "kind": node.kind,
+                        "head": node.head,
+                        "name": node.name,
+                        "line": node.line,
+                        "depth": node.depth,
+                        "handle": node.handle,
+                        "hash": hashutil::tagged(&hash),
+                        "form": form,
+                    })),
+                    warnings: None,
+                    notes: None,
+                    error: None,
+                });
+            }
+            let Some(n) = name else {
+                return Err(Fail(
+                    2,
+                    ErrorBody {
+                        code: "usage",
+                        line: None,
+                        col: None,
+                        message: "no target given: pass --name SYM or --handle H".into(),
+                        hint: None,
+                        suggestions: None,
+                    },
+                ));
+            };
+            let target = resolve_target(&parsed.forms, n)?;
             let f = &target.form;
             let text = String::from_utf8_lossy(&bytes[f.start_byte..f.end_byte]).to_string();
+            // The read lookup carries the form's handle for use in an edit
+            // (SPEC §5); null for non-collection forms.
+            let nodes = handle::collect(&bytes);
+            let form_handle = nodes
+                .iter()
+                .find(|n| n.path == target.addr.to_string())
+                .map(|n| n.handle.clone());
             Ok(Output {
                 ok: true,
                 op: "get",
@@ -778,6 +791,7 @@ fn dispatch(cli: &Cli) -> Result<Output, Fail> {
                     "name": f.name,
                     "line": f.line,
                     "hash": hashutil::tagged(&f.hash),
+                    "handle": form_handle,
                     "form": text,
                 })),
                 warnings: None,
@@ -891,22 +905,17 @@ fn dispatch(cli: &Cli) -> Result<Output, Fail> {
         Op::Edit {
             file,
             mode,
-            addr,
-            after,
-            before,
-            name,
             content,
             content_file,
             old_text,
             new_text,
-            expect,
             handle,
             dry_run,
             strict,
             repair,
         } => run_edit(
-            file, *mode, *addr, *after, *before, name, content, content_file, old_text, new_text,
-            expect, handle, *dry_run, *strict, *repair,
+            file, *mode, content, content_file, old_text, new_text, handle, *dry_run, *strict,
+            *repair,
         ),
         Op::Tree { file, depth, full } => {
             let (bytes, had_bom) = read_file(file)?;
@@ -1058,15 +1067,10 @@ fn prepare_fail(p: content::PrepareError) -> Fail {
 fn run_edit(
     file: &Path,
     mode: Mode,
-    addr: Option<u32>,
-    after: Option<u32>,
-    before: Option<u32>,
-    name: &Option<String>,
     content: &Option<String>,
     content_file: &Option<PathBuf>,
     old_text: &Option<String>,
     new_text: &Option<String>,
-    expect: &Option<String>,
     handle_opt: &Option<String>,
     dry_run: bool,
     strict: bool,
@@ -1076,23 +1080,10 @@ fn run_edit(
     let parsed = parse_or_fail(&bytes, "file")?;
     let before_forms = parsed.forms.clone();
 
-    // --handle path (SPEC §10.3): resolve the target collection node and
-    // splice its exact byte range; the top-level --addr/--name machinery
-    // below is bypassed (issue 04 removes it).
+    // Target (SPEC §5/§10.3): --handle for replace/patch/delete/
+    // insert-before/insert-after; append and prepend are file-level and take
+    // no target.
     let handle_node: Option<handle::Node> = match handle_opt {
-        Some(h) if h.len() < 6 => {
-            return Err(Fail(
-                2,
-                ErrorBody {
-                    code: "usage",
-                    line: None,
-                    col: None,
-                    message: format!("--handle must be at least 6 hex characters, got {h:?}"),
-                    hint: Some("run tree to list current handles".into()),
-                    suggestions: None,
-                },
-            ))
-        }
         Some(h) if matches!(mode, Mode::Append | Mode::Prepend) => {
             return Err(Fail(
                 2,
@@ -1106,142 +1097,29 @@ fn run_edit(
                 },
             ))
         }
-        Some(h) => {
-            let nodes = handle::collect(&bytes);
-            let hits: Vec<&handle::Node> =
-                nodes.iter().filter(|n| n.raw.starts_with(h.as_str())).collect();
-            match hits.len() {
-                0 => {
-                    return Err(Fail(
-                        3,
-                        ErrorBody {
-                            code: "stale-handle",
-                            line: None,
-                            col: None,
-                            message: format!(
-                                "handle {h:?} does not match any form in {} — the form it names changed or is gone",
-                                file.display()
-                            ),
-                            hint: Some("re-run tree to get current handles".into()),
-                            suggestions: None,
-                        },
-                    ));
-                }
-                1 => Some(hits[0].clone()),
-                n => {
-                    let paths: Vec<&str> = hits.iter().map(|x| x.path.as_str()).collect();
-                    return Err(Fail(
-                        3,
-                        ErrorBody {
-                            code: "ambiguous-handle",
-                            line: None,
-                            col: None,
-                            message: format!(
-                                "handle {h:?} matches {n} forms (paths: {}) — extend the prefix to disambiguate",
-                                paths.join(", ")
-                            ),
-                            hint: Some("re-run tree and copy a longer prefix".into()),
-                            suggestions: None,
-                        },
-                    ));
-                }
-            }
+        Some(h) => Some(resolve_handle(&bytes, h, file)?),
+        None if matches!(mode, Mode::Append | Mode::Prepend) => None,
+        None => {
+            return Err(Fail(
+                2,
+                ErrorBody {
+                    code: "usage",
+                    line: None,
+                    col: None,
+                    message: format!(
+                        "--mode {} targets a form and needs --handle H (run tree to list current handles)",
+                        mode_name(&mode)
+                    ),
+                    hint: Some("append and prepend are the only target-less modes".into()),
+                    suggestions: None,
+                },
+            ))
         }
-        None => None,
-    };
-
-    // Resolve target per mode. The --handle path targets the containing
-    // top-level form (for --expect and the I2 window); the splice itself
-    // uses the node's byte range.
-    let resolved_by_name = name.is_some();
-    let target = if let Some(node) = handle_node.as_ref() {
-        let top_level = node
-            .path
-            .split('.')
-            .next()
-            .and_then(|s| s.parse().ok())
-            .expect("handle node path indexes a top-level form");
-        debug_assert!(
-            (1..=before_forms.len()).contains(&top_level),
-            "handle path must index a top-level form"
-        );
-        Target {
-            addr: top_level,
-            form: before_forms[top_level - 1].clone(),
-        }
-    } else {
-        match mode {
-        Mode::Replace | Mode::Patch | Mode::Delete => resolve_target(&before_forms, &addr, name)?,
-        Mode::InsertAfter | Mode::InsertBefore | Mode::Append | Mode::Prepend => {
-            // Anchor: explicit index, name, or file edges.
-            match (after, before, name) {
-                (Some(n), _, _) if mode == Mode::InsertAfter => {
-                    if n as usize > before_forms.len() {
-                        return Err(Fail(
-                            2,
-                            ErrorBody {
-                                code: "usage",
-                                line: None,
-                                col: None,
-                                message: format!(
-                                    "--after {n} out of range: file has {} forms",
-                                    before_forms.len()
-                                ),
-                                hint: None,
-                                suggestions: None,
-                            },
-                        ));
-                    }
-                    // 0 = before the first form; else anchor at form n.
-                    if n == 0 {
-                        Target { addr: 0, form: placeholder_form(&before_forms) }
-                    } else {
-                        Target {
-                            addr: n as usize,
-                            form: before_forms[n as usize - 1].clone(),
-                        }
-                    }
-                }
-                (_, Some(n), _) if mode == Mode::InsertBefore => {
-                    if n == 0 || n as usize > before_forms.len() {
-                        return Err(Fail(
-                            2,
-                            ErrorBody {
-                                code: "usage",
-                                line: None,
-                                col: None,
-                                message: format!(
-                                    "--before {n} out of range: file has {} forms",
-                                    before_forms.len()
-                                ),
-                                hint: None,
-                                suggestions: None,
-                            },
-                        ));
-                    }
-                    Target {
-                        addr: n as usize,
-                        form: before_forms[n as usize - 1].clone(),
-                    }
-                }
-                (_, _, Some(n)) => resolve_target(&before_forms, &None, &Some(n.clone()))?,
-                _ => {
-                    // No anchor: insert-after/append → end; before/prepend → front.
-                    let default_addr = match mode {
-                        Mode::InsertAfter | Mode::Append => before_forms.len(),
-                        _ => 0,
-                    };
-                    Target { addr: default_addr, form: placeholder_form(&before_forms) }
-                }
-            }
-        }
-    }
     };
 
     // Payload: whole-form content (normalized/repaired) or a surgical patch
-    // scoped to the target form's bytes (no repair — patch is exact).
-    // Notes accumulate here (marker-strip / reindent) and gain the --expect
-    // notes after the payload is built.
+    // scoped to the target node's bytes (no repair — patch is exact).
+    // Notes accumulate here (marker-strip / reindent).
     let mut notes: Vec<String> = Vec::new();
     let payload: Option<Payload> = match mode {
         Mode::Delete => None,
@@ -1267,30 +1145,16 @@ fn run_edit(
                     "stripped \u{27E6}…\u{27E7} view markers from the submitted text".to_string(),
                 );
             }
-            // Scope: the whole top-level form on the --addr/--name path, the
-            // target node's exact bytes on the --handle path.
-            let scoped = match handle_node.as_ref() {
-                Some(node) => &bytes[node.start_byte..node.end_byte],
-                None => &bytes[target.form.start_byte..target.form.end_byte],
-            };
-            let (line_range, scope_label, scope_bytes) = match handle_node.as_ref() {
-                Some(node) => (
-                    node.line,
-                    node.kind.clone(),
-                    String::from_utf8_lossy(scoped).to_string(),
-                ),
-                None => {
-                    let form_label = match &target.form.name {
-                        Some(n) => format!("{} {n}", target.form.kind),
-                        None => target.form.kind.clone(),
-                    };
-                    (
-                        target.form.line,
-                        form_label,
-                        String::from_utf8_lossy(scoped).to_string(),
-                    )
-                }
-            };
+            // Patch is handle-only: the usage check above guarantees a node.
+            let node = handle_node
+                .as_ref()
+                .expect("patch requires --handle (validated above)");
+            let scoped = &bytes[node.start_byte..node.end_byte];
+            let (line_range, scope_label, scope_bytes) = (
+                node.line,
+                node.kind.clone(),
+                String::from_utf8_lossy(scoped).to_string(),
+            );
             let needle = old.as_bytes();
             let hits = find_all(scoped, needle);
             match hits.len() {
@@ -1362,13 +1226,20 @@ fn run_edit(
                     "stripped \u{27E6}…\u{27E7} view markers from the submitted text".to_string(),
                 );
             }
-            // Base-shift reindent for the --handle path: dedent the content
-            // by its common leading whitespace and land every line after
-            // line 0 at the splice column. It runs before prepare, which
+            // Base-shift reindent for the --handle path. Replace/patch and
+            // inline inserts splice mid-line, so line 0 lands bare at the
+            // splice point (reindent_to_column: continuation reindent). When
+            // the splice itself introduces a line break — a nested
+            // insert-after, or a nested insert-before whose anchor starts
+            // its line — the final lines must carry the target column end
+            // to end (reindent_block). The dedent runs before prepare, which
             // trims blank edges and would mask the caller's indentation;
-            // a top-level target (column 0) is a no-op, so v1 behavior is
-            // unchanged there.
-            let (reind_text, reind_changed) = match handle_node.as_ref() {
+            // that trim also swallows line 0's pad and the newline, so the
+            // post-prepare `block_col` step restores them. A top-level
+            // target takes the seam, so v1 behavior is unchanged there.
+            // `block_col` carries the target column when a line break is
+            // introduced.
+            let (reind_text, reind_changed, block_col) = match handle_node.as_ref() {
                 Some(node) => {
                     let start = node.start_byte;
                     let line_start = bytes[..start]
@@ -1376,32 +1247,83 @@ fn run_edit(
                         .rposition(|&b| b == b'\n')
                         .map_or(0, |p| p + 1);
                     let target_col = start - line_start;
-                    if target_col > 0 || matches!(mode, Mode::InsertAfter) {
-                        let (reind, changed) = reindent_to_column(&stripped, target_col);
-                        (reind, changed)
-                    } else {
-                        (stripped.clone(), false)
+                    let nested = node.path.contains('.');
+                    let anchor_starts_line = bytes[line_start..start]
+                        .iter()
+                        .all(|&b| b == b' ' || b == b'\t');
+                    match mode {
+                        // Nested insert-after: block reindent (dedent +
+                        // target column on every line). Line 0's pad and
+                        // the leading newline are (re-)applied below
+                        // prepare: the blank-edge trim swallows both.
+                        Mode::InsertAfter if nested => {
+                            let (reind, changed) = reindent_block(&stripped, target_col);
+                            (reind, changed, Some(target_col))
+                        }
+                        // Nested insert-before whose anchor starts its line:
+                        // same block reindent; line 0 rides on the anchor's
+                        // existing line prefix, and the trailing newline +
+                        // pad are appended below prepare.
+                        Mode::InsertBefore if nested && anchor_starts_line => {
+                            let (reind, changed) = reindent_block(&stripped, target_col);
+                            (reind, changed, Some(target_col))
+                        }
+                        _ => {
+                            if target_col > 0 || matches!(mode, Mode::InsertAfter) {
+                                let (reind, changed) = reindent_to_column(&stripped, target_col);
+                                (reind, changed, None)
+                            } else {
+                                (stripped.clone(), false, None)
+                            }
+                        }
                     }
                 }
-                None => (stripped.clone(), false),
+                None => (stripped.clone(), false, None),
             };
             let mut prepared =
                 content::prepare(&reind_text, false, strict, repair).map_err(prepare_fail)?;
-            // The insert-after leading newline is appended after prepare:
-            // prepare's blank-edge trim would swallow it, and it is what
-            // lands the new form as a sibling on its own line.
-            let mut leading_newline_added = false;
-            if handle_node.is_some()
-                && matches!(mode, Mode::InsertAfter)
-                && prepared.bytes.first() != Some(&b'\n')
-            {
-                let mut b = Vec::with_capacity(prepared.bytes.len() + 1);
-                b.push(b'\n');
-                b.append(&mut prepared.bytes);
+            // The nested insert-after leading newline is appended after
+            // prepare: prepare's blank-edge trim would swallow it, and it is
+            // what lands the new form as a sibling on its own line at the
+            // target column. Top-level inserts take the seam (insert_at),
+            // which owns the line structure and blank-line separation.
+            let mut line_structure_added = false;
+            if let Some(target_col) = block_col {
+                // The splice introduces a line break, so the final lines
+                // carry the target column end to end (the block result of
+                // reindent_block). prepare's blank-edge trim swallowed the
+                // newline and line 0's pad, and for insert-after the pad
+                // must be restored here. For insert-before the anchor's own
+                // line prefix (spaces only, by construction) already lands
+                // line 0 at the target column, so only the trailing newline
+                // + pad is appended — it moves the anchor onto its own
+                // line. Top-level inserts take the seam (insert_at), which
+                // owns the line structure and blank-line separation.
+                let pad = " ".repeat(target_col);
+                let mut b = Vec::with_capacity(prepared.bytes.len() + 1 + 2 * pad.len());
+                match mode {
+                    // The new form lands on its own line at the target
+                    // column; the following closers stay put (no trailing
+                    // newline).
+                    Mode::InsertAfter => {
+                        b.push(b'\n');
+                        b.extend(pad.bytes());
+                        b.append(&mut prepared.bytes);
+                    }
+                    // The new form takes the line above the anchor (line 0
+                    // rides on the anchor's existing line prefix), which
+                    // drops to its own line at the target column.
+                    Mode::InsertBefore => {
+                        b.append(&mut prepared.bytes);
+                        b.push(b'\n');
+                        b.extend(pad.bytes());
+                    }
+                    _ => unreachable!("block_col is set only for nested inserts"),
+                }
                 prepared.bytes = b;
-                leading_newline_added = true;
+                line_structure_added = true;
             }
-            if reind_changed || leading_newline_added {
+            if reind_changed || line_structure_added {
                 notes.push(
                     "reindented submitted content to the target column".to_string(),
                 );
@@ -1410,65 +1332,112 @@ fn run_edit(
         }
     };
 
-    // --expect guard (advisory by default).
-    let (_expect_prefix, expect_notes) =
-        check_expect(&target, expect, &before_forms, strict, resolved_by_name);
-    notes.extend(expect_notes);
-    if strict {
-        if let Some(e) = expect {
-            if hashutil::parse_hash_prefix(e).is_ok()
-                && !hashutil::matches_prefix(&target.form.hash, &{
-                    hashutil::parse_hash_prefix(e).unwrap_or_default()
-                })
-            {
-                return Err(Fail(
-                    3,
-                    ErrorBody {
-                        code: "stale-form",
-                        line: Some(target.form.line[0]),
-                        col: None,
-                        message: format!(
-                            "--strict: --expect mismatch: form {} ({}) hash is {}…",
-                            target.form.addr,
-                            target.form.kind,
-                            &target.form.hash[..12]
-                        ),
-                        hint: Some("re-list forms and retry, or drop --expect/--strict".into()),
-                        suggestions: None,
-                    },
-                ));
-            }
-        }
-    }
-
-    // Build splice + allowed-change window.
-    let (sp, allowed) = if let Some(node) = handle_node.as_ref() {
-        // Nested edits never change the top-level form count, so every mode
-        // gets the same I2 window: the containing top-level form may change.
+    // Build splice + allowed-change window + actual splice window (lo, hi):
+    // the node range for replace/patch/delete, and the insert position for
+    // inserts. For a top-level insert-after the position can sit past
+    // node.end_byte (a same-line trailing comment stays with the anchor).
+    let (sp, allowed, bound) = if let Some(node) = handle_node.as_ref() {
         let top_level = node.path.split('.').next().unwrap().parse::<usize>().unwrap();
+        // The I3 window depends on depth. Nested edits never change the
+        // top-level form count: the containing form may change and nothing
+        // else. Top-level edits DO move the count: a replace spans the N
+        // content forms, an insert adds N siblings, a delete drops one.
+        let window = if node.depth > 1 {
+            invariants::Allowed::Replace { addr: top_level, n: 1 }
+        } else {
+            match mode {
+                Mode::Delete => invariants::Allowed::Delete { addr: top_level },
+                Mode::Patch => invariants::Allowed::Replace { addr: top_level, n: 1 },
+                Mode::InsertAfter => {
+                    let n = content_forms(&payload);
+                    invariants::Allowed::Insert { at: top_level + 1, n }
+                }
+                Mode::InsertBefore => {
+                    let n = content_forms(&payload);
+                    invariants::Allowed::Insert { at: top_level, n }
+                }
+                _ => {
+                    // Replace: the N content forms take the target's slot.
+                    invariants::Allowed::Replace { addr: top_level, n: content_forms(&payload) }
+                }
+            }
+        };
         let (start, end) = (node.start_byte, node.end_byte);
-        let sp = match mode {
-            Mode::Replace | Mode::InsertBefore | Mode::InsertAfter => {
+        let (sp, bound): (splice::Splice, (usize, usize)) = match mode {
+            Mode::Replace => {
                 let Payload::Prepared(ref p) = payload.as_ref().unwrap() else {
                     unreachable!("whole-form modes carry prepared content")
                 };
-                let content = p.bytes.clone();
-                match mode {
-                    Mode::Replace => splice::Splice::Range {
+                (
+                    splice::Splice::Range {
                         start,
                         end,
-                        content,
+                        content: p.bytes.clone(),
                     },
-                    Mode::InsertBefore => splice::Splice::Range {
-                        start,
-                        end: start,
-                        content,
-                    },
-                    _ => splice::Splice::Range {
-                        start: end,
-                        end,
-                        content,
-                    },
+                    (start, end),
+                )
+            }
+            Mode::InsertBefore => {
+                let Payload::Prepared(ref p) = payload.as_ref().unwrap() else {
+                    unreachable!("whole-form modes carry prepared content")
+                };
+                if node.depth > 1 {
+                    // Nested: byte-exact insert at the node's start. When
+                    // the anchor starts its line the content already ends
+                    // in the newline + target-column pad that drops the
+                    // anchor onto its own line; otherwise it is a plain
+                    // inline (continuation) insert.
+                    (
+                        splice::Splice::Range {
+                            start,
+                            end: start,
+                            content: p.bytes.clone(),
+                        },
+                        (start, start),
+                    )
+                } else {
+                    // Top-level: the node is the whole form, so take the
+                    // seam (blank-line separation) at the form's start.
+                    let pos =
+                        splice::insert_before_pos(&bytes, &before_forms, top_level);
+                    (
+                        splice::Splice::InsertBefore {
+                            before: top_level,
+                            content: p.bytes.clone(),
+                        },
+                        (pos, pos),
+                    )
+                }
+            }
+            Mode::InsertAfter => {
+                let Payload::Prepared(ref p) = payload.as_ref().unwrap() else {
+                    unreachable!("whole-form modes carry prepared content")
+                };
+                if node.depth > 1 {
+                    // Nested: byte-exact insert at the node's end (the
+                    // leading newline + column pad in the content land the
+                    // new form on its own line at the target column).
+                    (
+                        splice::Splice::Range {
+                            start: end,
+                            end,
+                            content: p.bytes.clone(),
+                        },
+                        (end, end),
+                    )
+                } else {
+                    // Top-level: the seam lands after the anchor's whole
+                    // line (a same-line trailing comment stays with the
+                    // anchor) with blank-line separation.
+                    let pos =
+                        splice::insert_after_pos(&bytes, &before_forms, top_level);
+                    (
+                        splice::Splice::Insert {
+                            after: top_level,
+                            content: p.bytes.clone(),
+                        },
+                        (pos, pos),
+                    )
                 }
             }
             Mode::Patch => {
@@ -1477,102 +1446,70 @@ fn run_edit(
                 else {
                     unreachable!("patch carries patched node bytes")
                 };
+                (
+                    splice::Splice::Range {
+                        start,
+                        end,
+                        content: content.clone(),
+                    },
+                    (start, end),
+                )
+            }
+            Mode::Delete => (
                 splice::Splice::Range {
                     start,
                     end,
-                    content: content.clone(),
-                }
-            }
-            Mode::Delete => splice::Splice::Range {
-                start,
-                end,
-                content: Vec::new(),
-            },
+                    content: Vec::new(),
+                },
+                (start, end),
+            ),
             Mode::Append | Mode::Prepend => {
                 unreachable!("append/prepend are refused for --handle")
             }
         };
-        (sp, invariants::Allowed::Replace { addr: top_level, n: 1 })
+        (sp, window, bound)
     } else {
+        // append/prepend: file-edge inserts with the seam logic (blank-line
+        // separation, trailing newline at EOF).
+        let Some(Payload::Prepared(p)) = payload.as_ref() else {
+            unreachable!("append/prepend carry prepared content")
+        };
         match mode {
-        Mode::Replace => {
-            let Some(Payload::Prepared(p)) = payload.as_ref() else {
-                unreachable!("replace carries prepared content")
-            };
-            (
-                splice::Splice::Edit {
-                    addr: target.addr,
+            Mode::Append => (
+                splice::Splice::Insert {
+                    after: before_forms.len(),
                     content: p.bytes.clone(),
                 },
-                invariants::Allowed::Replace {
-                    addr: target.addr,
+                invariants::Allowed::Insert {
+                    at: before_forms.len() + 1,
                     n: p.forms,
                 },
-            )
-        }
-        Mode::Patch => {
-            let Some(Payload::Patch { bytes: content, .. }) = payload.as_ref() else {
-                unreachable!("patch carries patched form bytes")
-            };
-            (
-                splice::Splice::Edit {
-                    addr: target.addr,
-                    content: content.clone(),
-                },
-                invariants::Allowed::Replace {
-                    addr: target.addr,
-                    n: 1,
-                },
-            )
-        }
-        Mode::Delete => (
-            splice::Splice::Delete { addr: target.addr },
-            invariants::Allowed::Delete { addr: target.addr },
-        ),
-        Mode::InsertAfter | Mode::Append => {
-            let Some(Payload::Prepared(p)) = payload.as_ref() else {
-                unreachable!("insert carries prepared content")
-            };
-            // target.addr == 0 → before first (at=1); == len → end (at=len+1).
-            let at = if target.addr >= before_forms.len() {
-                before_forms.len() + 1
-            } else {
-                target.addr + 1
-            };
-            (
-                splice::Splice::Insert {
-                    after: target.addr,
-                    content: p.bytes.clone(),
-                },
-                invariants::Allowed::Insert { at, n: p.forms },
-            )
-        }
-        Mode::InsertBefore | Mode::Prepend => {
-            let Some(Payload::Prepared(p)) = payload.as_ref() else {
-                unreachable!("insert carries prepared content")
-            };
-            // target.addr == 0 → before first (at=1); else before form k (at=k).
-            let at = if target.addr == 0 { 1 } else { target.addr };
-            (
+                (0, 0),
+            ),
+            Mode::Prepend => (
                 splice::Splice::InsertBefore {
-                    before: target.addr,
+                    before: 0,
                     content: p.bytes.clone(),
                 },
-                invariants::Allowed::Insert { at, n: p.forms },
-            )
+                invariants::Allowed::Insert { at: 1, n: p.forms },
+                (0, 0),
+            ),
+            _ => unreachable!("target-less edit is append/prepend only"),
         }
-    }
     };
 
     let new_bytes = splice::apply(&bytes, &before_forms, &sp);
 
-    // §10.3 boundary check (I2 extension): the splice may only touch
-    // [start, end). True by construction; this is the explicit proof.
-    if let Some(node) = handle_node.as_ref() {
-        let (start, end) = (node.start_byte, node.end_byte);
-        let content_len = new_bytes.len() - start - (bytes.len() - end);
-        if new_bytes[..start] != bytes[..start]
-            || new_bytes[start + content_len..] != bytes[end..]
+    // §10.3 boundary check (I2 extension): the splice may only touch its
+    // actual window — [start, end) for replace/patch/delete, and the insert
+    // position for inserts (which for a top-level insert-after can be past
+    // node.end_byte, past a same-line comment). True by construction; this
+    // is the explicit proof.
+    if handle_node.is_some() {
+        let (lo, hi) = bound;
+        let content_len = new_bytes.len() - lo - (bytes.len() - hi);
+        if new_bytes[..lo] != bytes[..lo]
+            || new_bytes[lo + content_len..] != bytes[hi..]
         {
             return Err(Fail(
                 1,
@@ -1650,12 +1587,9 @@ fn run_edit(
 
     // Summary of what sits at the target after the op.
     let (summary, summary_notes) = if let Some(node) = handle_node.as_ref() {
-        build_handle_summary(mode, node, &bytes, &new_bytes, &payload)
+        build_handle_summary(mode, node, &bytes, &new_bytes, &payload, bound)
     } else {
-        (
-            handle_target_summary(&mode, &after_parsed, &target, &allowed, &payload),
-            Vec::new(),
-        )
+        (append_prepend_summary(&after_parsed, &allowed), Vec::new())
     };
     notes.extend(summary_notes);
 
@@ -1726,14 +1660,35 @@ fn strip_view_markers(text: &str) -> (String, bool) {
     (stripped, changed)
 }
 
-/// Base-shift reindent for the `--handle` path: the caller sends an isolated
-/// form (any indentation); land it at the splice column. Dedent the content
-/// by its common leading whitespace across non-blank lines, emit line 0
-/// with no leading whitespace (it lands at the splice point, after the
-/// existing line prefix) and prefix every later line with `target_col`
-/// spaces. Whitespace-only and deterministic; both a caller-indented and a
-/// flat block normalize to the same result.
+/// Base-shift reindent for the `--handle` replace/patch/inline-insert
+/// path: the caller sends an isolated form (any indentation); land it at
+/// the splice column. Dedent the content by its common leading whitespace
+/// across non-blank lines, emit line 0 with no leading whitespace (it
+/// lands at the splice point, after the existing line prefix) and prefix
+/// every later line with `target_col` spaces. Whitespace-only and
+/// deterministic; both a caller-indented and a flat block normalize to the
+/// same result.
 fn reindent_to_column(content: &str, target_col: usize) -> (String, bool) {
+    reindent_with(content, target_col, false)
+}
+
+/// Block reindent for `--handle` inserts whose splice introduces a line
+/// break (nested insert-after; nested insert-before whose anchor starts
+/// its line): the form lands on its own line(s), so line 0 no longer rides
+/// on the existing line prefix and EVERY line — line 0 included — is
+/// prefixed with `target_col` spaces after the same common-whitespace
+/// dedent as `reindent_to_column`, whose line-0 continuation is only right
+/// while no line break is inserted.
+/// NOTE: on the `--handle` path this runs BEFORE `content::prepare`, whose
+/// blank-edge trim removes line 0's pad; the payload builder re-applies the
+/// line-0 pad + newline after prepare for insert-after (insert-before
+/// instead rides line 0 on the anchor's existing line prefix and appends
+/// only the trailing newline + pad), so the final lines equal this result.
+fn reindent_block(content: &str, target_col: usize) -> (String, bool) {
+    reindent_with(content, target_col, true)
+}
+
+fn reindent_with(content: &str, target_col: usize, prefix_first_line: bool) -> (String, bool) {
     let mut lines: Vec<&str> = content.split('\n').collect();
     // A trailing newline does not create a phantom final line.
     let trailing_nl = lines.last().copied().unwrap_or("").is_empty();
@@ -1763,7 +1718,7 @@ fn reindent_to_column(content: &str, target_col: usize) -> (String, bool) {
         let mut out_lines = Vec::with_capacity(lines.len());
         for (i, l) in lines.iter().enumerate() {
             let body = if l.len() >= common.len() { &l[common.len()..] } else { l };
-            out_lines.push(if i == 0 {
+            out_lines.push(if i == 0 && !prefix_first_line {
                 body.to_string()
             } else {
                 format!("{prefix}{body}")
@@ -1783,76 +1738,29 @@ fn is_blank_line(l: &str) -> bool {
     l.bytes().all(|b| b == b' ' || b == b'\t' || b == b'\r')
 }
 
-/// Summary of the top-level (addr/name) path: what sits at the target after
-/// the op.
-fn handle_target_summary(
-    mode: &Mode,
+/// Summary of the file-edge insert (append/prepend, the only target-less
+/// edit modes): what now sits at the edge.
+fn append_prepend_summary(
     after_parsed: &parser::Parsed,
-    target: &Target,
     allowed: &invariants::Allowed,
-    payload: &Option<Payload>,
 ) -> serde_json::Value {
-    match mode {
-        Mode::Replace => {
-            let f = &after_parsed.forms[target.addr - 1];
-            let content_forms = match payload {
-                Some(Payload::Prepared(p)) => p.forms,
-                _ => unreachable!("replace carries prepared content"),
-            };
+    let (at, n) = match allowed {
+        invariants::Allowed::Insert { at, n } => (*at, *n),
+        _ => unreachable!("append/prepend carry the Insert window"),
+    };
+    let inserted: Vec<serde_json::Value> = after_parsed.forms[at - 1..at - 1 + n]
+        .iter()
+        .map(|f| {
             serde_json::json!({
-                "action": "replaced",
-                "addr": target.addr,
-                "kind": f.kind,
-                "name": f.name,
-                "line": f.line,
-                "hash": hashutil::tagged(&f.hash),
-                "wasKind": target.form.kind,
-                "wasName": target.form.name,
-                "wasLine": target.form.line,
-                "hashBefore": hashutil::tagged(&target.form.hash),
-                "contentForms": content_forms,
+                "addr": f.addr, "kind": f.kind, "name": f.name, "line": f.line,
             })
-        }
-        Mode::Patch => {
-            let f = &after_parsed.forms[target.addr - 1];
-            serde_json::json!({
-                "action": "patched",
-                "addr": target.addr,
-                "kind": f.kind,
-                "name": f.name,
-                "line": f.line,
-                "hash": hashutil::tagged(&f.hash),
-                "hashBefore": hashutil::tagged(&target.form.hash),
-            })
-        }
-        Mode::Delete => serde_json::json!({
-            "action": "deleted",
-            "addr": target.addr,
-            "kind": target.form.kind,
-            "name": target.form.name,
-            "lineBefore": target.form.line,
-            "hashBefore": hashutil::tagged(&target.form.hash),
-        }),
-        _ => {
-            let (at, n) = match allowed {
-                invariants::Allowed::Insert { at, n } => (*at, *n),
-                _ => unreachable!(),
-            };
-            let inserted: Vec<serde_json::Value> = after_parsed.forms[at - 1..at - 1 + n]
-                .iter()
-                .map(|f| {
-                    serde_json::json!({
-                        "addr": f.addr, "kind": f.kind, "name": f.name, "line": f.line,
-                    })
-                })
-                .collect();
-            serde_json::json!({
-                "action": "inserted",
-                "at": at,
-                "forms": inserted,
-            })
-        }
-    }
+        })
+        .collect();
+    serde_json::json!({
+        "action": "inserted",
+        "at": at,
+        "forms": inserted,
+    })
 }
 
 /// Summary of the `--handle` path: where the node sits in the new file and
@@ -1865,6 +1773,7 @@ fn build_handle_summary(
     bytes: &[u8],
     new_bytes: &[u8],
     payload: &Option<Payload>,
+    bound: (usize, usize),
 ) -> (serde_json::Value, Vec<String>) {
     let mut notes: Vec<String> = Vec::new();
     let new_nodes = handle::collect(new_bytes);
@@ -1909,15 +1818,13 @@ fn build_handle_summary(
             notes,
         ),
         Mode::InsertBefore | Mode::InsertAfter => {
-            // The inserted span in the new file: the node's start (insert
-            // before) or end (insert after) — the splice is pure, so the
-            // anchor is the same offset in both files.
-            let anchor = if mode == Mode::InsertBefore {
-                node.start_byte
-            } else {
-                node.end_byte
-            };
-            let content_len = new_bytes.len() - anchor - (bytes.len() - anchor);
+            // The inserted span in the new file: for an insert the bound
+            // window is (pos, pos) at the actual insert position — which
+            // for a top-level insert-after can sit past node.end_byte — and
+            // the splice is pure, so the position is the same offset in
+            // both files.
+            let anchor = bound.0;
+            let content_len = new_bytes.len() - anchor - (bytes.len() - bound.1);
             let handles: Vec<String> = new_nodes
                 .iter()
                 .filter(|n| n.start_byte >= anchor && n.start_byte < anchor + content_len)
@@ -1963,19 +1870,6 @@ fn find_all(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
         }
     }
     out
-}
-
-fn placeholder_form(forms: &[Form]) -> Form {
-    forms.first().cloned().unwrap_or(Form {
-        addr: 0,
-        kind: String::new(),
-        name: None,
-        line: [0, 0],
-        hash: String::new(),
-        contains: Default::default(),
-        start_byte: 0,
-        end_byte: 0,
-    })
 }
 
 fn human_summary(summary: &serde_json::Value, shape: &invariants::ShapeCheck) -> String {

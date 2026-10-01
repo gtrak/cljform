@@ -30,6 +30,23 @@ fn tmpfile(name: &str, bytes: &[u8]) -> std::path::PathBuf {
     p
 }
 
+/// A node's handle, found by def name (top-level).
+fn handle_of(file: &str, name: &str) -> String {
+    let (code, out) = run(&["tree", file, "--json"], None);
+    assert_eq!(code, 0, "{out}");
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    v["result"]["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["name"].as_str() == Some(name))
+        .unwrap_or_else(|| panic!("no node named {name:?}"))
+        ["handle"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
 #[test]
 fn garbage_inputs_never_panic() {
     // Deterministic pseudo-random bytes (no RNG dep).
@@ -57,20 +74,23 @@ fn garbage_inputs_never_panic() {
         // forms
         let (code, _) = run(&["forms", &file, "--json"], None);
         assert!(code == 0 || code == 1, "forms exit {code} on case {case}");
-        // edit: valid target impossible on garbage; must fail cleanly
+        // edit: a handle matching nothing on garbage; must fail cleanly
         let (code, out) = run(
             &[
                 "edit",
                 &file,
-                "--addr",
-                "1",
+                "--handle",
+                "000000",
                 "--content",
                 "(def ok 1)",
                 "--json",
             ],
             None,
         );
-        assert!(code == 0 || code == 1 || code == 2, "edit exit {code} on case {case}");
+        assert!(
+            code == 1 || code == 3,
+            "edit exit {code} on case {case}"
+        );
         if code == 1 {
             assert!(out.contains("\"ok\":false"));
         }
@@ -93,12 +113,15 @@ fn truncated_edits_fail_cleanly() {
     for (i, content) in cases.iter().enumerate() {
         let good = tmpfile(&format!("good-{i}.clj"), b"(ns t)\n\n(def a 1)\n");
         let file = good.to_str().unwrap();
+        // Re-fetch per case: a successful repair rewrites the form's bytes
+        // (and thus its handle).
+        let h = handle_of(file, "a");
         let (code, out) = run(
             &[
                 "edit",
                 file,
-                "--name",
-                "a",
+                "--handle",
+                &h,
                 "--content",
                 content,
                 "--json",

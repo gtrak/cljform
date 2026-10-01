@@ -41,6 +41,28 @@ fn forms_of(file: &str) -> Vec<serde_json::Value> {
     d["forms"].as_array().unwrap().clone()
 }
 
+/// The `tree` node table: path, kind, name, line, handle, …
+fn handles(file: &str) -> serde_json::Value {
+    let (code, d) = run(&["tree", file, "--json"], None);
+    assert_eq!(code, 0, "{d}");
+    d["result"]["nodes"].clone()
+}
+
+/// A node's handle, found by def name (top-level) or node path.
+fn handle_of(file: &str, name_or_path: &str) -> String {
+    let nodes = handles(file);
+    let hit = nodes
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| {
+            n["name"].as_str() == Some(name_or_path)
+                || n["path"].as_str() == Some(name_or_path)
+        })
+        .unwrap_or_else(|| panic!("no node named/pathed {name_or_path:?}"));
+    hit["handle"].as_str().unwrap().to_string()
+}
+
 fn check_ok(file: &str) {
     let (code, d) = run(&["check", file, "--json"], None);
     assert_eq!(code, 0, "file must stay parseable: {d}");
@@ -66,7 +88,7 @@ fn deeply_nested_data_parses_and_edits() {
 
     // Replace the def wrapping the payload.
     let (code, d) = run(
-        &["edit", &f, "--name", "payload", "--content", "(def payload :flat)", "--json"],
+        &["edit", &f, "--handle", &handle_of(&f, "payload"), "--content", "(def payload :flat)", "--json"],
         None,
     );
     assert_eq!(code, 0, "{d}");
@@ -110,7 +132,7 @@ fn bom_file_roundtrip_preserves_bom_and_form_bytes() {
 
     // Replace a form; BOM must survive on disk.
     let (code, d) = run(
-        &["edit", &f, "--name", "target", "--content", "(def target 42)", "--json"],
+        &["edit", &f, "--handle", &handle_of(&f, "target"), "--content", "(def target 42)", "--json"],
         None,
     );
     assert_eq!(code, 0, "{d}");
@@ -136,9 +158,10 @@ fn qualified_def_forms_resolve_and_edit() {
     assert_eq!(forms[2]["kind"], "clojure.test/deftest");
     assert_eq!(forms[2]["name"], "qualified-test");
 
-    // Name targeting works for qualified defs.
+    // Handle targeting works for qualified defs (the name lookup carries the
+    // handle; the edit takes it).
     let (code, d) = run(
-        &["edit", &f, "--name", "qualified", "--content", "(clojure.core/defn qualified [x] (inc x))", "--json"],
+        &["edit", &f, "--handle", &handle_of(&f, "qualified"), "--content", "(clojure.core/defn qualified [x] (inc x))", "--json"],
         None,
     );
     assert_eq!(code, 0, "{d}");
@@ -168,7 +191,7 @@ fn qualified_deftest_swallowed_by_defn_fires_d1() {
 fn edit_with_trailing_comment_keeps_same_line_neighbor() {
     let f = write("same-line.clj", b"(def a 1) (def b 2)\n");
     let (code, d) = run(
-        &["edit", &f, "--addr", "1", "--content", "(def a 1) ; tweaked", "--json"],
+        &["edit", &f, "--handle", &handle_of(&f, "1"), "--content", "(def a 1) ; tweaked", "--json"],
         None,
     );
     assert_eq!(code, 0, "comment-terminated content must not swallow the neighbor: {d}");
@@ -181,7 +204,7 @@ fn edit_with_trailing_comment_keeps_same_line_neighbor() {
 #[test]
 fn delete_between_same_line_neighbors_reseams() {
     let f = write("same-line-del.clj", b"(def a 1) (def b 2) (def c 3)\n");
-    let (code, _d) = run(&["edit", &f, "--name", "b", "--mode", "delete", "--json"], None);
+    let (code, _d) = run(&["edit", &f, "--handle", &handle_of(&f, "b"), "--mode", "delete", "--json"], None);
     assert_eq!(code, 0);
     let text = std::fs::read_to_string(&f).unwrap();
     assert!(text.contains("(def a 1)") && text.contains("(def c 3)") && !text.contains("(def b 2)"));
@@ -193,7 +216,7 @@ fn delete_before_comment_keeps_comment_attached_to_neighbor() {
     // The comment sits after the deleted form on the same line; it must end
     // up attached to the surviving line, not orphaned with the dead form.
     let f = write("comment-seam.clj", b"(def x 1) (def gone 2) ; keep me\n(def y 3)\n");
-    let (code, _d) = run(&["edit", &f, "--name", "gone", "--mode", "delete", "--json"], None);
+    let (code, _d) = run(&["edit", &f, "--handle", &handle_of(&f, "gone"), "--mode", "delete", "--json"], None);
     assert_eq!(code, 0);
     let text = std::fs::read_to_string(&f).unwrap();
     assert!(text.contains("; keep me"), "{text:?}");
@@ -211,7 +234,7 @@ fn crlf_file_forms_and_edit() {
     assert_eq!(forms.len(), 3);
     assert_eq!(forms[2]["line"], serde_json::json!([5, 6]));
     let (code, d) = run(
-        &["edit", &f, "--name", "target", "--content", "(def target 9)", "--json"],
+        &["edit", &f, "--handle", &handle_of(&f, "target"), "--content", "(def target 9)", "--json"],
         None,
     );
     assert_eq!(code, 0, "{d}");
@@ -234,7 +257,7 @@ fn unicode_and_emoji_in_strings_and_symbols() {
     assert_eq!(forms.len(), 2);
     assert_eq!(forms[1]["name"], "label");
     let (code, d) = run(
-        &["edit", &f, "--name", "label", "--content", "(def label \"🚀 launched\")", "--json"],
+        &["edit", &f, "--handle", &handle_of(&f, "label"), "--content", "(def label \"🚀 launched\")", "--json"],
         None,
     );
     assert_eq!(code, 0, "{d}");
@@ -256,7 +279,7 @@ fn brackets_inside_strings_regex_chars_are_not_structure() {
     assert_eq!(forms.len(), 5);
     // Edit the trickiest one.
     let (code, d) = run(
-        &["edit", &f, "--name", "tricky", "--content", "(def tricky \"now ( balanced )\")", "--json"],
+        &["edit", &f, "--handle", &handle_of(&f, "tricky"), "--content", "(def tricky \"now ( balanced )\")", "--json"],
         None,
     );
     assert_eq!(code, 0, "{d}");
@@ -308,7 +331,7 @@ fn discard_chain_hides_forms() {
 fn form_containing_discard_edits_cleanly() {
     let f = write("inner-dis.clj", b"(ns p)\n\n(defn f [] #_(old) 1)\n");
     let (code, d) = run(
-        &["edit", &f, "--name", "f", "--content", "(defn f [] #_(old) (inc 1))", "--json"],
+        &["edit", &f, "--handle", &handle_of(&f, "f"), "--content", "(defn f [] #_(old) (inc 1))", "--json"],
         None,
     );
     assert_eq!(code, 0, "{d}");
@@ -318,44 +341,12 @@ fn form_containing_discard_edits_cleanly() {
 // ─── stale-view traps ────────────────────────────────────────────────────────
 
 #[test]
-fn expect_prefix_matches_full_or_12char_not_8char() {
-    let f = write("expect.clj", b"(ns e)\n\n(def target 1)\n");
-    let forms = forms_of(&f);
-    let full = forms[1]["hash"].as_str().unwrap().to_string();
-    let twelve: String = full.chars().take(12).collect();
-    let eight: String = full.chars().take(8).collect();
-
-    // 12-char prefix accepted.
-    let (code, d) = run(
-        &["edit", &f, "--name", "target", "--expect", &twelve, "--content", "(def target 2)", "--json"],
-        None,
-    );
-    assert_eq!(code, 0, "{d}");
-
-    // 8-char prefix rejected as usage noise, not applied blindly.
-    let (_c2, d2) = run(
-        &["edit", &f, "--name", "target", "--expect", &eight, "--content", "(def target 3)", "--json"],
-        None,
-    );
-    assert!(d2["notes"].as_array().unwrap().iter().any(|n| n.as_str().unwrap().contains("ignored --expect")), "{d2}");
-
-    // Full 64-char hash accepted.
-    let (code, d) = run(
-        &["edit", &f, "--name", "target", "--expect", &format!("blake3:{full}"), "--content", "(def target 4)", "--json"],
-        None,
-    );
-    // full hash no longer matches (content changed above) — advisory note, ok.
-    assert_eq!(code, 0, "{d}");
-    assert!(!d["notes"].as_array().unwrap().is_empty());
-}
-
-#[test]
 fn ambiguous_after_multi_form_content_is_reported() {
     let f = write("dup2.clj", b"(def dup 1)\n");
     // Replace the only form with two same-named defs; the FILE now has an
-    // ambiguous name — next name-targeted op must report both candidates.
+    // ambiguous name — next name-targeted read must report both candidates.
     let (code, _d) = run(
-        &["edit", &f, "--addr", "1", "--content", "(def dup 1)\n\n(def dup 2)", "--json"],
+        &["edit", &f, "--handle", &handle_of(&f, "1"), "--content", "(def dup 1)\n\n(def dup 2)", "--json"],
         None,
     );
     assert_eq!(code, 0);
@@ -373,16 +364,22 @@ fn battery_of_mutations_all_leave_parseable_file() {
         "battery.clj",
         b"(ns bat)\n\n(def a 1)\n\n(defn b [x] x)\n\n(deftest c (is true))\n\n(def d {:e [1 2 {:f \"(g)\"}]})\n",
     );
-    let ops: Vec<Vec<&str>> = vec![
-        vec!["edit", &f, "--name", "a", "--content", "(def a 10)"],
-        vec!["edit", &f, "--name", "b", "--content", "(defn b [x] (inc x))"],
-        vec!["edit", &f, "--mode", "append", "--content", "(def appended 1)"],
-        vec!["edit", &f, "--mode", "prepend", "--content", "(def prepended 0)"],
-        vec!["edit", &f, "--name", "c", "--mode", "delete"],
-        vec!["edit", &f, "--mode", "insert-after", "--name", "d", "--content", "(def after-d 1)"],
+    // Handles are content-addressed: they survive the inserts/deletes the
+    // battery performs elsewhere, so capture them all up front.
+    let ha = handle_of(&f, "a");
+    let hb = handle_of(&f, "b");
+    let hc = handle_of(&f, "c");
+    let hd = handle_of(&f, "d");
+    let ops: Vec<Vec<String>> = vec![
+        vec!["edit".into(), f.clone(), "--handle".into(), ha, "--content".into(), "(def a 10)".into()],
+        vec!["edit".into(), f.clone(), "--handle".into(), hb, "--content".into(), "(defn b [x] (inc x))".into()],
+        vec!["edit".into(), f.clone(), "--mode".into(), "append".into(), "--content".into(), "(def appended 1)".into()],
+        vec!["edit".into(), f.clone(), "--mode".into(), "prepend".into(), "--content".into(), "(def prepended 0)".into()],
+        vec!["edit".into(), f.clone(), "--handle".into(), hc, "--mode".into(), "delete".into()],
+        vec!["edit".into(), f.clone(), "--mode".into(), "insert-after".into(), "--handle".into(), hd, "--content".into(), "(def after-d 1)".into()],
     ];
     for op in &ops {
-        let mut args = op.clone();
+        let mut args: Vec<&str> = op.iter().map(|s| s.as_str()).collect();
         args.push("--json");
         let (code, d) = run(&args, None);
         assert_eq!(code, 0, "op {op:?} failed: {d}");

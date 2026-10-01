@@ -297,6 +297,63 @@ fn edit_handle_patch_delete_insert() {
 }
 
 #[test]
+fn edit_handle_nested_inserts_own_lines() {
+    // The repro shape: a multi-line when/inner nest. `when` starts its line
+    // at column 4; `(inner x)` starts its line at column 6.
+    let src = "(ns t)\n\n(defn f [x]\n  (let [a 1]\n    (when x\n      (inner x))))\n";
+    let f = write("he-nested-lines.clj", src.as_bytes());
+
+    // Nested insert-after, single-line content: the new form lands on its
+    // own line at the anchor's start column (4), after the anchor's last
+    // child; the following closers stay put.
+    let h = handle_at(&f, "2.3.2"); // (when x ...)
+    let (code, d, stderr) = run_json(&[
+        "edit", &f, "--handle", &h, "--mode", "insert-after", "--content", "(log x)", "--json",
+    ]);
+    assert_eq!(code, 0, "{d} {stderr}");
+    assert_eq!(d["result"]["summary"]["side"], "after");
+    assert_eq!(
+        std::fs::read_to_string(&f).unwrap(),
+        "(ns t)\n\n(defn f [x]\n  (let [a 1]\n    (when x\n      (inner x))\n    (log x)))\n"
+    );
+
+    // Nested insert-after, multi-line content: EVERY line lands at the
+    // anchor's start column (line 0 at 4, the body line at 4 + its relative
+    // 2-space indent).
+    std::fs::write(&f, src.as_bytes()).unwrap();
+    let h = handle_at(&f, "2.3.2");
+    let (code, d, stderr) = run_json(&[
+        "edit", &f, "--handle", &h, "--mode", "insert-after",
+        "--content", "(defn g [a]\n  a)", "--json",
+    ]);
+    assert_eq!(code, 0, "{d} {stderr}");
+    assert_eq!(
+        std::fs::read_to_string(&f).unwrap(),
+        "(ns t)\n\n(defn f [x]\n  (let [a 1]\n    (when x\n      (inner x))\n    (defn g [a]\n      a)))\n"
+    );
+
+    // Nested insert-before whose anchor starts its line: the new form takes
+    // the line above at the anchor's column and the anchor drops to its own
+    // line at the same column.
+    std::fs::write(&f, src.as_bytes()).unwrap();
+    let h = handle_at(&f, "2.3.2.2"); // (inner x)
+    let (code, d, stderr) = run_json(&[
+        "edit", &f, "--handle", &h, "--mode", "insert-before", "--content", "(log x)", "--json",
+    ]);
+    assert_eq!(code, 0, "{d} {stderr}");
+    assert_eq!(d["result"]["summary"]["side"], "before");
+    assert_eq!(
+        std::fs::read_to_string(&f).unwrap(),
+        "(ns t)\n\n(defn f [x]\n  (let [a 1]\n    (when x\n      (log x)\n      (inner x))))\n"
+    );
+
+    // The spliced file still parses with the same top-level form count.
+    let (code, forms, stderr) = run_json(&["forms", &f, "--json"]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(forms["forms"].as_array().unwrap().len(), 2);
+}
+
+#[test]
 fn edit_handle_stale_is_refused() {
     let f = write(
         "he-stale.clj",
@@ -305,8 +362,9 @@ fn edit_handle_stale_is_refused() {
     let h = handle_at(&f, "2.3.1");
     // Out-of-band: form 2 is replaced entirely, so the target node's content
     // changes (or disappears).
+    let h2 = handle_at(&f, "2");
     let (code, _, stderr) = run_json(&[
-        "edit", &f, "--addr", "2", "--content", "(defn f [x] (inc x))", "--json",
+        "edit", &f, "--handle", &h2, "--content", "(defn f [x] (inc x))", "--json",
     ]);
     assert_eq!(code, 0, "{stderr}");
     let before = std::fs::read(&f).unwrap();
@@ -326,9 +384,10 @@ fn edit_handle_stale_is_refused() {
 fn edit_handle_reaims_moved_form() {
     let f = write("he-reaim.clj", HEDIT_FIXTURE);
     let h = handle_at(&f, "2");
-    // An earlier insert moves the form from addr 2 to addr 3.
+    // An earlier top-level insert moves the form from addr 2 to addr 3
+    // (the seam inserts a blank-line-separated sibling before it).
     let (code, _, stderr) = run_json(&[
-        "edit", &f, "--mode", "insert-before", "--before", "2", "--content", "(def first :x)", "--json",
+        "edit", &f, "--handle", &h, "--mode", "insert-before", "--content", "(def first :x)", "--json",
     ]);
     assert_eq!(code, 0, "{stderr}");
     // Content-addressed: the old handle still resolves and can replace the

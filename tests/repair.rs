@@ -4,17 +4,17 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-fn edit_content(file: &str, name: &str, content: &str) -> (i32, serde_json::Value) {
-    edit_content_extra(file, name, content, &[])
+fn edit_content(file: &str, handle: &str, content: &str) -> (i32, serde_json::Value) {
+    edit_content_extra(file, handle, content, &[])
 }
 
 fn edit_content_extra(
     file: &str,
-    name: &str,
+    handle: &str,
     content: &str,
     extra: &[&str],
 ) -> (i32, serde_json::Value) {
-    let mut args = vec!["edit", file, "--name", name, "--content", content, "--json"];
+    let mut args = vec!["edit", file, "--handle", handle, "--content", content, "--json"];
     args.extend_from_slice(extra);
     let mut child = Command::new(env!("CARGO_BIN_EXE_cljform"))
         .args(&args)
@@ -29,6 +29,25 @@ fn edit_content_extra(
     (out.status.code().unwrap_or(-1), json)
 }
 
+/// A node's handle, found by def name (top-level).
+fn handle_of(file: &str, name: &str) -> String {
+    let out = Command::new(env!("CARGO_BIN_EXE_cljform"))
+        .args(["tree", file, "--json"])
+        .output()
+        .unwrap();
+    let d: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    d["result"]["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["name"].as_str() == Some(name))
+        .unwrap_or_else(|| panic!("no node named {name:?}"))
+        ["handle"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
 fn fixture(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join("cljform-repair");
     std::fs::create_dir_all(&dir).unwrap();
@@ -40,7 +59,7 @@ fn fixture(name: &str) -> std::path::PathBuf {
 #[test]
 fn missing_closers_inferred_from_indentation() {
     let p = fixture("r1.clj");
-    let (code, d) = edit_content(p.to_str().unwrap(), "target", "(defn target [x]\n  (* x 2)");
+    let (code, d) = edit_content(p.to_str().unwrap(), &handle_of(p.to_str().unwrap(), "target"), "(defn target [x]\n  (* x 2)");
     assert_eq!(code, 0, "{d}");
     assert_eq!(d["result"]["repaired"], true);
     assert!(d["result"]["repairDiff"].as_str().unwrap().contains("(defn target [x]"));
@@ -57,7 +76,7 @@ fn missing_closers_inferred_from_indentation() {
 #[test]
 fn balanced_content_is_never_touched() {
     let p = fixture("r2.clj");
-    let (code, d) = edit_content(p.to_str().unwrap(), "target", "(defn target [x]\n  (+ x 1))");
+    let (code, d) = edit_content(p.to_str().unwrap(), &handle_of(p.to_str().unwrap(), "target"), "(defn target [x]\n  (+ x 1))");
     assert_eq!(code, 0);
     assert_eq!(d["result"]["repaired"], false);
     assert_eq!(d["result"]["repairDiff"], "");
@@ -75,7 +94,7 @@ fn markdown_fence_stripped() {
     let p = fixture("r3.clj");
     let (code, d) = edit_content(
         p.to_str().unwrap(),
-        "target",
+        &handle_of(p.to_str().unwrap(), "target"),
         "```clojure\n(defn target [x]\n  (dec x))\n```",
     );
     assert_eq!(code, 0, "{d}");
@@ -94,7 +113,7 @@ fn complete_content_with_unterminated_fence_is_accepted() {
     let p = fixture("r4.clj");
     let (code, d) = edit_content(
         p.to_str().unwrap(),
-        "target",
+        &handle_of(p.to_str().unwrap(), "target"),
         "```clojure\n(defn target [x]\n  (dec x))",
     );
     assert_eq!(code, 0, "{d}");
@@ -110,7 +129,7 @@ fn unterminated_fence_truncated_content_is_refused_not_repaired() {
     let before = std::fs::read_to_string(&p).unwrap();
     let (code, d) = edit_content(
         p.to_str().unwrap(),
-        "target",
+        &handle_of(p.to_str().unwrap(), "target"),
         "```clojure\n(defn target [x]\n  (let [y 2]\n    y",
     );
     assert_eq!(code, 1, "{d}");
@@ -121,7 +140,7 @@ fn unterminated_fence_truncated_content_is_refused_not_repaired() {
 #[test]
 fn unrepairable_content_fails_with_position() {
     let p = fixture("r5.clj");
-    let (code, d) = edit_content(p.to_str().unwrap(), "target", "(defn target [x]\n  ] ] ]");
+    let (code, d) = edit_content(p.to_str().unwrap(), &handle_of(p.to_str().unwrap(), "target"), "(defn target [x]\n  ] ] ]");
     assert_eq!(code, 1);
     assert_eq!(d["error"]["code"], "not-one-form");
     assert!(d["error"]["line"].is_u64(), "position required: {d}");
@@ -135,11 +154,11 @@ fn unrepairable_content_fails_with_position() {
 #[test]
 fn empty_and_comment_only_content_rejected() {
     let p = fixture("r6.clj");
-    let (code, d) = edit_content(p.to_str().unwrap(), "target", "   \n\n  ");
+    let (code, d) = edit_content(p.to_str().unwrap(), &handle_of(p.to_str().unwrap(), "target"), "   \n\n  ");
     assert_eq!(code, 1);
     assert!(d["error"]["message"].as_str().unwrap().contains("interpolated"));
 
-    let (code, d) = edit_content(p.to_str().unwrap(), "target", ";; just a comment");
+    let (code, d) = edit_content(p.to_str().unwrap(), &handle_of(p.to_str().unwrap(), "target"), ";; just a comment");
     assert_eq!(code, 1);
     assert_eq!(d["error"]["code"], "not-one-form");
 }
@@ -150,7 +169,7 @@ fn repair_handles_trailing_comment_lines() {
     let p = fixture("r7.clj");
     let (code, d) = edit_content(
         p.to_str().unwrap(),
-        "target",
+        &handle_of(p.to_str().unwrap(), "target"),
         "(defn target [x]\n  (* x 3) ; multiply\n",
     );
     assert_eq!(code, 0, "{d}");
@@ -169,7 +188,7 @@ fn repair_multiple_missing_closers_across_levels() {
     let p = fixture("r8.clj");
     let (code, d) = edit_content(
         p.to_str().unwrap(),
-        "target",
+        &handle_of(p.to_str().unwrap(), "target"),
         "(defn target [x]\n  (let [y 2]\n    (+ x y)",
     );
     assert_eq!(code, 0, "{d}");
@@ -194,7 +213,7 @@ fn repair_keeps_bare_body_inside_inner_form() {
     let p = fixture("r9.clj");
     let (code, d) = edit_content(
         p.to_str().unwrap(),
-        "target",
+        &handle_of(p.to_str().unwrap(), "target"),
         "(defn target [x]\n  (let [y 2]\n    y",
     );
     assert_eq!(code, 0, "{d}");
@@ -217,13 +236,13 @@ fn mid_file_dedent_repair_requires_opt_in() {
     let content = "(defn target [x]\n  (let [y 2]\n    (+ x y)\n  (inc x)";
     let p = fixture("r12.clj");
     let before = std::fs::read_to_string(&p).unwrap();
-    let (code, d) = edit_content(p.to_str().unwrap(), "target", content);
+    let (code, d) = edit_content(p.to_str().unwrap(), &handle_of(p.to_str().unwrap(), "target"), content);
     assert_eq!(code, 3, "{d}");
     assert_eq!(d["error"]["code"], "dedent-repair");
     assert!(d["error"]["message"].as_str().unwrap().contains("candidate:"));
     assert_eq!(std::fs::read_to_string(&p).unwrap(), before, "nothing written");
 
-    let (code, d) = edit_content_extra(p.to_str().unwrap(), "target", content, &["--repair"]);
+    let (code, d) = edit_content_extra(p.to_str().unwrap(), &handle_of(p.to_str().unwrap(), "target"), content, &["--repair"]);
     assert_eq!(code, 0, "{d}");
     assert_eq!(d["result"]["repaired"], true);
     let get = Command::new(env!("CARGO_BIN_EXE_cljform"))
@@ -245,8 +264,8 @@ fn strict_refuses_repair() {
         .args([
             "edit",
             p.to_str().unwrap(),
-            "--name",
-            "target",
+            "--handle",
+            &handle_of(p.to_str().unwrap(), "target"),
             "--content",
             "(defn target [x]\n  (* x 2)",
             "--strict",

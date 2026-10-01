@@ -16,6 +16,26 @@ fn run_json(args: &[&str]) -> serde_json::Value {
     serde_json::from_slice(&out.stdout).expect("json envelope")
 }
 
+/// A node's handle, found by def name (top-level).
+fn handle_of(file: &str, name: &str) -> String {
+    let out = Command::new(env!("CARGO_BIN_EXE_cljform"))
+        .args(["tree", file, "--json"])
+        .output()
+        .expect("spawn cljform");
+    assert!(out.status.success(), "tree must succeed");
+    let d: serde_json::Value = serde_json::from_slice(&out.stdout).expect("json envelope");
+    d["result"]["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["name"].as_str() == Some(name))
+        .unwrap_or_else(|| panic!("no node named {name:?}"))
+        ["handle"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
 #[test]
 fn swallowed_deftests_are_detected_with_exact_lines() {
     let dir = std::env::temp_dir().join("cljform-regression");
@@ -79,12 +99,13 @@ fn edit_carrying_the_bug_fires_d1_in_result() {
     )
     .unwrap();
 
+    let h = handle_of(path.to_str().unwrap(), "make-widget");
     let out = Command::new(env!("CARGO_BIN_EXE_cljform"))
         .args([
             "edit",
             path.to_str().unwrap(),
-            "--name",
-            "make-widget",
+            "--handle",
+            &h,
             "--content",
             "(defn make-widget [x]\n  {:w x}\n(deftest stray (is true)))",
             "--json",
@@ -121,8 +142,8 @@ fn the_same_edit_via_strict_mode_refuses() {
         .args([
             "edit",
             path.to_str().unwrap(),
-            "--name",
-            "f",
+            "--handle",
+            &handle_of(path.to_str().unwrap(), "f"),
             "--content",
             "(defn f [x]\n  x\n(deftest swallowed (is true)))",
             "--strict",
