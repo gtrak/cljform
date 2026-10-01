@@ -38,3 +38,13 @@ Sequence (one worker subagent per issue):
 - **06 — `format` op** (`issue-06-format.md`): explicit, candidate-first
   parinfer paren-mode formatter (rules adopted from `../parinfer-rust`,
   differential-tested against the installed binary). Independent of 03–05.
+- **07 — test consolidation** (`issue-07-test-consolidation.md`): shared
+  `tests/common/mod.rs` helpers; thematic files; table-driven merges of the
+  duplicated clusters (BOM/CRLF, comment-gap, detectors, name extraction,
+  byte-identity). Depends on 04 (which migrates the tests to handles).
+- **08 — integration acceptance** (`issue-08-acceptance.md`):
+  `cargo install --path .` to `~/.cargo/bin/cljform`; confirm the extension
+  symlink + `clojure-worker` agent are live; then adversarially run the local
+  model in fresh `clojure-worker` subagents (deep nesting, ambiguous/stale
+  handles, nested edits) and report the agent+tool-loop results. Depends on
+  05 (extension) and 07.

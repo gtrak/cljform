@@ -32,7 +32,7 @@ comment and `end < bytes.len()` and `bytes[end] != b'\n'`, push `b'\n'`).
 Resolution (only when `handle` is `Some`; `--handle` conflicts with
 `--addr`/`--name`/`--after`/`--before`):
 - Reject `H.len() < 6` as a usage error (exit 2).
-- `let nodes = handle::collect(&bytes)?;` match `node.raw.starts_with(H)`
+- `let nodes = handle::collect(&bytes);` match `node.raw.starts_with(H)`
   (so a full 64-hex hash works too).
   - exactly 1 -> target node
   - 0 -> `Fail(3, "stale-handle")`, message names the file and says the form
