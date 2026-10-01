@@ -87,7 +87,11 @@ Lives in this repo at `extension/clojure-forms.ts` (with the
   `⟦handle⟧` and takes whole-form `content` or a surgical
   `oldText`/`newText` patch (mode auto-selects `patch`), reindenting
   submitted content to the target's column — a four-line change in a 60-line
-  form no longer means re-transcribing 60 lines. `clj_draft` runs the
+  form no longer means re-transcribing 60 lines. By default it also reindents
+  the `content` being submitted in parinfer paren mode (`autoFormat`, via
+  `cljform format` on stdin; the CLI `edit` itself only base-shifts, and
+  `format` remains the explicit whole-file op — unparseable content is sent
+  verbatim with a note, and patch `oldText`/`newText` are never touched). `clj_draft` runs the
   indent-mode completer on an indentation-only draft and returns candidate +
   diff (never writes). Content is passed via temp file; handles survive
   edits elsewhere, so a copied handle keeps working until its own form

@@ -54,3 +54,9 @@ Sequence (one worker subagent per issue):
   current in §2/§4.1/§4.3/§6/§7/§8/§9/§12/§14. Reconcile every section with
   the shipped handle-only CLI. Docs only. Depends on 06 (so `format` is
   documented) and 05.
+- **10 — wrapper auto-format** (`issue-10-autoformat.md`): the pi extension
+  reindents the `clj_edit` **content** (via `cljform format` on stdin, default
+  on, `autoFormat` param) before splicing — not a whole-file reformat. The
+  Rust edit path then base-shifts the parinfer-shaped content to the target
+  column. Experiment: observe whether the reindentation surprises the agent.
+  Depends on 06 and 05.

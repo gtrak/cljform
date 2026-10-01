@@ -374,15 +374,18 @@ multiple repos; behavior is cwd-agnostic; §14 wrapper entry).
 `error` result with the install hint; the extension must not crash the
 session.
 
-**Tools** (typebox schemas; content sent via a temp file — `--content-file` —
-never stdin or argv, since pi's exec has no stdin):
+**Tools** (typebox schemas; edit content is sent via a temp file —
+`--content-file` — never argv, since pi's exec has no stdin channel; the one
+exception is `clj_edit`'s autoFormat step, which pipes the raw content into
+`cljform format`'s stdin via a direct spawn, because pi.exec closes the
+child's stdin):
 
 | Tool | Params | Maps to |
 |------|--------|---------|
 | `clj_forms` | `{path}` | `cljform forms --json`; refreshes the fingerprint cache |
 | `clj_tree` | `{path, depth?, json?}` | `cljform tree` — the primary handle-discovery view (`--depth N\|all`); `json` returns the structured node list |
 | `clj_get` | `{path, name? / handle?}` | `cljform get --json` — exact bytes + the form's `⟦handle⟧` |
-| `clj_edit` | `{path, handle?, mode?, content? / oldText? + newText?, dryRun?, strict?, repair?}` | `cljform edit --handle …` — mode auto-selects `patch` when `oldText` is present; append/prepend take no handle; `dryRun` ⇒ `--dry-run`, `strict` ⇒ `--strict`, `repair` ⇒ `--repair` |
+| `clj_edit` | `{path, handle?, mode?, content? / oldText? + newText?, dryRun?, strict?, repair?, autoFormat?}` | `cljform edit --handle …` — mode auto-selects `patch` when `oldText` is present; append/prepend take no handle; `dryRun` ⇒ `--dry-run`, `strict` ⇒ `--strict`, `repair` ⇒ `--repair`; `autoFormat` (default true) reindents `content` by piping it into `cljform format`'s stdin before the edit (candidate-only parinfer paren-mode reindent, §10.5; on format refusal or a missing binary the original content is sent verbatim, the edit never fails for it; a changed content adds the note `reindented content (parinfer paren mode) before editing`); `oldText`/`newText` are exact patch text and are never reformatted |
 | `clj_draft` | `{content}` | `cljform materialize --content-file …` — returns candidate + diff; never writes |
 
 **Fingerprint cache:** in-memory `Map<realpath, forms>`. Refreshed on every
