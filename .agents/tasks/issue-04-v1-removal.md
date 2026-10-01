@@ -28,7 +28,12 @@ lookup on `get`. This is a deliberate breaking change.
   `stale-handle` / `ambiguous-handle` are the edit errors.
 
 ## Read surface
-`get` keeps `--name`, gains `--handle` (added in 03). `forms` unchanged.
+`get` loses `--addr` (numbers are gone), keeps `--name`, and gains
+`--handle` (resolve the node via `handle::collect`, print its bytes +
+metadata). `forms` unchanged.
+
+`resolve_target` is now the `get` name lookup only; `get --handle` is a
+separate branch mirroring the edit resolver.
 
 ## Tests
 The whole suite currently addresses edits by name/addr. Migrate it. Add a
