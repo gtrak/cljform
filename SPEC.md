@@ -480,7 +480,39 @@ Markers are stripped from `--content`, `--old-text`, and `--new-text` before
 use (lossless and deterministic, with a note), so annotated text can be copied
 straight back into an edit without leaking markers into the file.
 
-### 10.5 Deferred / out of scope
+### 10.5 format (paren-mode reindent)
+
+Built. `format <file>` (or stdin) reindents the whole file the way
+parinfer's **paren mode** does — the only op that imposes a style; the edit
+path only base-shifts. Adopted rules (reference: the local parinfer-rust
+checkout's `src/parinfer.rs`, not added as a dependency):
+
+- at a line's first code character (not inside a string, comment, regex,
+  or char literal), the indent is clamped to
+  `[innermost-open.col + 1, most-recently-closed-child.col]` (or the
+  top-level max when nothing is open); leading whitespace is rewritten as
+  spaces, tabs counted at display width 2;
+- leading closing delimiters move up onto the previous content line (the
+  paren trail), and whitespace between trailing closers is removed so
+  closers become contiguous;
+- comment lines, string interiors, and blank lines are left alone.
+
+Candidate-first: the result mirrors `materialize`'s shape
+(`candidate`, `diff`, `note`) and is never written. Verification before
+emission: the candidate must re-parse clean and its token stream (the
+non-whitespace byte sequence) must equal the input's — only whitespace and
+the position of closing delimiters may change. A candidate that fails
+either is `format-error` (exit 1) and is never emitted.
+
+**Differential gate:** `format_matches_parinfer_rust` runs both cljform and
+the installed parinfer-rust binary (`--input-format json --output-format
+text`, paren mode) over a fixture corpus (existing fixtures plus
+flat / over-indented / under-indented / nested / standalone-closer /
+comment-line / string-with-newline / regex / `#(...)`/`#{...}` / CRLF /
+tab cases) and asserts byte equality. The test skips (never fails) when
+the binary is absent, so the suite stays hermetic.
+
+### 10.6 Deferred / out of scope
 
 - **Human-facing structural paths** (`7.2.1` syntax): handles are opaque and
   copy-only by design; a readable path syntax can layer on later.
@@ -608,6 +640,20 @@ design):
   prompt note as specced. Builtin subagents don't inherit extension tools
   (strict allowlists) but the guard hook fires for them; a
   `clojure-worker` user agent ships with the clj tools allowed.
+- **`format` (paren-mode reindent, §10.5).** An explicit, candidate-first
+  op that adopts parinfer paren-mode rules (reference: local parinfer-rust
+  checkout's `src/parinfer.rs` — `correct_indent`, `set_max_indent`,
+  `on_indent`, `check_indent`, `on_comment_line`, `finish_new_paren_trail`,
+  `append_paren_trail`, `clean_paren_trail`, `add_indent`, `init_line`,
+  `is_in_stringish` — not a dependency). It is the only op that imposes a
+  style; the edit path only base-shifts. The from-scratch pass replaces the
+  reference's `indent_delta` incremental machinery and mirrors its failure
+  rules too (unmatched closer, hanging backslash, unbalanced comment
+  quotes, unclosed string/opener → `format-error`, exit 1). Emission is
+  gated on re-parse + token-stream equality (only whitespace and
+  closing-delimiter position may move). Gated by the differential test
+  `format_matches_parinfer_rust` against the installed parinfer-rust
+  binary, which skips when the binary is absent.
 - **Definition heads are recognized by prefix, not a fixed list**, and the
   two uses are distinguished. **Definition-like** (for D2, "accidental local
   def") is any `def…` head: `defn`, `defmacro`, `defmethod`, and project

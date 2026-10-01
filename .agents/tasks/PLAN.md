@@ -48,3 +48,9 @@ Sequence (one worker subagent per issue):
   model in fresh `clojure-worker` subagents (deep nesting, ambiguous/stale
   handles, nested edits) and report the agent+tool-loop results. Depends on
   05 (extension) and 07.
+- **09 — docs reconciliation** (`issue-09-docs-reconcile.md`): SPEC.md still
+  presents the v1 edit contract (`--addr`/`--expect`/`--after`/`--before`,
+  `stale-generation`, the `insert`/`delete` ops, a generation guard) as
+  current in §2/§4.1/§4.3/§6/§7/§8/§9/§12/§14. Reconcile every section with
+  the shipped handle-only CLI. Docs only. Depends on 06 (so `format` is
+  documented) and 05.
