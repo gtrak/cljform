@@ -265,26 +265,78 @@ fn print_human(out: &Output) {
         }
         return;
     }
-    if let Some(forms) = &out.forms {
-        println!(
-            "{}: {} forms",
-            out.file.as_deref().unwrap_or("<stdin>"),
-            forms.len()
-        );
-        for f in forms {
-            println!(
-                "  {:>3}  {:<12} {:<24} lines {}–{}",
-                f.addr,
-                f.kind,
-                f.name.clone().unwrap_or_default(),
-                f.line[0],
-                f.line[1]
-            );
+    if out.op == "get" {
+        // The requested form is the payload: print a one-line header then its
+        // exact bytes, not the whole table.
+        if let Some(r) = &out.result {
+            let file = out.file.as_deref().unwrap_or("<stdin>");
+            let kind = r.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+            let label = match r.get("name").and_then(|v| v.as_str()) {
+                Some(n) => format!("{kind} [{n}]"),
+                None => kind.to_string(),
+            };
+            let lines = r.get("line").and_then(|v| v.as_array());
+            let line_range = match lines {
+                Some(a) if a.len() == 2 => format!("lines {}–{}", a[0], a[1]),
+                _ => String::new(),
+            };
+            let hash = r.get("hash").and_then(|v| v.as_str()).unwrap_or("");
+            let header = if line_range.is_empty() {
+                format!("{file} · {label} · {hash}")
+            } else {
+                format!("{file} · {label} · {line_range} · {hash}")
+            };
+            println!("{header}");
+            if let Some(form) = r.get("form").and_then(|v| v.as_str()) {
+                print!("{form}");
+                if !form.ends_with('\n') {
+                    println!();
+                }
+            }
         }
-    }
-    if let Some(r) = &out.result {
-        if let Some(text) = r.get("text").and_then(|t| t.as_str()) {
-            print!("{text}");
+    } else if out.op == "materialize" {
+        // The candidate (and its diff) are the payload; the note goes in notes.
+        if let Some(r) = &out.result {
+            if let Some(cand) = r.get("candidate").and_then(|v| v.as_str()) {
+                print!("{cand}");
+                if !cand.ends_with('\n') {
+                    println!();
+                }
+            }
+            if let Some(diff) = r.get("diff").and_then(|v| v.as_str()) {
+                if !diff.is_empty() {
+                    print!("{diff}");
+                    if !diff.ends_with('\n') {
+                        println!();
+                    }
+                }
+            }
+        }
+    } else {
+        if let Some(forms) = &out.forms {
+            println!(
+                "{}: {} forms",
+                out.file.as_deref().unwrap_or("<stdin>"),
+                forms.len()
+            );
+            for f in forms {
+                println!(
+                    "  {:>3}  {:<12} {:<24} lines {}–{}",
+                    f.addr,
+                    f.kind,
+                    f.name.clone().unwrap_or_default(),
+                    f.line[0],
+                    f.line[1]
+                );
+            }
+        }
+        if let Some(r) = &out.result {
+            if let Some(text) = r.get("text").and_then(|t| t.as_str()) {
+                print!("{text}");
+                if !text.ends_with('\n') {
+                    println!();
+                }
+            }
         }
     }
     if let Some(ws) = &out.warnings {

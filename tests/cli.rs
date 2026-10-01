@@ -338,6 +338,45 @@ fn exit_codes_are_stable() {
 }
 
 #[test]
+fn human_get_shows_form_bytes() {
+    let (_p, f) = fresh("human-get.clj");
+    let out = Command::new(env!("CARGO_BIN_EXE_cljform"))
+        .args(["get", &f, "--name", "helper", "--human"])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    // The form's exact bytes (its body expression) must appear, not just a table row.
+    assert!(s.contains("(* x 2)"), "get shows form bytes: {s}");
+    // Header carries the blake3 hash.
+    assert!(s.contains("blake3:"), "header has hash: {s}");
+    // It does not merely repeat the form table.
+    assert!(!s.contains("forms"), "no form table in get human output: {s}");
+    assert!(!s.starts_with('{'), "must not be json");
+}
+
+#[test]
+fn human_materialize_shows_candidate() {
+    let out = Command::new(env!("CARGO_BIN_EXE_cljform"))
+        .args([
+            "materialize",
+            "--content",
+            "(defn f [x]\n  (inc x)",
+            "--human",
+        ])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    // The bracketed candidate appears in human output.
+    assert!(s.contains("(inc x))"), "materialize shows candidate: {s}");
+    // And a diff marker.
+    assert!(
+        s.contains("@@") || s.contains("+") || s.contains("-"),
+        "diff marker present: {s}"
+    );
+    assert!(!s.starts_with('{'), "must not be json");
+}
+
+#[test]
 fn human_mode_goes_to_stdout_stderr_without_json() {
     let (_p, f) = fresh("human.clj");
     let out = Command::new(env!("CARGO_BIN_EXE_cljform"))
