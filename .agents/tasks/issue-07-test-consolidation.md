@@ -57,6 +57,13 @@ expectation)` cases), preserving every existing assertion:
 - Keep the deep-nesting (20k) and no-panic tests; they are cheap insurance.
 - `cargo test` must stay green after each file move (do it incrementally).
 
+## 5. Also (tiny README fix, same run)
+`README.md` (~line 50) says `--strict` turns "detector warnings and content
+repairs into refusals (exit 3, `repair-refused`)". That conflates two codes:
+`--strict` detector warnings are exit 1 `detector-fatal` (`src/main.rs`),
+while content repairs are exit 3 `repair-refused`. Split the sentence so each
+has its correct code. Docs only; no code change.
+
 ## Gates
 `cargo build` · `cargo clippy --all-targets -- -D warnings` · `cargo test`
 

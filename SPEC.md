@@ -1,6 +1,6 @@
 # cljform — form-addressed Clojure editing: spec
 
-Status: **implemented (v1; patch mode, bounded repair, strict, clj_draft)** · Created: 2026-09-29
+Status: **implemented (v2: handles, tree/strip, handle-only edit, patch mode, bounded repair, strict, clj_draft, format)** · Created: 2026-09-29
 Shape: standalone Rust CLI (`cljform`) + pi extension wrapper (`clojure-forms`)
 
 ## 1. Problem
@@ -29,8 +29,11 @@ nesting sanity. Neither exists as a first-class tool today.
 - Edits expressed as **whole-form operations** with machine-checked
   well-formedness *and* shape invariants, applied atomically, with precise
   line/col diagnostics on failure.
-- A **generation guard** so a stale view of the file (indexes shifted by an
-  earlier edit, bytes changed by a formatter) can never target the wrong form.
+- **Content-addressed handle resolution** so a stale view of the file (its
+  target form edited or deleted, bytes changed by a formatter) can never
+  target the wrong form: a handle pins position + content, and resolution
+  either matches the one form it names or refuses (`stale-handle` /
+  `ambiguous-handle`, exit 3) (§5, §10.1).
 - **Never evaluate, never load**: the tool is purely syntactic. No Clojure
   runtime, no macro expansion, no namespace loading, ever.
 - Deterministic, scriptable, fast: JSON I/O, stable exit codes, ms-scale.
@@ -43,33 +46,34 @@ nesting sanity. Neither exists as a first-class tool today.
   after, separately).
 - Not a semantic analyzer: no type checking, no shadowing, no linting (that's
   kondo et al.). cljform catches *structural* drift.
-- No nested (path) addressing in v1 — top-level forms only. Reserved for v2
-  (§10).
+- No nested (path) addressing in v1 — top-level forms only. (Shipped as the
+  v2 handle design — §10, §14.)
 - Not an editor for humans — it's an agent/CLI tool with a human-readable
   fallback.
 
 ## 3. Architecture
 
 ```
-┌─────────────────────────── pi (TS) ───────────────────────────┐
+┌─────────────────────── pi (TS) ───────────────────────────────┐
 │ extension: clojure-forms (global, ~/.pi/agent/extensions/)    │
 │                                                               │
-│  tools:   clj-forms · clj-get · clj-check · clj-edit          │
-│           clj-insert · clj-delete · clj-draft                 │
-│  guard:   tool_result hook on built-in edit/write for         │
-│           *.clj *.cljs *.cljc *.cljx *.edn  → cljform check   │
-│  state:   per-file form-fingerprint cache (in-memory Map)     │
-└───────────────┬───────────────────────────────────────────────┘
-                │ spawn: cljform <op> --json …  (content via stdin)
+│ tools:   clj_forms · clj_tree · clj_get · clj_edit · clj_draft│
+│ guard:   tool_result hook on built-in edit/write for          │
+│          *.clj *.cljs *.cljc *.cljx *.edn  → cljform check    │
+│ state:   per-file form-fingerprint cache (in-memory Map;      │
+│          guard-hook shape deltas only)                        │
+└───────────────────────────────────────────────────────────────┘
+                │ spawn: cljform <op> --json …  (content via temp file)
 ┌───────────────▼───────────────────────────────────────────────┐
 │ cljform (Rust, no network, no Clojure runtime)                │
 │                                                               │
-│  parse:  tree-sitter + tree-sitter-clojure grammar            │
-│  map:    top-level form table: addr, kind, name, line range,  │
-│          blake3 hash, contained-kind counts                    │
-│  ops:    forms · get · check · edit · insert · delete ·       │
-│          materialize                                          │
-│  safety: invariants I1–I6, atomic write, nesting detectors    │
+│ parse:  tree-sitter + tree-sitter-clojure grammar             │
+│ view:   top-level form table (addr, kind, name, line range,   │
+│         blake3 hash, contained-kind counts) + annotated tree  │
+│         with content-addressed ⟦handles⟧                      │
+│ ops:    forms · tree · strip · get · check · edit ·           │
+│         materialize · format                                  │
+│ safety: invariants I1–I6, atomic write, nesting detectors     │
 └───────────────────────────────────────────────────────────────┘
 ```
 
@@ -83,38 +87,45 @@ structure-safe* lives in the binary.
 ### 4.1 Global
 
 ```
-cljform [--json] [--quiet] <op> [args]
+cljform [--json|--human] <op> [args]
 ```
 
 - `--json` (default when stdout is not a TTY, always on for the wrapper): one
-  JSON object on stdout. Human mode: plain text with line/col.
-- File argument: path, or `-` for stdin (stdin mode is non-mutating: ops that
-  write error with `code: "no-write-to-stdin"`).
+  JSON object on stdout. `--human`: plain text with line/col.
+- File argument: `check`, `strip`, and `format` take a path or read stdin when
+  the path is omitted; `forms`, `tree`, `get`, and `edit` require a path.
+  `edit` content arrives via `--content`, `--content-file`, or stdin.
 - **Exit codes** (the wrapper branches on these):
-  - `0` — success (including `--check` clean)
-  - `1` — parse/structure error (file or new content unbalanced, detector
-    failures configured fatal, etc.)
-  - `2` — usage error (bad args, unknown op)
-  - `3` — generation guard mismatch (stale `--expect`)
-  - `4` — I/O error (unreadable file, write failure)
+  - `0` — success (including a clean `--dry-run`)
+  - `1` — parse/structure error: `parse-error`, `not-one-form`,
+    `truncated-content`, `shape-violation`, `detector-fatal` (under
+    `--strict`), `annotate-conflict` (`tree` view), `materialize-error`,
+    `format-error`
+  - `2` — usage error: `usage` (bad args, unknown op, target required but
+    missing, `--handle` shorter than 6 hex chars, `--handle` with
+    append/prepend)
+  - `3` — targeting/refusal: `form-not-found`, `ambiguous`, `stale-handle`,
+    `ambiguous-handle`, `patch-not-found`, `patch-ambiguous`,
+    `repair-refused` (under `--strict`), `dedent-repair`
+  - `4` — I/O error: `io` (unreadable file, write failure)
 - **JSON envelope** (success):
   ```json
-  { "ok": true, "op": "forms", "file": "/abs/path",
-    "fileHash": "blake3:…", "generation": "blake3:…",
-    "forms": [ … ], "warnings": [ … ] }
+  { "ok": true, "op": "edit", "file": "/abs/path",
+    "file_hash": "blake3:…", "forms": [ … ],
+    "result": { … }, "warnings": [ … ], "notes": [ … ] }
   ```
 - **JSON envelope** (error):
   ```json
   { "ok": false, "op": "edit",
-    "error": { "code": "parse-error" | "stale-generation" | "not-one-form"
-                 | "form-not-found" | "detector-fatal" | "io" | "usage",
-               "line": 46, "col": 1, "message": "unclosed open-paren",
-               "hint": "…" },
-    "forms": [ … ]   // current form table, when the file parsed
-  }
+    "error": { "code": "stale-handle" | "form-not-found" | "usage" | "io" | …,
+               "line": 46, "col": 1, "message": "…",
+               "hint": "…" } }
   ```
-  Error output always carries the *current* form table when the file itself
-  parsed, so the agent can re-aim without a second round-trip.
+  Lookup and patch-mismatch errors carry a recovery payload —
+  `suggestions` (did-you-mean candidates) on `--name` lookups, and the
+  target form's exact bytes on `patch-not-found` — so the agent can re-aim
+  without a second round-trip; every other error re-aims via `tree` or
+  `forms`.
 
 ### 4.2 Form table (the `forms` array)
 
@@ -124,6 +135,10 @@ cljform [--json] [--quiet] <op> [args]
   "contains": { "deftest": 0, "defn": 0, "let": 2, "if": 1 } }
 ```
 
+The `forms` array is the **top-level listing**. The **nested view** is the
+`tree --json` node table (§10.2): `path`, `kind`, `head`, `name`, `line`,
+`depth`, `handle` per collection node.
+
 - `addr` — 1-based top-level form index.
 - `kind` — head symbol of the form (`defn`, `defn-`, `def`, `deftest`, `ns`,
   `in-ns`, `do`, `fn`, other, …); for non-symbol heads: `expr`.
@@ -132,41 +147,64 @@ cljform [--json] [--quiet] <op> [args]
 - `line` — [first, last] 1-based inclusive.
 - `hash` — blake3 of the **exact bytes** of the form (no normalization: a
   formatter changes bytes and must invalidate the hash — that's a feature, §6).
-- `contains` — counts of macro forms occurring at the form's **top body
-  level**: `deftest`, `defn`, `defn-`, `def`, `defmacro`, plus any configured
-  detector symbols. This is the cheap shape summary the agent eyeballs
-  ("13 forms: 1 ns, 2 defn-, 10 deftest" — expected 11 deftests, so something
-  is wrong).
+- `contains` — head-symbol counts of the form's **direct child list forms**
+  (top body level), keyed by base (unqualified) head name. This is the cheap
+  shape summary the agent eyeballs ("13 forms: 1 ns, 2 defn-, 10 deftest" —
+  expected 11 deftests, so something is wrong).
 
 ### 4.3 Operations
 
 | Op | Purpose | Mutates | Key args |
 |----|---------|---------|----------|
-| `forms` | list the form table | no | file |
-| `get` | print one form (exact bytes + hash + line range) | no | `--addr N` \| `--name sym` |
-| `check` | parse + form table + nesting warnings | no | file |
-| `edit` | replace the form at addr | yes | `--addr N` \| `--name sym`, `--expect <hash>`, content via stdin, `--check` dry-run |
-| `insert` | insert one new form after addr | yes | `--after N` (0 = before first), `--expect-file <fileHash>`, content via stdin, `--check` |
-| `delete` | remove the form at addr | yes | `--addr N`, `--expect <hash>`, `--check` |
-| `materialize` | draft→candidate via indent mode | no | content via stdin; emits candidate + unified diff |
+| `forms <file>` | top-level form table (§4.2) | no | — |
+| `tree <file>` | annotated view: source with `⟦handle⟧` after each marked collection's opening delimiter (§10.2) | no | `--depth N\|all`, `--full`, `--json` (flat node table) |
+| `strip [file]` | delete every `⟦…⟧` marker → the exact original bytes; pure stdout filter, no envelope (§10.2) | no | file or stdin |
+| `get <file>` | one form's exact bytes + metadata, including its handle | no | `--name sym` \| `--handle H` |
+| `check [file]` | parse + form table + nesting warnings | no | file or stdin |
+| `edit <file>` | whole-form / patch / insert / delete, handle-targeted (§5, §10.3) | yes | `--handle H` (append/prepend excepted), `--mode replace\|patch\|insert-after\|insert-before\|append\|prepend\|delete`, `--content` / `--content-file` / stdin, `--old-text`/`--new-text` (patch), `--strict`, `--repair`, `--dry-run` |
+| `materialize` | draft→candidate via indent mode (§4.4) | no | `--content` / `--content-file` / stdin; emits candidate + unified diff |
+| `format [file]` | parinfer paren-mode reindent, candidate-first (§10.5) | no | file or stdin |
 
-**Content rule (edit/insert):** stdin content must be **exactly one complete
-balanced top-level form** — no leading/trailing extra forms, no
-comments-only, no whitespace-only. Violations: `code: "not-one-form"` with a
-breakdown ("parsed 2 forms: defn, deftest" / "parsed 1 comment").
+**Content rule (edit):** content is normalized (markdown fences stripped,
+blank edges trimmed) and may carry several top-level forms — the I3 window
+generalizes to an N-form allowed change (the v1 "exactly one complete
+balanced form" gate is gone; §14). Unbalanced content is repaired by
+indent-mode inference when the fix is unambiguous, with a reported diff; the
+default only completes missing trailing closers. Refusals: `not-one-form`
+(exit 1 — needs a human eye), `truncated-content` (exit 1, an unterminated
+opening fence), `repair-refused` (exit 3, any repair under `--strict`), and
+`dedent-repair` (exit 3, a mid-file dedent closure — a guessed placement;
+`--repair` opts in, candidate + diff attached). `patch` mode is exact-match:
+`--old-text` must occur exactly once inside the target form's bytes,
+`--new-text` may be empty; there is no repair. `patch-not-found` (exit 3)
+returns the form's exact bytes; `patch-ambiguous` (exit 3) names the
+occurrence count.
 
-**`--expect` (generation guard):** required on `edit`/`delete`. The blake3 of
-the target form as it was when the agent last listed it. On mismatch:
-`exit 3`, `code: "stale-generation"`, current table attached. `insert` uses
-`--expect-file` (whole-file hash) since it has no target form. Rationale:
-indexes shift after any insert/delete; byte hashes shift after any formatter
-run. The guard turns "I think form 7 is `handle-thing`" into a
-machine-checked fact. The agent recovers by calling `forms` again — one extra
-round-trip, never a wrong-form edit.
+**Handle resolution (replaces the v1 `--expect` generation guard):** every
+form-targeting mode resolves `--handle H` content-addressedly (§5, §10.1):
+the handle is the shortest unique prefix (≥ 6 hex chars) of
+`blake3(content)`, with position folded in only when identical content is
+ambiguous. A handle pins position + content, and resolution either matches
+the one form it names or refuses: `stale-handle` (exit 3 — no match; the form
+changed or is gone; "re-run `tree`") or `ambiguous-handle` (exit 3 — multiple
+matches; extend the prefix). A moved form still resolves; a changed or
+deleted one does not; there is no third outcome. `append`/`prepend` are
+file-level and take no target.
 
-**`--check` (dry-run):** full validation (parse content, guard, invariants,
-detectors), report the resulting form table + a per-form change summary,
-**write nothing**. Exit 0 = "this edit would apply".
+**Boundary check (the I2 extension for nested edits, §10.3):** the splice may
+only touch its window — the node's byte range for replace/patch/delete, the
+insert position for inserts. Prefix and suffix equality are verified after
+the splice; a violation → `shape-violation` (exit 1), nothing written.
+
+**Marker auto-strip on ingest (§10.4):** `⟦…⟧` markers in `--content`,
+`--old-text`, and `--new-text` are stripped before use (lossless, with a
+note), so annotated text can be copied straight back into an edit without
+leaking markers into the file.
+
+**`--dry-run`:** full validation (resolve, content preparation, splice,
+I1–I3 + boundary check, detectors), report the outcome (`"wrote": false`,
+the resulting form table and a per-form change summary), **write nothing**.
+Exit 0 = "this edit would apply".
 
 ### 4.4 materialize (the indent-mode workflow, mechanized)
 
@@ -196,8 +234,9 @@ of `blake3(content)`, with the form's position folded in only when identical
 content would otherwise be ambiguous. The handle is simultaneously the address
 and the content pin — resolution either matches or refuses.
 
-- **`--handle H`** — the single edit target for every op (replace / patch /
-  insert / delete), at any nesting depth.
+- **`--handle H`** — the single edit target for every form-targeting mode
+  (`replace` / `patch` / `insert-after` / `insert-before` / `delete`), at any
+  nesting depth; `append`/`prepend` are file-level and take no target.
 - **`--name X`** — a *read* lookup, not an edit target: the unique top-level
   form whose head defines `X`. Zero matches → `form-not-found`; multiple →
   `ambiguous` (candidates listed with line ranges). The result carries the
@@ -205,8 +244,8 @@ and the content pin — resolution either matches or refuses.
 
 `--addr` (positional, unpinned) and `--expect` (a separate pin) are removed:
 for a named form, name + hash *is* a handle, so the two collapse into one
-token. Numeric insert anchors (`--after N`) go likewise — anchor by handle or
-name, and use `append`/`prepend` for the file ends.
+token. Numeric insert anchors (`--after N`) go likewise — anchor by handle, and use
+`append`/`prepend` for the file ends.
 
 ## 6. Safety invariants (the binary's contract)
 
@@ -218,25 +257,39 @@ name, and use `append`/`prepend` for the file ends.
   per-form hashes; reported in the result (`"untouched": 41, "changed": 1`).
   Any violation → `code: "shape-violation"`, nothing written. (In practice
   impossible given the splice model; I2 is the *verification* that proves it.)
-- **I3 — exactly the claimed delta.** `edit`: form count unchanged. `insert`:
-  +1. `delete`: −1. Any other delta → `code: "shape-violation"`.
-- **I4 — generation guard** (§4.3). Stale view ⇒ hard stop, exit 3.
+  For nested edits this extends to a **boundary check** (§10.3): every byte
+  outside the replaced range is unchanged (prefix and suffix equality) —
+  that is what covers edits inside a changed form.
+- **I3 — exactly the claimed delta.** The change must fit the mode's allowed
+  window: nested edits never move the top-level form count (only the
+  containing form may change); top-level replace spans the N content forms,
+  insert adds N, delete drops one (I3 generalized from the v1
+  one-form-at-a-time rule — §14). Any other delta → `code:
+  "shape-violation"`.
+- **I4 — content-addressed handle resolution** (§5, §10.1). A handle pins
+  position + content; a stale view (its form changed or deleted) ⇒ hard
+  refusal, exit 3 (`stale-handle` / `ambiguous-handle`), nothing written.
 - **I5 — no silent inference.** Bracket inference exists only in
   `materialize`, candidate-only, labeled (§4.4).
-- **I6 — dry-run is complete.** `--check` performs the entire I1–I5 pipeline
-  minus the write.
+- **I6 — dry-run is complete.** `--dry-run` performs the entire I1–I5
+  pipeline (incl. the boundary check) minus the write.
 
 **Nesting-sanity detectors** (the F1 catch). The invariants catch *splice
 corruption*; detectors catch *authoring intent* — the case where the agent
-wrote balanced content that is still the wrong shape. v1 detectors (non-fatal
-warnings by default; `--fatal-detectors` flips them to errors):
+wrote balanced content that is still the wrong shape. Shipped detectors
+(non-fatal warnings by default; `--strict` flips them to `detector-fatal`,
+exit 1):
 
 | ID | Rule | Fires on |
 |----|------|----------|
 | D1 | `deftest` at top body level of a `defn`/`defn-` | the swallowed-defest bug, exactly |
 | D2 | `def`/`defn`/`defn-`/`defmacro` at top body level of another `defn` (local def — legal, rare in most codebases) | accidental top-level defs inside a body |
 | D3 | `ns` not at addr 1 | reordered file |
-| D4 | form with head symbol `deftest` appearing *inside* a `let`/`fn`/`if` form | same class as D1, other hosts |
+
+(The v1 D4 — `deftest` inside a `let`/`fn`/`if` — was merged into D1, whose
+host set is wide: all executable-scope heads matched by base name, so
+`clojure.test/deftest` is caught too; D2 fires on any definition-like `def…`
+head, not just the four listed. §14.)
 
 Detector config is a data-driven list `(host-sym, forbidden-sym)` so v2 can
 extend per-repo without code changes (e.g. repo rules via a `.cljform.toml` —
@@ -267,7 +320,8 @@ make-widget (line 28–101) — intended?"` and decides.
   line; EOF closes the rest) on top of a shared literal-aware scanner;
   output is a labeled candidate, never applied.
 - **Hashing:** `blake3` over exact form bytes (and file bytes for
-  `--expect-file` / `generation`).
+  `file_hash`); handles are shortest unique prefixes (≥ 6 hex chars) of
+  `blake3(content)` (§10.1).
 - **No evaluation, no I/O beyond the target file.** No Clojure interop, no
   plugin loading. Reader macros (`#(...)`, etc.) are tokens to the
   grammar; they are never executed. This is a hard, reviewable property of the
@@ -278,15 +332,20 @@ make-widget (line 28–101) — intended?"` and decides.
 - **Performance target:** `forms`/`check` on a 1,100-line / ~50 KB file (a
   large service bootstrap file) < 50 ms cold. O(n) parse; no allocation
   surprises.
-- **Binary layout (suggested):**
+- **Binary layout (as built):**
   ```
   cljform/
   ├── Cargo.toml
-  ├── src/main.rs        # arg parsing (clap), dispatch, JSON envelope
-  ├── src/parser.rs      # tree-sitter wrapper, form table build
-  ├── src/ops/{forms,get,check,edit,insert,delete,materialize}.rs
-  ├── src/invariants.rs  # I1–I6 + detectors
-  └── tests/{golden, property, fuzz, regression}/
+  ├── src/main.rs        # clap arg parsing, dispatch, JSON envelope
+  ├── src/parser.rs      # tree-sitter wrapper, form table, detectors
+  ├── src/handle.rs      # handles, tree annotation, marker strip
+  ├── src/content.rs     # normalization + bounded repair
+  ├── src/materialize.rs # indent mode, unified diff
+  ├── src/format.rs      # parinfer paren-mode reindent
+  ├── src/splice.rs      # contiguous byte-range splices
+  ├── src/invariants.rs  # I1–I6, shape checks, atomic write
+  └── tests/             # cli, golden, repair, adversarial, fuzz, format,
+                         # handle, F1 regression
   ```
 - **Testing:**
   - *Golden:* form-table goldens for representative real-world files (a
@@ -297,7 +356,8 @@ make-widget (line 28–101) — intended?"` and decides.
     only the target range differs.
   - *Fuzz:* unbalanced/garbage inputs → structured JSON error, exit 1/4,
     never a panic, never a partial write.
-  - *Regression (mandatory, named):* `tests/regression/swallowed_defest.rs`
+  - *Regression (mandatory, named):*
+    `tests/regression_swallowed_deftest.rs`
     — feeds a fixture reproducing the F1 shape exactly (an unclosed `defn`
     swallowing the following `deftest`s): must report the reduced top-level
     count **and** fire D1 with the exact line range. This test exists because
@@ -305,32 +365,32 @@ make-widget (line 28–101) — intended?"` and decides.
 
 ## 8. pi wrapper spec (`clojure-forms` extension)
 
-Placement: `~/.pi/agent/extensions/clojure-forms/index.ts` (global — the
-author does Clojure across multiple repos; behavior is cwd-agnostic).
+Placement: shipped as `extension/clojure-forms.ts` in this repo, installed
+into `~/.pi/agent/extensions/` (global — the author does Clojure across
+multiple repos; behavior is cwd-agnostic; §14 wrapper entry).
 
 **Binary discovery:** resolve `cljform` from `PATH`; optional
 `CLJFORM_BIN` env override. Missing binary → tools return a single-line
 `error` result with the install hint; the extension must not crash the
 session.
 
-**Tools** (typebox schemas; content always sent via stdin, never as an arg):
+**Tools** (typebox schemas; content sent via a temp file — `--content-file` —
+never stdin or argv, since pi's exec has no stdin):
 
 | Tool | Params | Maps to |
 |------|--------|---------|
-| `clj-forms` | `{path}` | `cljform forms --json`; refreshes the fingerprint cache |
-| `clj-get` | `{path, addr? / name?}` | `cljform get --json` |
-| `clj-check` | `{path}` | `cljform check --json` (cheap post-edit sanity) |
-| `clj-edit` | `{path, addr? / name?, content, dryRun?}` | `cljform edit` with `--expect` from cache (auto-`forms` first if cache missing); `dryRun` ⇒ `--check` |
-| `clj-insert` | `{path, after, content, dryRun?}` | `cljform insert` with `--expect-file` |
-| `clj-delete` | `{path, addr, dryRun?}` | `cljform delete` |
-| `clj-draft` | `{content}` | `cljform materialize` — returns candidate + diff; never writes |
+| `clj_forms` | `{path}` | `cljform forms --json`; refreshes the fingerprint cache |
+| `clj_tree` | `{path, depth?, json?}` | `cljform tree` — the primary handle-discovery view (`--depth N\|all`); `json` returns the structured node list |
+| `clj_get` | `{path, name? / handle?}` | `cljform get --json` — exact bytes + the form's `⟦handle⟧` |
+| `clj_edit` | `{path, handle?, mode?, content? / oldText? + newText?, dryRun?, strict?, repair?}` | `cljform edit --handle …` — mode auto-selects `patch` when `oldText` is present; append/prepend take no handle; `dryRun` ⇒ `--dry-run`, `strict` ⇒ `--strict`, `repair` ⇒ `--repair` |
+| `clj_draft` | `{content}` | `cljform materialize --content-file …` — returns candidate + diff; never writes |
 
-**Fingerprint cache:** in-memory `Map<realpath, {fileHash, forms, at}>`.
-Written on every successful `forms`/mutation (the CLI result carries the new
-table — no re-parse). No session-state persistence in v1: correctness never
-depends on the cache (a missing/stale entry degrades to one extra `clj-forms`
-call; a *lying* cache is impossible because the CLI re-verifies against disk
-on every mutation).
+**Fingerprint cache:** in-memory `Map<realpath, forms>`. Refreshed on every
+successful `clj_forms`/`clj_get` and post-edit shape check (the CLI result
+carries the new table — no re-parse). It exists only to compute the guard
+hook's lost/gained-forms delta; correctness never depends on it — a stale
+view is refused by handle resolution (`stale-handle`), and the CLI
+re-verifies against disk on every operation.
 
 **Guard hook (the reason the wrapper earns its keep even when the agent uses
 plain `edit`/`write`):** on `tool_result` for built-in `edit`/`write` whose
@@ -339,14 +399,14 @@ run `cljform check --json` (time-box 2 s; on timeout, skip with a note) and
 append to the tool result:
 - parse failure → prominent `BLOCKING:` line with line/col from the CLI;
 - otherwise a one-line shape summary: `forms: 13→12, lost: deftest
-  test-retry-then-success (line 81)` or `shape unchanged (13 forms, 2 changed
-  at lines 28–101)` + any detector warnings.
+  test-retry-then-success` or `shape ok (13 forms: 1 ns, 2 defn-, 10
+  deftest)` + any detector warnings.
 The hook never blocks or rewrites (that's `tool_call`'s job); it makes the
 shape diff *inescapable* in the transcript, which is what was missing in F1.
 
 **Error surfacing:** CLI JSON errors become tool-result text with an
 actionable hint: `parse-error @ line 46 col 1: unclosed open-paren — the new
-content is one form short a `)`. Options: fix the content, or use clj-draft
+content is one form short a `)`. Options: fix the content, or use clj_draft
 with an indentation-only draft.` Detectors fire as `WARNING:` lines.
 
 **Subagents:** verify on M3 day-one that child runs in the same project load
@@ -364,12 +424,15 @@ explicitly justified."
 ## 9. End-to-end workflow (example)
 
 ```
-agent: clj-forms {path: "src/myns/my_logic.clj"}
-  → addr 7: defn handle-thing, lines 165–196, hash 3fa9…, gen c41d…
+agent: clj_tree {path: "src/myns/my_logic.clj"}
+  → annotated source; the target reads
+  (⟦7d21⟧defn handle-thing [x] …)
 
-agent: clj-edit {path: …, addr: 7, content: <new defn>}
-  → wrapper: cljform edit --addr 7 --expect 3fa9… --json  (content on stdin)
-  → { ok: true, changed: 1, untouched: 41, generation: 91b2…,
+agent: clj_edit {path: …, handle: "7d21", content: <new defn>}
+  → wrapper: cljform edit <file> --mode replace --handle 7d21 --json
+             (content via --content-file)
+  → { ok: true, changed: 1, untouched: 41, wrote: true,
+      result: { summary: { handle: <new handle at the same path> }, … },
       warnings: [] }
 
 agent: (runs the repo's linter + focused test suite as usual — cljform never
@@ -379,9 +442,10 @@ agent: (runs the repo's linter + focused test suite as usual — cljform never
 
 Failure variant (the F1 replay): agent edits a test file with the `defn`
 closer misplaced. Two outcomes, both safe:
-- via `clj-edit`: content parses as one form → splice OK → **D1 fires** on the
-  result (deftest inside defn) → agent sees it in-turn; or content is
-  unbalanced → `parse-error @ line …` in the content, file untouched.
+- via `clj_edit`: the content splices (repaired from indentation when the
+  fix is unambiguous) → **D1 fires** on the result (deftest inside defn) →
+  agent sees it in-turn; or the content is unrepairable → `not-one-form` /
+  `parse-error @ line …`, file untouched.
 - via plain `edit` (if the agent skipped the tools): the **guard hook** appends
   `forms: 13→10, lost: 3× deftest` + D1 to the tool result. Same-turn catch.
 
@@ -526,35 +590,37 @@ the binary is absent, so the suite stays hermetic.
 
 ## 11. Milestones & acceptance
 
+Milestones M1–M4 record the v1 rollout as delivered; the v2 handle surface
+(`tree`/`strip`, handle-only `edit`, `format`) landed after M4 (§14).
+
 | M | Scope | Acceptance |
 |---|-------|------------|
 | **M1** (read-only) | `forms`, `get`, `check` + golden tests + perf | golden tables stable across repeated runs; grammar pinned via Cargo.lock; 1,100-line file `check` < 50 ms |
 | **M2** (mutation) | `edit`, `insert`, `delete`, I1–I6, detectors, atomic writes, property/fuzz/regression suites | all §7 tests green; **regression test `swallowed_defest` fires D1 with the exact line range on its fixture** |
 | **M3** (wrapper) | extension + 7 tools + guard hook + prompt note; subagent inheritance check; dogfood: redo a representative multi-file one-line schema change across several files, plus one function-body replacement, through the tools on a scratch branch | dogfood diff byte-matches the hand-done equivalent changes; guard demonstrably reports a lost form when a deliberately-broken `edit` is made |
-| **M4** (draft, optional) | `materialize` + detector tuning + `CLJFORM_BIN` polish | the skill's indent-mode recovery is a single `clj-draft` call |
+| **M4** (draft, optional) | `materialize` + detector tuning + `CLJFORM_BIN` polish | the skill's indent-mode recovery is a single `clj_draft` call |
 
 Cross-cutting acceptance (always): a `cargo clippy -D warnings` clean build;
 no dependencies beyond `tree-sitter`, `tree-sitter-clojure`, `clap`,
-`serde`/`serde_json`, `blake3`, `tempfile` (+ test crates); MIT license,
-matching parinfer-rust.
+`serde`/`serde_json`, `blake3`, `tempfile`, `unicode-width`,
+`unicode-segmentation` (+ test crates); MIT license, matching
+parinfer-rust. **Accepted:** `unicode-width` and `unicode-segmentation`
+(issue 06) — `format` matches parinfer paren mode on display-width columns
+(wide characters) and grapheme boundaries; the differential corpus includes
+wide characters.
 
 ## 12. Open questions
 
-1. **Hash algorithm ergonomics** — blake3 hex prefixes (12 chars) in
-   `--expect`? Short prefixes make agent transcripts readable; collision
-   space is irrelevant at this scale. *Default: yes, 12-char prefix, full
-   hash available in JSON.*
-2. **`--expect` friction vs. safety** — one could make the guard *advisory*
-   (warn instead of exit 3) for agent flows. *Default: hard stop; the extra
-   `clj-forms` round-trip is milliseconds and the failure mode it prevents is
-   F2 (wrong-form edits), which is worse than a redundant call.*
-3. **`.edn` handling** — same engine, but `deftest`-style detectors are clj
+1. **Handle length** — shipped at the shortest unique prefix (≥ 6 hex
+   chars). Open: whether a longer default prefix, or a display-length cap in
+   `tree`, is wanted for copy-paste robustness in agent transcripts.
+2. **`.edn` handling** — same engine, but `deftest`-style detectors are clj
    only; for `.edn`, run checks + splice with an empty detector set.
-4. **Should the guard hook also run a linter** (scoped, ~10 s)? *Default: no —
+3. **Should the guard hook also run a linter** (scoped, ~10 s)? *Default: no —
    keep the hook cheap; linting stays an explicit gate.*
-5. **Distribution** — `cargo install --path` for now; `cargo publish` to
-   crates.io (`cljform`) once M2 is stable. The pi wrapper should tolerate
-   both a PATH binary and a repo-local `target/release/cljform` (via
+4. **Distribution** — `cargo install --path` for now; `cargo publish` to
+   crates.io (`cljform`) once stable. The pi wrapper should tolerate both a
+   PATH binary and a repo-local `target/release/cljform` (via
    `CLJFORM_BIN`).
 
 ## 13. Relationship to the clojure-parinfer skill
@@ -563,10 +629,10 @@ The skill stays as the **recovery knowledge base** (stdin discipline, JSON
 error mode, indent-mode technique, "kondo is the bracket-type gate").
 cljform converts its mechanical parts into *enforcement*:
 
-| Skill instruction today | cljform v1 |
+| Skill instruction today | cljform |
 |------------------------|------------|
-| "after EVERY edit run `parinfer-rust -m check < file`" | guard hook + `clj-check` (auto, structured, with shape diff) |
-| "if unbalanced, fix by hand or via indent mode on a scratch file" | `clj-draft` (indent mode, candidate + diff, in-tool) |
+| "after EVERY edit run `parinfer-rust -m check < file`" | guard hook + `clj_edit`'s shape output (auto, structured, with shape diff) |
+| "if unbalanced, fix by hand or via indent mode on a scratch file" | `clj_draft` (indent mode, candidate + diff, in-tool) |
 | "never use smart mode" | preserved: inference exists only as explicit, labeled `materialize` |
 | "kondo/cljfmt are the bracket-type/style gates" | unchanged; cljform deliberately defers to them (I2 keeps their input stable) |
 | "verify registered test counts after adding deftests" | `forms` `contains` summary at edit time; the test runner's registered-test count remains the runtime gate |
@@ -606,9 +672,10 @@ design):
   indentation; it does **not** invent missing openers, so a fully
   bracket-less draft is returned as-is with a note. Exposed to agents as
   `clj_draft` (candidate + diff, never writes).
-- **`--expect` is advisory by default.** A stale address is re-aimed by hash
-  when the expected form is still uniquely findable; `--strict` restores the
-  hard stop (exit 3).
+- **`--expect` is advisory by default (v1; removed with the v2 handle design).**
+  A stale address was re-aimed by hash when the expected form was still
+  uniquely findable; `--strict` restored the hard stop (exit 3). Staleness is
+  now a `stale-handle` refusal (§10.3).
 - **Detectors:** D1's host set is wide (all executable-scope heads, matched
   by base name so `clojure.test/deftest` is caught); former D4 merged into
   D1 (the message names the host). One warning per offending node,
@@ -619,9 +686,10 @@ design):
 - **Splice hardening:** trailing-comment content gets a newline before a
   same-line neighbor (the neighbor cannot be commented out); delete seams
   keep attached comments with their surviving line.
-- **Ops:** `edit` absorbed insert/delete via `--mode` (replace | insert-after
-  | insert-before | append | prepend | delete) and accepts multi-form
-  content (I3 generalized to an N-form allowed-change window).
+- **Ops (v1).** `edit` absorbed insert/delete via `--mode` (replace |
+  insert-after | insert-before | append | prepend | delete) and accepts
+  multi-form content (I3 generalized to an N-form allowed-change window). The
+  mode set carries into the v2 handle-targeted `edit`.
 - **Granularity (v0.2).** A whole-form edit unit made small changes inside
   large forms force full re-transcription (a dropped `]` in a 60-line resend
   was the observed failure). Added `get` / `clj_get` to fetch exact form
@@ -634,8 +702,9 @@ design):
   failure is `oldText` re-typed from a `sed`/`cat` read), so recovery is one
   call with no `clj_get` round-trip. Strictness is the point: the error was
   granularity, not safety. Sub-form addressing (§10, the v2 handle design)
-  remains reserved for v2.
-- **Wrapper:** tools are `clj_forms`/`clj_get`/`clj_edit`/`clj_draft`;
+  shipped with the v2 entry below.
+- **Wrapper (v1; the v2 entry below extends it).** tools are
+  `clj_forms`/`clj_get`/`clj_edit`/`clj_draft`;
   content passes via `--content-file` (pi exec has no stdin). Guard hook and
   prompt note as specced. Builtin subagents don't inherit extension tools
   (strict allowlists) but the guard hook fires for them; a
