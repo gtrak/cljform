@@ -381,6 +381,173 @@ fn patch_mode_line_growth_shifts_later_forms() {
     assert_eq!(rows[2]["hash"], after_hash, "shifted form kept its bytes");
 }
 
+// ─── content reindent inside the edit (issue 11) ────────────────────────────
+
+#[test]
+fn edit_format_content_reindents() {
+    // Flat, balanced content submitted to a nested form: the CLI reindents
+    // it in parinfer paren mode (the flat body raises to the opener's
+    // column + 1) and then base-shifts the result to the target column.
+    let f = fixture("fmt-reindent.clj", b"(def x {:a 1})\n");
+    let h = handle_at_path(&f, "1.2"); // the map, at column 7
+    let (code, d, stderr) = run_json(
+        &[
+            "edit",
+            &f,
+            "--handle",
+            &h,
+            "--content",
+            "(defn f [a]\n(inc a))",
+            "--json",
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "{d} {stderr}");
+    let notes = d["notes"].as_array().unwrap();
+    assert!(
+        notes.iter().any(|n| n.as_str() == Some("reindented content (parinfer paren mode)")),
+        "parinfer reindent is reported: {notes:?}"
+    );
+    assert!(
+        notes.iter().any(|n| n.as_str().unwrap_or("").contains("target column")),
+        "base-shift is reported: {notes:?}"
+    );
+    // Line 0 lands at the splice point (column 7); the body line carries
+    // the target column plus the parinfer 1-space raise.
+    assert_eq!(
+        std::fs::read_to_string(&f).unwrap(),
+        "(def x (defn f [a]\n        (inc a)))\n"
+    );
+
+    // --no-format-content: the relative shape is preserved verbatim —
+    // base-shift only, no parinfer raise.
+    std::fs::write(&f, b"(def x {:a 1})\n").unwrap();
+    let h = handle_at_path(&f, "1.2");
+    let (code, d, stderr) = run_json(
+        &[
+            "edit",
+            &f,
+            "--handle",
+            &h,
+            "--no-format-content",
+            "--content",
+            "(defn f [a]\n(inc a))",
+            "--json",
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "{d} {stderr}");
+    let notes = d["notes"].as_array().unwrap();
+    assert!(
+        !notes.iter().any(|n| n.as_str().unwrap_or("").contains("parinfer")),
+        "no reindent note with --no-format-content: {notes:?}"
+    );
+    assert!(
+        notes.iter().any(|n| n.as_str().unwrap_or("").contains("target column")),
+        "base-shift still applies: {notes:?}"
+    );
+    // The body line lands at the target column itself (relative 0 kept).
+    assert_eq!(
+        std::fs::read_to_string(&f).unwrap(),
+        "(def x (defn f [a]\n       (inc a)))\n"
+    );
+}
+
+#[test]
+fn edit_format_content_skips_unbalanced() {
+    // Unbalanced content: prepare's bracket repair runs first, then the
+    // parindent of the REPAIRED candidate — no format-error, the edit
+    // still succeeds and lands base-shifted.
+    let f = fixture("fmt-unbalanced.clj", b"(def x {:a 1})\n");
+    let h = handle_at_path(&f, "1.2");
+    let (code, d, stderr) = run_json(
+        &[
+            "edit",
+            &f,
+            "--handle",
+            &h,
+            "--content",
+            "(defn f [a]\n  (inc a",
+            "--json",
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "{d} {stderr}");
+    assert_eq!(d["result"]["repaired"], true, "{d}");
+    let notes = d["notes"].as_array().unwrap();
+    assert!(
+        notes.iter().any(|n| n.as_str().unwrap_or("").contains("repaired")),
+        "repair is reported: {notes:?}"
+    );
+    assert!(
+        !notes.iter().any(|n| n.as_str().unwrap_or("").contains("not reindented")),
+        "no format refusal: {notes:?}"
+    );
+    // Repaired, then parindent-shaped (already parinfer-clean: no raise),
+    // then base-shifted to the target column.
+    assert_eq!(
+        std::fs::read_to_string(&f).unwrap(),
+        "(def x (defn f [a]\n         (inc a)))\n"
+    );
+}
+
+#[test]
+fn edit_patch_and_delete_never_reformat() {
+    // Patch newText is exact text: multi-line content that a parinfer
+    // reindent would reshape (a body line at column 0) must land verbatim,
+    // with no reindent note.
+    let f = fixture(
+        "fmt-patch.clj",
+        b"(ns p)\n\n(defn f [x]\n  (h x))\n\n(def after :ok)\n",
+    );
+    let h = handle_of(&f, "f");
+    let (code, d, stderr) = run_json(
+        &[
+            "edit",
+            &f,
+            "--handle",
+            &h,
+            "--mode",
+            "patch",
+            "--old-text",
+            "(h x)",
+            "--new-text",
+            "g x\n(y 1)",
+            "--json",
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "{d} {stderr}");
+    let notes = d["notes"].as_array().unwrap();
+    assert!(
+        !notes.iter().any(|n| n.as_str().unwrap_or("").contains("parinfer")),
+        "patch text is never reindented: {notes:?}"
+    );
+    // The flat body line stays at column 0 — verbatim.
+    assert_eq!(
+        std::fs::read_to_string(&f).unwrap(),
+        "(ns p)\n\n(defn f [x]\n  g x\n(y 1))\n\n(def after :ok)\n"
+    );
+
+    // Delete carries no content at all: it can never reformat anything.
+    let h2 = handle_of(&f, "after");
+    let (code, d, stderr) = run_json(
+        &[
+            "edit",
+            &f,
+            "--handle",
+            &h2,
+            "--mode",
+            "delete",
+            "--json",
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "{d} {stderr}");
+    check_ok(&f);
+}
+
+
 // ─── untouched byte-identity (table-driven) ─────────────────────────────────
 
 #[test]

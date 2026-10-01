@@ -122,6 +122,15 @@ enum Op {
         /// missing trailing closers are completed.
         #[arg(long)]
         repair: bool,
+        /// Reindent submitted content in parinfer paren mode before the
+        /// base shift (content modes only; patch/delete are never
+        /// reformatted). On by default; explicit opt-in accepted.
+        #[arg(long, action = clap::ArgAction::SetTrue, conflicts_with = "no_format_content")]
+        format_content: bool,
+        /// Disable the content reindent: content is still normalized,
+        /// repaired, and base-shifted, but never parinfer-reindented.
+        #[arg(long, action = clap::ArgAction::SetTrue, conflicts_with = "format_content")]
+        no_format_content: bool,
     },
     /// Infer brackets from indentation (candidate only; never writes).
     Materialize {
@@ -927,9 +936,11 @@ fn dispatch(cli: &Cli) -> Result<Output, Fail> {
             dry_run,
             strict,
             repair,
+            format_content,
+            no_format_content,
         } => run_edit(
             file, *mode, content, content_file, old_text, new_text, handle, *dry_run, *strict,
-            *repair,
+            *repair, *format_content || !*no_format_content,
         ),
         Op::Tree { file, depth, full } => {
             let (bytes, had_bom) = read_file(file)?;
@@ -1191,6 +1202,7 @@ fn run_edit(
     dry_run: bool,
     strict: bool,
     repair: bool,
+    format_content: bool,
 ) -> Result<Output, Fail> {
     let (bytes, had_bom) = read_file(file)?;
     let parsed = parse_or_fail(&bytes, "file")?;
@@ -1356,20 +1368,25 @@ fn run_edit(
                     "stripped \u{27E6}…\u{27E7} view markers from the submitted text".to_string(),
                 );
             }
-            // Base-shift reindent for the --handle path. Replace/patch and
-            // inline inserts splice mid-line, so line 0 lands bare at the
-            // splice point (reindent_to_column: continuation reindent). When
-            // the splice itself introduces a line break — a nested
+            // Base-shift geometry (SPEC §10.3): replace/patch and inline
+            // inserts splice mid-line, so line 0 lands bare at the splice
+            // point (reindent_to_column: continuation reindent). When the
+            // splice itself introduces a line break — a nested
             // insert-after, or a nested insert-before whose anchor starts
             // its line — the final lines must carry the target column end
-            // to end (reindent_block). The dedent runs before prepare, which
-            // trims blank edges and would mask the caller's indentation;
-            // that trim also swallows line 0's pad and the newline, so the
-            // post-prepare `block_col` step restores them. A top-level
+            // to end (reindent_block). The base-shift dedent stage runs
+            // before prepare, which trims blank edges and would mask the
+            // caller's indentation; the prefix stage runs after the
+            // parinfer reindent so it owns the final columns. A top-level
             // target takes the seam, so v1 behavior is unchanged there.
-            // `block_col` carries the target column when a line break is
-            // introduced.
-            let (reind_text, reind_changed, block_col) = match handle_node.as_ref() {
+            #[derive(Clone, Copy)]
+            enum BaseShift {
+                None,
+                Column,
+                BlockAfter,
+                BlockBefore,
+            }
+            let (base_col, base_shift) = match handle_node.as_ref() {
                 Some(node) => {
                     let start = node.start_byte;
                     let line_start = bytes[..start]
@@ -1382,82 +1399,103 @@ fn run_edit(
                         .iter()
                         .all(|&b| b == b' ' || b == b'\t');
                     match mode {
-                        // Nested insert-after: block reindent (dedent +
-                        // target column on every line). Line 0's pad and
-                        // the leading newline are (re-)applied below
-                        // prepare: the blank-edge trim swallows both.
-                        Mode::InsertAfter if nested => {
-                            let (reind, changed) = reindent_block(&stripped, target_col);
-                            (reind, changed, Some(target_col))
-                        }
-                        // Nested insert-before whose anchor starts its line:
-                        // same block reindent; line 0 rides on the anchor's
-                        // existing line prefix, and the trailing newline +
-                        // pad are appended below prepare.
+                        // Nested insert-after: block prefix (target column
+                        // on every line) plus a leading newline.
+                        Mode::InsertAfter if nested => (target_col, BaseShift::BlockAfter),
+                        // Nested insert-before whose anchor starts its
+                        // line: line 0 rides on the anchor's existing line
+                        // prefix; the trailing newline + pad drops the
+                        // anchor onto its own line.
                         Mode::InsertBefore if nested && anchor_starts_line => {
-                            let (reind, changed) = reindent_block(&stripped, target_col);
-                            (reind, changed, Some(target_col))
+                            (target_col, BaseShift::BlockBefore)
                         }
                         _ => {
                             if target_col > 0 || matches!(mode, Mode::InsertAfter) {
-                                let (reind, changed) = reindent_to_column(&stripped, target_col);
-                                (reind, changed, None)
+                                (target_col, BaseShift::Column)
                             } else {
-                                (stripped.clone(), false, None)
+                                (0, BaseShift::None)
                             }
                         }
                     }
                 }
-                None => (stripped.clone(), false, None),
+                None => (0, BaseShift::None),
+            };
+            // 1. Normalize + repair. The base-shift dedent runs on the raw
+            // text: prepare's blank-edge trim swallows line 0's pad and
+            // leading newlines, so the dedent stage must run first.
+            let prepared_in = if matches!(base_shift, BaseShift::None) {
+                stripped.clone()
+            } else {
+                reindent_dedent(&stripped)
             };
             let mut prepared =
-                content::prepare(&reind_text, false, strict, repair).map_err(prepare_fail)?;
-            // The nested insert-after leading newline is appended after
-            // prepare: prepare's blank-edge trim would swallow it, and it is
-            // what lands the new form as a sibling on its own line at the
-            // target column. Top-level inserts take the seam (insert_at),
-            // which owns the line structure and blank-line separation.
-            let mut line_structure_added = false;
-            if let Some(target_col) = block_col {
-                // The splice introduces a line break, so the final lines
-                // carry the target column end to end (the block result of
-                // reindent_block). prepare's blank-edge trim swallowed the
-                // newline and line 0's pad, and for insert-after the pad
-                // must be restored here. For insert-before the anchor's own
-                // line prefix (spaces only, by construction) already lands
-                // line 0 at the target column, so only the trailing newline
-                // + pad is appended — it moves the anchor onto its own
-                // line. Top-level inserts take the seam (insert_at), which
-                // owns the line structure and blank-line separation.
-                let pad = " ".repeat(target_col);
-                let mut b = Vec::with_capacity(prepared.bytes.len() + 1 + 2 * pad.len());
-                match mode {
-                    // The new form lands on its own line at the target
-                    // column; the following closers stay put (no trailing
-                    // newline).
-                    Mode::InsertAfter => {
-                        b.push(b'\n');
-                        b.extend(pad.bytes());
-                        b.append(&mut prepared.bytes);
+                content::prepare(&prepared_in, false, strict, repair).map_err(prepare_fail)?;
+
+            // 2. Parinfer paren-mode reindent of the prepared content
+            // (default on; `--no-format-content` disables it). The same
+            // gates as `format`: the candidate must still parse and keep
+            // the token stream (whitespace and closer positions only). A
+            // refused candidate keeps the prepared content — it never
+            // fails the edit.
+            if format_content {
+                let prepared_text = String::from_utf8_lossy(&prepared.bytes).into_owned();
+                if !prepared_text.trim().is_empty() {
+                    match format::format_paren(&prepared_text) {
+                        Ok(cand) if cand == prepared_text => {}
+                        Ok(cand)
+                            if parser::parse(cand.as_bytes()).is_ok()
+                                && format::token_stream(&cand)
+                                    == format::token_stream(&prepared_text) =>
+                        {
+                            prepared.bytes = cand.into_bytes();
+                            notes.push("reindented content (parinfer paren mode)".to_string());
+                        }
+                        Ok(_) => {
+                            notes.push(
+                                "content was not reindented (the reindent candidate \
+                                 failed verification; normalized content kept)"
+                                    .to_string(),
+                            );
+                        }
+                        Err(e) => {
+                            notes.push(format!(
+                                "content was not reindented (parinfer paren mode: {})",
+                                e.message
+                            ));
+                        }
                     }
-                    // The new form takes the line above the anchor (line 0
-                    // rides on the anchor's existing line prefix), which
-                    // drops to its own line at the target column.
-                    Mode::InsertBefore => {
-                        b.append(&mut prepared.bytes);
-                        b.push(b'\n');
-                        b.extend(pad.bytes());
-                    }
-                    _ => unreachable!("block_col is set only for nested inserts"),
                 }
-                prepared.bytes = b;
-                line_structure_added = true;
             }
-            if reind_changed || line_structure_added {
+
+            // 3. Base-shift the formatted content to the splice column and
+            // re-apply the line structure the splice introduces. Top-level
+            // inserts take the seam (insert_at), which owns the line
+            // structure and blank-line separation.
+            let text = String::from_utf8_lossy(&prepared.bytes).into_owned();
+            let (out, reind_changed) = match base_shift {
+                BaseShift::None => (text, false),
+                BaseShift::Column => reindent_to_column(&text, base_col),
+                // The new form lands on its own line at the target
+                // column; the following closers stay put (no trailing
+                // newline).
+                BaseShift::BlockAfter => {
+                    let (out, _) = reindent_block(&text, base_col);
+                    (format!("\n{out}"), true)
+                }
+                // The new form takes the line above the anchor (line 0
+                // rides on the anchor's existing line prefix), which drops
+                // to its own line at the target column.
+                BaseShift::BlockBefore => {
+                    let (out, _) = reindent_to_column(&text, base_col);
+                    (format!("{out}\n{}", " ".repeat(base_col)), true)
+                }
+            };
+            if reind_changed {
                 notes.push(
                     "reindented submitted content to the target column".to_string(),
                 );
             }
+            prepared.bytes = out.into_bytes();
             Some(Payload::Prepared(prepared))
         }
     };
@@ -1799,7 +1837,9 @@ fn strip_view_markers(text: &str) -> (String, bool) {
 /// deterministic; both a caller-indented and a flat block normalize to the
 /// same result.
 fn reindent_to_column(content: &str, target_col: usize) -> (String, bool) {
-    reindent_with(content, target_col, false)
+    let out = reindent_prefix(&reindent_dedent(content), target_col, false);
+    let changed = out != content;
+    (out, changed)
 }
 
 /// Block reindent for `--handle` inserts whose splice introduces a line
@@ -1809,16 +1849,25 @@ fn reindent_to_column(content: &str, target_col: usize) -> (String, bool) {
 /// prefixed with `target_col` spaces after the same common-whitespace
 /// dedent as `reindent_to_column`, whose line-0 continuation is only right
 /// while no line break is inserted.
-/// NOTE: on the `--handle` path this runs BEFORE `content::prepare`, whose
-/// blank-edge trim removes line 0's pad; the payload builder re-applies the
-/// line-0 pad + newline after prepare for insert-after (insert-before
-/// instead rides line 0 on the anchor's existing line prefix and appends
-/// only the trailing newline + pad), so the final lines equal this result.
+/// NOTE: on the `--handle` path the dedent stage runs BEFORE
+/// `content::prepare` (its blank-edge trim would remove line 0's pad) and
+/// this prefix stage runs AFTER prepare (and after the parinfer reindent):
+/// insert-after gets the leading newline prepended, insert-before rides
+/// line 0 on the anchor's existing line prefix and gets only the trailing
+/// newline + pad appended, so the final lines equal this result.
 fn reindent_block(content: &str, target_col: usize) -> (String, bool) {
-    reindent_with(content, target_col, true)
+    let out = reindent_prefix(&reindent_dedent(content), target_col, true);
+    let changed = out != content;
+    (out, changed)
 }
 
-fn reindent_with(content: &str, target_col: usize, prefix_first_line: bool) -> (String, bool) {
+/// Base-shift dedent stage: strip the common leading whitespace across
+/// non-blank lines (line 0 included). Whitespace-only and deterministic;
+/// both a caller-indented and a flat block normalize to the same result.
+/// Runs on the raw submitted text, before `content::prepare`, whose
+/// blank-edge trim would swallow line 0's pad and mask the caller's
+/// common indent.
+fn reindent_dedent(content: &str) -> String {
     let mut lines: Vec<&str> = content.split('\n').collect();
     // A trailing newline does not create a phantom final line.
     let trailing_nl = lines.last().copied().unwrap_or("").is_empty();
@@ -1844,14 +1893,12 @@ fn reindent_with(content: &str, target_col: usize, prefix_first_line: bool) -> (
             });
         }
         let common = common.unwrap_or_default();
-        let prefix = " ".repeat(target_col);
         let mut out_lines = Vec::with_capacity(lines.len());
-        for (i, l) in lines.iter().enumerate() {
-            let body = if l.len() >= common.len() { &l[common.len()..] } else { l };
-            out_lines.push(if i == 0 && !prefix_first_line {
-                body.to_string()
+        for l in &lines {
+            out_lines.push(if l.len() >= common.len() {
+                l[common.len()..].to_string()
             } else {
-                format!("{prefix}{body}")
+                l.to_string()
             });
         }
         let mut out = out_lines.join("\n");
@@ -1860,8 +1907,39 @@ fn reindent_with(content: &str, target_col: usize, prefix_first_line: bool) -> (
         }
         out
     };
-    let changed = out != content;
-    (out, changed)
+    out
+}
+
+/// Base-shift prefix stage: prefix every line — or every line after line 0,
+/// which lands bare at the splice point — with `target_col` spaces.
+/// Whitespace-only and deterministic. Runs on the prepared, parinfer-
+/// reindented content, so it owns the final columns.
+fn reindent_prefix(content: &str, target_col: usize, prefix_first_line: bool) -> String {
+    let mut lines: Vec<&str> = content.split('\n').collect();
+    // A trailing newline does not create a phantom final line.
+    let trailing_nl = lines.last().copied().unwrap_or("").is_empty();
+    if trailing_nl {
+        lines.pop();
+    }
+    let out = if lines.is_empty() || lines.iter().all(|l| is_blank_line(l)) {
+        content.to_string()
+    } else {
+        let prefix = " ".repeat(target_col);
+        let mut out_lines = Vec::with_capacity(lines.len());
+        for (i, l) in lines.iter().enumerate() {
+            out_lines.push(if i == 0 && !prefix_first_line {
+                l.to_string()
+            } else {
+                format!("{prefix}{l}")
+            });
+        }
+        let mut out = out_lines.join("\n");
+        if trailing_nl {
+            out.push('\n');
+        }
+        out
+    };
+    out
 }
 
 fn is_blank_line(l: &str) -> bool {
