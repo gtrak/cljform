@@ -544,6 +544,16 @@ Markers are stripped from `--content`, `--old-text`, and `--new-text` before
 use (lossless and deterministic, with a note), so annotated text can be copied
 straight back into an edit without leaking markers into the file.
 
+`--handle` values are normalized the same spirit: surrounding whitespace is
+trimmed, and a value given as a single `⟦X⟧` span (no marker glyphs inside
+`X`) has its marker glyphs removed so the bare `X` is resolved — this is why
+copying a `⟦handle⟧` straight from the `tree` view and passing it as
+`--handle` works (edit reports the strip with a note). The `⟦…⟧` spans in
+submitted *text* are deleted outright (lossless view removal); a `--handle`
+given as a single span instead keeps its content, since the handle *is* the
+span's content. Values that are not a single well-formed span pass through
+unchanged (trimmed) and fail the usual handle checks.
+
 ### 10.5 format (paren-mode reindent)
 
 Built. `format <file>` (or stdin) reindents the whole file the way

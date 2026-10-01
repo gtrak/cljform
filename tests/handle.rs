@@ -463,3 +463,84 @@ fn edit_reindents_isolated_content() {
     assert_eq!(code, 0, "{d} {stderr}");
     assert_eq!(std::fs::read_to_string(&f).unwrap(), "(def x (defn f [a]\n         a))\n");
 }
+
+#[test]
+fn get_and_edit_accept_decorated_handles() {
+    // A handle lifted from the annotated tree view carries the ⟦…⟧ markers;
+    // both resolvers must resolve it exactly like the bare handle.
+    let f = fixture("he-decorated-handle.clj", HEDIT_FIXTURE);
+    let h = handle_at(&f, "2"); // def config
+    let decorated = format!("\u{27E6}{h}\u{27E7}");
+
+    // get: the decorated handle resolves identically to the bare one.
+    let (code, dd, stderr) = run_json(&["get", &f, "--handle", &decorated, "--json"], None);
+    assert_eq!(code, 0, "{dd} {stderr}");
+    let (code, db, stderr) = run_json(&["get", &f, "--handle", &h, "--json"], None);
+    assert_eq!(code, 0, "{db} {stderr}");
+    assert_eq!(dd, db, "decorated and bare handles must resolve identically");
+
+    // get: a bare handle with surrounding spaces resolves identically too.
+    let (code, dsp, stderr) = run_json(&["get", &f, "--handle", &format!(" {h} "), "--json"], None);
+    assert_eq!(code, 0, "{dsp} {stderr}");
+    assert_eq!(db, dsp, "padded bare handle must resolve identically");
+
+    // edit: the decorated handle targets the same node and reports the strip.
+    let (code, d, stderr) = run_json(
+        &["edit", &f, "--handle", &decorated, "--content", "(def config {:a 9})", "--json"],
+        None,
+    );
+    assert_eq!(code, 0, "{d} {stderr}");
+    assert_eq!(d["result"]["summary"]["action"], "replaced");
+    assert_eq!(d["result"]["summary"]["path"], "2");
+    let notes = d["notes"].as_array().expect("notes");
+    assert!(
+        notes
+            .iter()
+            .any(|n| n == "stripped \u{27E6}…\u{27E7} view markers from the handle"),
+        "handle strip note present: {notes:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&f).unwrap(),
+        "(ns t)\n\n(def config {:a 9})\n\n(defn helper [x]\n  (let [y [1 2]]\n    (when x\n      (+ y 1))))\n\n(def after :ok)\n"
+    );
+
+    // A bare handle still works, with no strip note.
+    let h2 = handle_at(&f, "2");
+    let (code, d, stderr) = run_json(
+        &["edit", &f, "--handle", &h2, "--content", "(def config {:a 8})", "--json"],
+        None,
+    );
+    assert_eq!(code, 0, "{d} {stderr}");
+    assert_eq!(d["result"]["summary"]["path"], "2");
+    let notes = d["notes"].as_array().expect("notes");
+    assert!(
+        !notes
+            .iter()
+            .any(|n| n.as_str().unwrap_or("").contains("from the handle")),
+        "no strip note for a bare handle: {notes:?}"
+    );
+
+    // A bare handle with surrounding spaces resolves too (trim only, no note).
+    let h3 = handle_at(&f, "2");
+    let (code, d, stderr) = run_json(
+        &["edit", &f, "--handle", &format!(" {h3} "), "--content", "(def config {:a 7})", "--json"],
+        None,
+    );
+    assert_eq!(code, 0, "{d} {stderr}");
+    assert_eq!(d["result"]["summary"]["path"], "2");
+    let notes = d["notes"].as_array().expect("notes");
+    assert!(
+        !notes
+            .iter()
+            .any(|n| n.as_str().unwrap_or("").contains("from the handle")),
+        "trim alone is not a strip: {notes:?}"
+    );
+
+    // A value with stray glyphs that is not a single well-formed span is
+    // passed through unchanged and fails the usual handle checks.
+    let stray = format!("{h3}\u{27E6}");
+    let (code, d, _) =
+        run_json(&["get", &f, "--handle", &stray, "--json"], None);
+    assert_eq!(code, 3, "{d}");
+    assert_eq!(d["error"]["code"], "stale-handle");
+}

@@ -132,6 +132,27 @@ pub fn strip(text: &str) -> String {
     out
 }
 
+/// `--handle` normalization (SPEC §10.4). Agents copy the handle straight
+/// out of the annotated view, where it is the marker span itself:
+/// `⟦handle⟧` after the opening delimiter. So trim surrounding whitespace;
+/// if the result is exactly one well-formed span whose content carries no
+/// marker glyphs, drop only the glyphs and keep the handle. Anything else
+/// passes through unchanged (trimmed). Reports whether the span was
+/// extracted. (Unlike `strip`, the span CONTENT survives — the handle is
+/// the content.)
+pub fn bare_handle(value: &str) -> (String, bool) {
+    let trimmed = value.trim();
+    if let Some(inner) = trimmed
+        .strip_prefix(MARKER_OPEN)
+        .and_then(|rest| rest.strip_suffix(MARKER_CLOSE))
+    {
+        if !inner.contains(MARKER_OPEN) && !inner.contains(MARKER_CLOSE) {
+            return (inner.to_string(), true);
+        }
+    }
+    (trimmed.to_string(), false)
+}
+
 /// Node kinds the grammar produces for collection forms: list/vector/map/set/
 /// anon-fn literals plus reader-conditional and ns-map forms (`#(...)`,
 /// `#{...}`, `#?(:...)`, `#?{...}`, `#:ns{...}`). Metadata maps (`^{:a 1}`)
@@ -355,6 +376,29 @@ mod tests {
         assert_eq!(strip("no markers here\n"), "no markers here\n");
         // Unterminated opener is left as-is.
         assert_eq!(strip("a \u{27E6}zz"), "a \u{27E6}zz");
+    }
+
+    #[test]
+    fn bare_handle_normalizes_decorated_tokens() {
+        // A span is the decorated form of its content: glyphs drop, content keeps.
+        assert_eq!(bare_handle("\u{27E6}aaaff5\u{27E7}"), ("aaaff5".into(), true));
+        assert_eq!(bare_handle("  \u{27E6}aaaff5\u{27E7}  "), ("aaaff5".into(), true));
+        // Bare and whitespace-padded handles pass through (trimmed), unflagged.
+        assert_eq!(bare_handle("aaaff5"), ("aaaff5".into(), false));
+        assert_eq!(bare_handle("  aaaff5  "), ("aaaff5".into(), false));
+        // Not a single well-formed span: stray glyphs pass through unchanged.
+        assert_eq!(
+            bare_handle("\u{27E6}aaaff5\u{27E7}junk"),
+            ("\u{27E6}aaaff5\u{27E7}junk".into(), false)
+        );
+        assert_eq!(
+            bare_handle("\u{27E6}aaaff5"),
+            ("\u{27E6}aaaff5".into(), false)
+        );
+        assert_eq!(
+            bare_handle("\u{27E6}\u{27E6}inner\u{27E7}\u{27E7}"),
+            ("\u{27E6}\u{27E6}inner\u{27E7}\u{27E7}".into(), false)
+        );
     }
 
     #[test]

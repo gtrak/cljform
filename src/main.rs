@@ -738,8 +738,12 @@ fn dispatch(cli: &Cli) -> Result<Output, Fail> {
             let parsed = parse_or_fail(&bytes, "file")?;
             if let Some(h) = handle {
                 // The read counterpart of the edit resolver (SPEC §5/§10.2):
-                // resolve the node via handle::collect, print its bytes + metadata.
-                let node = resolve_handle(&bytes, h, file)?;
+                // resolve the node via handle::collect, print its bytes +
+                // metadata. §10.4: a handle copied from the annotated tree
+                // view is the marker span itself; drop the glyphs, keep
+                // the bare handle.
+                let (bare, _extracted) = handle::bare_handle(h);
+                let node = resolve_handle(&bytes, &bare, file)?;
                 let form =
                     String::from_utf8_lossy(&bytes[node.start_byte..node.end_byte]).to_string();
                 let hash = hashutil::file_hash(&bytes[node.start_byte..node.end_byte]);
@@ -1195,6 +1199,7 @@ fn run_edit(
     // Target (SPEC §5/§10.3): --handle for replace/patch/delete/
     // insert-before/insert-after; append and prepend are file-level and take
     // no target.
+    let mut handle_stripped = false;
     let handle_node: Option<handle::Node> = match handle_opt {
         Some(h) if matches!(mode, Mode::Append | Mode::Prepend) => {
             return Err(Fail(
@@ -1209,7 +1214,15 @@ fn run_edit(
                 },
             ))
         }
-        Some(h) => Some(resolve_handle(&bytes, h, file)?),
+        Some(h) => {
+            // §10.4: a handle copied from the annotated tree view is the
+            // marker span itself; drop the glyphs, keep the bare handle.
+            let (bare, extracted) = handle::bare_handle(h);
+            if extracted {
+                handle_stripped = true;
+            }
+            Some(resolve_handle(&bytes, &bare, file)?)
+        }
         None if matches!(mode, Mode::Append | Mode::Prepend) => None,
         None => {
             return Err(Fail(
@@ -1233,6 +1246,11 @@ fn run_edit(
     // scoped to the target node's bytes (no repair — patch is exact).
     // Notes accumulate here (marker-strip / reindent).
     let mut notes: Vec<String> = Vec::new();
+    if handle_stripped {
+        notes.push(
+            "stripped \u{27E6}…\u{27E7} view markers from the handle".to_string(),
+        );
+    }
     let payload: Option<Payload> = match mode {
         Mode::Delete => None,
         Mode::Patch => {
