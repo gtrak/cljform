@@ -191,13 +191,22 @@ attributable invocation whose output the agent must verify.
 
 ## 5. Addressing
 
-- **By index** (`--addr N`) — primary; cheap and unambiguous with the guard.
-- **By name** (`--name handle-thing`) — resolved to the *unique*
-  top-level form whose head defines that name. Zero or multiple matches →
-  `code: "form-not-found"` / `"ambiguous"` listing candidates with line
-  ranges.
-- **Nested paths** (`7.2.1`) — v2, §10. The JSON form table already carries
-  line ranges; v2 adds `--deep` (per-node ids) to `forms`/`get`.
+A form is addressed by an opaque **handle** (§10): the shortest unique prefix
+of `blake3(content)`, with the form's position folded in only when identical
+content would otherwise be ambiguous. The handle is simultaneously the address
+and the content pin — resolution either matches or refuses.
+
+- **`--handle H`** — the single edit target for every op (replace / patch /
+  insert / delete), at any nesting depth.
+- **`--name X`** — a *read* lookup, not an edit target: the unique top-level
+  form whose head defines `X`. Zero matches → `form-not-found`; multiple →
+  `ambiguous` (candidates listed with line ranges). The result carries the
+  form's handle for use in an edit.
+
+`--addr` (positional, unpinned) and `--expect` (a separate pin) are removed:
+for a named form, name + hash *is* a handle, so the two collapse into one
+token. Numeric insert anchors (`--after N`) go likewise — anchor by handle or
+name, and use `append`/`prepend` for the file ends.
 
 ## 6. Safety invariants (the binary's contract)
 
@@ -376,16 +385,109 @@ closer misplaced. Two outcomes, both safe:
 - via plain `edit` (if the agent skipped the tools): the **guard hook** appends
   `forms: 13→10, lost: 3× deftest` + D1 to the tool result. Same-turn catch.
 
-## 10. v2 / out of scope
+## 10. v2 — nested form edits (the handle design)
 
-- **Nested path addressing** (`7.2.1` — "the `:or` binding in some `defn`'s
-  param map"): `forms --deep` emitting node ids per tree level; splice at
-  inner boundaries; invariants unchanged (I2 becomes "untouched *nodes*").
+The v2 headline is editing **any collection form**, not only top-level forms.
+The unit of address is an opaque **handle**, not a structural path.
+
+### 10.1 Handle
+
+A form's handle is the **shortest unique prefix** (>= 6 hex chars) of
+`blake3(content)`, with the form's position folded in **only when content
+alone is ambiguous**:
+
+- **unique content** -> `hash(content)`. Named forms land here: the name
+  already guarantees uniqueness, so a named form's handle *is* its hash.
+- **duplicate content** (`[]`, `(is (= 1 1))`) -> `hash(content || position)`,
+  where position is the structural child-index path from the file root
+  (top-level `2`, nested `2.3.1`), keeping the copies distinguishable.
+
+Two deterministic disambiguation rules: different content sharing a short
+prefix extends the prefix (git-style); identical content adds the position.
+
+Because the handle is content-addressed, resolution finds the form **wherever
+it is**: a moved form still resolves (safe re-aim), while an edited or deleted
+form does not (refuse). There is no third outcome, so a handle can never
+silently name the wrong form. This subsumes the v1 content-only form hash,
+which is now the handle itself, so `--expect` disappears.
+
+**Handles are snapshot tokens.** A handle changes when its form's content
+changes, or (for duplicate forms) when it moves; it does **not** change when
+unrelated forms are inserted or deleted. A list of handles therefore survives
+a batch of edits elsewhere, and only edits to the form itself invalidate it.
+Mutations return the new handles they produced.
+
+### 10.2 Annotated view — `tree`
+
+`tree <file>` emits the source with `⟦handle⟧` after each **opening**
+collection delimiter:
+
+```clojure
+(⟦a3f9⟧ns n)
+
+(⟦7d21⟧defn outer [x]
+  (⟦9b12⟧let [a 1]
+    (⟦1f3c⟧when x
+      (inner x))))
+```
+
+- **Open only** — the handle names the whole form, so the tool owns extent and
+  the caller never paren-matches.
+- **Depth heuristic (default)** — every top-level form is marked; a *nested*
+  form is marked (and descended into) only if it spans >= 2 lines. Single-line
+  forms (`[x]`, `(inc x)`, `{:a 1}`) are easy to name by text, so they get no
+  handle and are not descended into. This is sound: a single-line form cannot
+  contain a multi-line descendant. The default view is therefore top-level
+  forms plus their multi-line structural children, stopping at leaf-ish
+  expressions.
+- **`--depth N`** overrides the heuristic: mark forms down to nesting depth N
+  (top-level = 1). **`--depth all`** (alias `--full`) marks every collection
+  form. Depth is a **view** concern only: the resolver computes handles for all
+  forms, so any handle resolves under the default cutoff.
+- Emitted from the **same parse the resolver uses**, so every handle is
+  guaranteed to resolve.
+- **Lossless** — `strip` deletes every `⟦...⟧` and recovers the exact original
+  bytes (BOM/CRLF preserved). Property test over the fuzz corpus:
+  `strip(annotate(x)) == x`.
+- **Collision policy** — if the source already contains the marker glyphs,
+  refuse to annotate (`annotate-conflict`, exit 1) and fall back to `--json`.
+- Markers go only at AST delimiter positions, never inside strings, regexes,
+  comments, or char literals.
+- `tree --json` emits the flat node table (`path`, `kind`, `head`, `line`,
+  `handle`) derived from the same tree. Annotated source is the canonical read
+  view; JSON is derived.
+
+### 10.3 Edit contract
+
+`edit <file> --handle H [--mode replace|insert-before|insert-after|delete] [--content ...]`
+
+- Resolve the handle against the current file: content-addressed, so a moved
+  form still resolves, but a changed or absent one does not.
+- The splice is still a **contiguous byte-range replacement** — the engine is
+  unchanged. Invariants extend rather than change:
+  - **I1** parse before and after;
+  - **I2** every untouched top-level form byte-identical, plus a **boundary
+    check**: every byte outside the replaced range is unchanged (prefix and
+    suffix equality), which is what covers nested edits inside a changed form;
+  - **I3** form-count window.
+- Unknown or stale handle -> `stale-handle`, exit 3, nothing written, with a
+  "re-run `tree`" note.
+
+### 10.4 Content ingest
+
+Markers are stripped from `--content`, `--old-text`, and `--new-text` before
+use (lossless and deterministic, with a note), so annotated text can be copied
+straight back into an edit without leaking markers into the file.
+
+### 10.5 Deferred / out of scope
+
+- **Human-facing structural paths** (`7.2.1` syntax): handles are opaque and
+  copy-only by design; a readable path syntax can layer on later.
 - **Repo detector config** (`.cljform.toml`): per-repo D-rules and fatal sets.
-- **Multi-file ops** (apply the same form replacement across N files — e.g.
-  adding one schema key to several service config schemas): `edit --file-list`.
-- **`clj-apply-diff`**: consume a unified diff and apply form-aware, rejecting
-  hunks that cross form boundaries (bridge for patch-based workflows).
+- **Multi-file ops** (`edit --file-list`): prepare-all, then commit-all.
+- **`clj-apply-diff`**: form-aware unified-diff application.
+- **`resolve`**: merge-conflict regions via a caller-specified line region
+  with a marker-conditional write.
 - **Editor/REPL integration** (cider-nrepl, lsp-cljk): not planned; the tool
   is deliberately a CLI with a well-known contract.
 
@@ -498,8 +600,8 @@ design):
   A `patch-not-found` error returns the form's **exact bytes** (the dominant
   failure is `oldText` re-typed from a `sed`/`cat` read), so recovery is one
   call with no `clj_get` round-trip. Strictness is the point: the error was
-  granularity, not safety. Sub-form
-  path addressing (§10) remains reserved for v2.
+  granularity, not safety. Sub-form addressing (§10, the v2 handle design)
+  remains reserved for v2.
 - **Wrapper:** tools are `clj_forms`/`clj_get`/`clj_edit`/`clj_draft`;
   content passes via `--content-file` (pi exec has no stdin). Guard hook and
   prompt note as specced. Builtin subagents don't inherit extension tools
