@@ -7,10 +7,11 @@ to leave a file unparsable.
 
 ## Philosophy
 
-1. **Do what the caller means.** Target forms by name or address; content may
-   be unbalanced, fenced in markdown, or padded with blank lines — it is
-   normalized, and brackets are repaired from indentation when the fix is
-   unambiguous (reported, never silent).
+1. **Do what the caller means.** Target forms by `⟦handle⟧` (copied from
+   `tree`; names are read lookups); content may be unbalanced, fenced in
+   markdown, or padded with blank lines — it is normalized, and brackets are
+   repaired from indentation when the fix is unambiguous (reported, never
+   silent).
 2. **Never leave the file broken.** A write happens only if the post-splice
    file parses clean and every untouched form is byte-identical to before.
    Otherwise: nothing is written and the error carries the exact line/col.
@@ -28,23 +29,26 @@ cljform [--json|--human] <op> …
 | Op | Purpose |
 |----|---------|
 | `forms <file>` | Top-level form table: addr, kind, name, lines, blake3, `contains` shape summary, D-warnings |
-| `get <file> [--addr N\|--name sym]` | One form's exact bytes + metadata. Names are extracted for var-defining `def…` heads (`defn`, `defapifn`, …; not `defmethod`, which extends an existing multimethod) |
+| `tree <file> [--depth N\|all \| --full] [--json]` | Annotated view: the source with `⟦handle⟧` after each marked collection's opening delimiter (default: top-level + multi-line forms). Handles are the only edit targets; every emitted handle resolves. `--json` emits the flat node table. Refuses sources that already contain the marker glyphs (`annotate-conflict`, exit 1) |
+| `strip [file]` | Delete every `⟦…⟧` marker span → recovers the exact original bytes (BOM/CRLF preserved). Pure filter on stdout, no envelope; file or stdin |
+| `get <file> [--name sym\|--handle H]` | One form's exact bytes + metadata, including its `⟦handle⟧` (pass it to `edit`). `--name` is a top-level read lookup — names are extracted for var-defining `def…` heads (`defn`, `defapifn`, …; not `defmethod`, which extends an existing multimethod); `--handle` reads any collection node |
 | `check [file]` | Parse + table + nesting warnings (file or stdin) |
-| `edit <file> --name s\|--addr N [--mode M] [--content C\|--content-file F] [--repair]` | Whole-form edit; modes `replace` (default), `insert-after` (`--after`, 0=before first), `insert-before` (`--before`), `append`, `prepend`, `delete`. `--repair` allows a guessed mid-file dedent closure |
-| `edit <file> --name s\|--addr N --mode patch --old-text T [--new-text U]` | Surgical text patch inside one form: `T` must occur exactly once in the form's byte range and never cross its boundary; `U` (default empty) replaces it. Bytes outside the match are untouched; no bracket repair, but I1–I3 still gate the write. A mismatch error returns the form's **exact bytes**, so recovery needs no `clj_get` round-trip |
+| `edit <file> --handle H [--mode M] [--content C\|--content-file F] [--repair]` | Whole-form edit; modes `replace` (default), `insert-after` / `insert-before` (anchor: `--handle`), `append`, `prepend` (file ends, no target), `delete`. Submitted content is reindented to the target's column. `--repair` allows a guessed mid-file dedent closure |
+| `edit <file> --handle H --mode patch --old-text T [--new-text U]` | Surgical text patch inside one form: `T` must occur exactly once in the form's byte range and never cross its boundary; `U` (default empty) replaces it. Bytes outside the match are untouched; no bracket repair, but I1–I3 still gate the write. A mismatch error returns the form's **exact bytes**, so recovery needs no `clj_get` round-trip |
 | `materialize --content C` | Indent-mode bracket completion → labeled candidate + diff (never writes). Completes missing **closers** implied by indentation; it does not invent missing openers, so a fully bracket-less draft comes back unchanged with a note |
 
-Exit codes: `0` ok · `1` parse/structure failure (nothing written) · `2`
-usage · `3` targeting failure or refused repair (not found / ambiguous /
-stale `--expect` under `--strict` / `repair-refused` / `dedent-repair`) ·
-`4` I/O.
+Exit codes: `0` ok · `1` parse/structure failure or `annotate-conflict`
+(nothing written) · `2` usage · `3` targeting failure or refused repair
+(`form-not-found` / `ambiguous` / `stale-handle` / `ambiguous-handle` /
+`repair-refused` / `dedent-repair`) · `4` I/O.
 
-Guards: `--expect <hash-prefix>` (12+ hex chars, `blake3:` optional) is
-advisory by default — a stale address is re-aimed by hash when the expected
-form is still uniquely findable, and the re-aim is reported. `--strict`
-turns mismatches, detector warnings, **and content repairs** into refusals
-(exit 3, `repair-refused`, with the diff it declined to apply). `--dry-run`
-validates and writes nothing.
+Guards: the `⟦handle⟧` is a content pin — resolution either matches the one
+form it names or refuses (`stale-handle` / `ambiguous-handle`, exit 3,
+"re-run `tree`"), so a stale view can never target the wrong form. Handles
+are content-addressed: an unchanged form keeps its handle across edits
+elsewhere. `--strict` turns detector warnings and **content repairs** into
+refusals (exit 3, `repair-refused`, with the diff it declined to apply).
+`--dry-run` validates and writes nothing.
 
 Refusal beats guessed repair. By default cljform only *completes* unbalanced
 content the forced way — appending missing trailing closers. A repair that
@@ -73,15 +77,19 @@ on a 64 MB-stack worker thread — 50k-deep data is fine.
 Lives in this repo at `extension/clojure-forms.ts` (with the
 `extension/agents/clojure-worker.md` subagent definition). It registers:
 
-- **clj_forms / clj_get / clj_edit / clj_draft** — the table, single-form byte
-  fetch, the editor, and a draft recovery aid. `clj_get` returns one form's
-  exact bytes (refreshing the cache); `clj_edit` takes whole-form `content`
-  or a surgical `oldText`/`newText` patch (mode auto-selects `patch`), so a
-  four-line change in a 60-line form no longer means re-transcribing 60
-  lines. `clj_draft` runs the indent-mode completer on an
-  indentation-only draft and returns candidate + diff (never writes).
-  Content is passed via temp file; names survive earlier edits better than
-  addresses.
+- **clj_forms / clj_tree / clj_get / clj_edit / clj_draft** — the top-level
+  table, the annotated `⟦handle⟧` view, single-form byte fetch, the editor,
+  and a draft recovery aid. `clj_tree` is the primary way an agent discovers
+  handles (the only edit targets); `clj_get` returns one form's exact bytes
+  plus its handle (`--name` or `--handle`); `clj_edit` targets by
+  `⟦handle⟧` and takes whole-form `content` or a surgical
+  `oldText`/`newText` patch (mode auto-selects `patch`), reindenting
+  submitted content to the target's column — a four-line change in a 60-line
+  form no longer means re-transcribing 60 lines. `clj_draft` runs the
+  indent-mode completer on an indentation-only draft and returns candidate +
+  diff (never writes). Content is passed via temp file; handles survive
+  edits elsewhere, so a copied handle keeps working until its own form
+  changes (`stale-handle` → re-run `clj_tree`).
 - **Guard hook** — after *any* built-in `edit`/`write` touching
   `*.clj|cljs|cljc|cljx|edn`, appends a shape report to the tool result:
   form-count delta, lost/gained named forms, D-warnings, or a `BLOCKING:`
@@ -106,9 +114,8 @@ not inherit extension tools, but the guard hook still fires for them. For
 form-addressed editing in subagents use the `clojure-worker` agent, whose
 allowlist includes the clj tools. Verified against the builtin `worker` and
 `clojure-worker` with adversarial drills on a local model: bracket-mismatch
-refusals and self-corrections, stale-address recovery via the `was …`
-result field, D1 bait compliance/justification, and `BLOCKING:` recovery —
-see SPEC.md §14.
+refusals and self-corrections, stale-handle refusal → re-`tree` recovery, D1
+bait compliance/justification, and `BLOCKING:` recovery — see SPEC.md §14.
 
 ## Building
 

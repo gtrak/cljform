@@ -625,3 +625,24 @@ design):
   1,081-line file < 10 ms. Dogfooded end-to-end by a local model via the
   wrapper (4 tasks, tests green, shape reports binding) including a live
   bracket-mistake → precise-refusal → self-correction cycle.
+- **v2 as built (handles).** §5/§10 are now the shipped surface. A form's
+  handle is the **shortest unique prefix (>= 6 hex chars) of
+  `blake3(content)`**, with the structural position folded in only when
+  identical content would otherwise be ambiguous; handles are
+  content-addressed snapshot tokens — a moved form still resolves, a changed
+  or absent one refuses (`stale-handle` / `ambiguous-handle`, exit 3,
+  "re-run `tree`"). Two new read ops: **`tree`** (annotated source with
+  `⟦handle⟧` after each marked collection's opening delimiter; default
+  heuristic = top-level + multi-line forms, `--depth N|all` / `--full`,
+  `--json` flat node table; `annotate-conflict`, exit 1, if the source
+  already contains the marker glyphs) and **`strip`** (lossless marker
+  removal — `strip(annotate(x)) == x` — a pure stdout filter with no
+  envelope). **`edit` is handle-only**: `--handle H` targets
+  replace/patch/delete/insert-after/insert-before; `append`/`prepend` are
+  file-level; `--addr`, `--expect`, and the numeric `--after`/`--before`
+  anchors were removed (`--name` remains a read lookup on `get`, carrying
+  the form's handle). Submitted content is marker-stripped (§10.4) and
+  reindented to the target's column (base-shift: line 0 takes the splice
+  column; nested inserts that introduce a line break carry the target
+  column end to end). The wrapper exposes `clj_tree`, `clj_get` takes
+  `--name`/`--handle`, and `clj_edit` targets by `handle` only.

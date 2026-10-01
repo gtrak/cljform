@@ -65,6 +65,12 @@ regex, `#(...)`/`#{...}`, CRLF, and tab cases.
   `format_is_candidate_only`.
 - `format_token_stream_unchanged` on every fixture.
 
+## Docs (this issue owns the `format` documentation)
+- `README.md`: add `format` to the CLI table (candidate-first; parinfer
+  paren-mode rules) and note it is the only op that imposes a style.
+- `SPEC.md` §10/§14: record `format` as built, with the adopted rule summary
+  and the differential-test gate.
+
 ## Gates
 `cargo build` · `cargo clippy --all-targets -- -D warnings` · `cargo test`
 
