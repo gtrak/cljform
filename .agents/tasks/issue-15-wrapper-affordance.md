@@ -47,3 +47,14 @@ tool or by inspecting the constructed output).
 ## Report
 The exact final output strings for replace/patch/insert; proof the default
 clj_tree no longer reports isError; the guidance diff.
+
+## Dogfood result (T8, fresh local-model clojure-worker, after both issues)
+Task: 4 sequential edits to one form in /tmp/cljform-accept/T8.clj.
+- The affordance worked: after patch 1 the worker chased the returned
+  `next handle: ⟦2ffa6e⟧` with no refetch; the single refetch (1 in 8 edits,
+  vs 3-4 per form before) came after patching a sub-form, which legitimately
+  invalidates its parent's handle.
+- Verified: file parses; `format` is a no-op (canonical); ns form hash
+  unchanged (untouched); no lone closers or ws-only lines; all 4 changes exact.
+- Residues → issue 16: two `patch-not-found` from literal `\n` escapes in
+  oldText (correctly refused; recovery guidance worked).
