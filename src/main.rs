@@ -15,7 +15,9 @@ mod hashutil;
 mod invariants;
 mod materialize;
 mod parser;
+mod seam;
 mod splice;
+mod summary;
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -851,7 +853,7 @@ fn dispatch(cli: &Cli) -> Result<Output, Fail> {
 /// are `check`'s job).
 fn run_forms(file: &Path) -> Result<Output, Fail> {
     let (bytes, parsed) = load_parsed(file)?;
-    Ok(forms_output("forms", file, &bytes, parsed.forms, vec![]))
+    Ok(summary::forms_output("forms", file, &bytes, parsed.forms, vec![]))
 }
 
 /// `cljform get`: print one form — by `--handle` (the node's exact bytes +
@@ -924,7 +926,7 @@ fn run_check(file: &Option<PathBuf>) -> Result<Output, Fail> {
         Some(f) => {
             let (bytes, parsed) = load_parsed(f)?;
             let warnings = parsed.warnings;
-            Ok(forms_output("check", f, &bytes, parsed.forms, warnings))
+            Ok(summary::forms_output("check", f, &bytes, parsed.forms, warnings))
         }
         None => {
             let text = read_content(&None, &None)?;
@@ -1181,27 +1183,16 @@ fn prepare_fail(p: content::PrepareError) -> Fail {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn run_edit(
-    file: &Path,
+/// Target (SPEC §5/§10.3): --handle for replace/patch/delete/
+/// insert-before/insert-after; append and prepend are file-level and take
+/// no target. Returns the resolved node (None for append/prepend) and
+/// whether the handle arrived as an annotated-view marker span.
+fn resolve_edit_target(
+    bytes: &[u8],
     mode: Mode,
-    content: &Option<String>,
-    content_file: &Option<PathBuf>,
-    old_text: &Option<String>,
-    new_text: &Option<String>,
     handle_opt: &Option<String>,
-    dry_run: bool,
-    strict: bool,
-    repair: bool,
-    format_content: bool,
-) -> Result<Output, Fail> {
-    let (bytes, had_bom) = read_file(file)?;
-    let parsed = parse_or_fail(&bytes, "file")?;
-    let before_forms = parsed.forms.clone();
-
-    // Target (SPEC §5/§10.3): --handle for replace/patch/delete/
-    // insert-before/insert-after; append and prepend are file-level and take
-    // no target.
+    file: &Path,
+) -> Result<(Option<handle::Node>, bool), Fail> {
     let mut handle_stripped = false;
     let handle_node: Option<handle::Node> = match handle_opt {
         Some(h) if matches!(mode, Mode::Append | Mode::Prepend) => {
@@ -1220,7 +1211,7 @@ fn run_edit(
             if extracted {
                 handle_stripped = true;
             }
-            Some(resolve_handle(&bytes, &bare, file)?)
+            Some(resolve_handle(bytes, &bare, file)?)
         }
         None if matches!(mode, Mode::Append | Mode::Prepend) => None,
         None => {
@@ -1237,267 +1228,268 @@ fn run_edit(
             ))
         }
     };
+    Ok((handle_node, handle_stripped))
+}
 
-    // Payload: whole-form content (normalized/repaired) or a surgical patch
-    // scoped to the target node's bytes (no repair — patch is exact).
-    // Notes accumulate here (marker-strip / reindent).
-    let mut notes: Vec<String> = Vec::new();
-    if handle_stripped {
-        notes.push(
-            "stripped \u{27E6}…\u{27E7} view markers from the handle".to_string(),
-        );
-    }
-    let payload: Option<Payload> = match mode {
-        Mode::Delete => None,
-        Mode::Patch => {
-            let Some(old_raw) = old_text.as_deref().filter(|s| !s.is_empty()) else {
-                return Err(Fail(
-                    exit::USAGE,
-                    ErrorBody::new("usage", "patch mode requires non-empty --old-text")
-                        .with_hint(
-                            "patch replaces an exact snippet inside one form; for whole-form edits use --content"
-                        ),
-                ));
-            };
-            // §10.4: view markers never reach the file.
-            let old = strip_view_markers_into(old_raw, &mut notes);
-            let new = strip_view_markers_into(new_text.as_deref().unwrap_or(""), &mut notes);
-            // Patch is handle-only: the usage check above guarantees a node.
-            let node = handle_node
-                .as_ref()
-                .expect("patch requires --handle (validated above)");
-            let scoped = &bytes[node.start_byte..node.end_byte];
-            let (line_range, scope_label, scope_bytes) = (
-                node.line,
-                node.kind.clone(),
-                String::from_utf8_lossy(scoped).to_string(),
-            );
-            let needle = old.as_bytes();
-            let hits = find_all(scoped, needle);
-            // Issue 16: agents sometimes encode newlines/tabs as the literal
-            // two-character sequences `\n` / `\t`. Flag that possibility in
-            // the refusal — never a fix, since Clojure strings and regexes
-            // can legitimately contain them.
-            let escape_suspect = old_raw.contains("\\n") || old_raw.contains("\\t");
-            match hits.len() {
-                0 => {
-                    return Err(Fail(
-                        exit::TARGET,
-                        ErrorBody::new(
-                            "patch-not-found",
-                            // Hand back the exact form bytes: the dominant
-                            // failure is oldText re-typed from a sed/cat read,
-                            // and this makes recovery one call, no clj_get.
-                            format!(
-                                "--old-text not found inside {scope_label} (lines {}–{}); occurrences elsewhere in the file do not count\n\nexact form bytes (copy oldText from these):\n{}",
-                                line_range[0],
-                                line_range[1],
-                                scope_bytes
-                            ),
-                        )
-                        .at(Some(line_range[0]), None)
-                        .with_hint({
-                            let mut hint = "use the exact bytes above verbatim; only re-fetch with clj_get if the file changed since you read it"
-                                .to_string();
-                            if escape_suspect {
-                                hint.push_str(
-                                    "; oldText contains the literal two characters backslash-n (or backslash-t); if you meant a newline or tab, send a real one",
-                                );
-                            }
-                            hint
-                        }),
-                    ));
-                }
-                1 => {}
-                n => {
-                    return Err(Fail(
-                        exit::TARGET,
-                        ErrorBody::new(
-                            "patch-ambiguous",
-                            format!(
-                                "--old-text occurs {n} times inside {scope_label} — include more surrounding lines to make it unique"
-                            ),
-                        )
-                        .at(Some(line_range[0]), None),
-                    ));
-                }
-            }
-            let i = hits[0];
-            let mut nb = Vec::with_capacity(scoped.len() - needle.len() + new.len());
-            nb.extend_from_slice(&scoped[..i]);
-            nb.extend_from_slice(new.as_bytes());
-            nb.extend_from_slice(&scoped[i + needle.len()..]);
-            let noop = nb == scoped;
-            let diff = if noop {
-                String::new()
-            } else {
-                materialize::unified_diff(
-                    &scope_bytes,
-                    &String::from_utf8_lossy(&nb),
-                    "before",
-                    "after",
+/// Patch payload (SPEC: exact-match text replacement scoped to the target
+/// form's bytes; no repair — patch is surgical).
+fn build_patch_payload(
+    bytes: &[u8],
+    old_text: &Option<String>,
+    new_text: &Option<String>,
+    handle_node: Option<&handle::Node>,
+    notes: &mut Vec<String>,
+) -> Result<Payload, Fail> {
+    let Some(old_raw) = old_text.as_deref().filter(|s| !s.is_empty()) else {
+        return Err(Fail(
+            exit::USAGE,
+            ErrorBody::new("usage", "patch mode requires non-empty --old-text")
+                .with_hint(
+                    "patch replaces an exact snippet inside one form; for whole-form edits use --content"
+                ),
+        ));
+    };
+    // §10.4: view markers never reach the file.
+    let old = seam::strip_view_markers_into(old_raw, notes);
+    let new = seam::strip_view_markers_into(new_text.as_deref().unwrap_or(""), notes);
+    // Patch is handle-only: the usage check above guarantees a node.
+    let node = handle_node
+        .expect("patch requires --handle (validated above)");
+    let scoped = &bytes[node.start_byte..node.end_byte];
+    let (line_range, scope_label, scope_bytes) = (
+        node.line,
+        node.kind.clone(),
+        String::from_utf8_lossy(scoped).to_string(),
+    );
+    let needle = old.as_bytes();
+    let hits = find_all(scoped, needle);
+    // Issue 16: agents sometimes encode newlines/tabs as the literal
+    // two-character sequences `\n` / `\t`. Flag that possibility in
+    // the refusal — never a fix, since Clojure strings and regexes
+    // can legitimately contain them.
+    let escape_suspect = old_raw.contains("\\n") || old_raw.contains("\\t");
+    match hits.len() {
+        0 => {
+            return Err(Fail(
+                exit::TARGET,
+                ErrorBody::new(
+                    "patch-not-found",
+                    // Hand back the exact form bytes: the dominant
+                    // failure is oldText re-typed from a sed/cat read,
+                    // and this makes recovery one call, no clj_get.
+                    format!(
+                        "--old-text not found inside {scope_label} (lines {}–{}); occurrences elsewhere in the file do not count\n\nexact form bytes (copy oldText from these):\n{}",
+                        line_range[0],
+                        line_range[1],
+                        scope_bytes
+                    ),
                 )
-            };
-            Some(Payload::Patch { bytes: nb, diff, noop })
+                .at(Some(line_range[0]), None)
+                .with_hint({
+                    let mut hint = "use the exact bytes above verbatim; only re-fetch with clj_get if the file changed since you read it"
+                        .to_string();
+                    if escape_suspect {
+                        hint.push_str(
+                            "; oldText contains the literal two characters backslash-n (or backslash-t); if you meant a newline or tab, send a real one",
+                        );
+                    }
+                    hint
+                }),
+            ));
         }
-        _ => {
-            let raw = read_content(content, content_file)?;
-            // §10.4: view markers never reach the file.
-            let stripped = strip_view_markers_into(&raw, &mut notes);
-            // Base-shift geometry (SPEC §10.3): replace/patch and inline
-            // inserts splice mid-line, so line 0 lands bare at the splice
-            // point (reindent_to_column: continuation reindent). When the
-            // splice itself introduces a line break — a nested
-            // insert-after, or a nested insert-before whose anchor starts
-            // its line — the final lines must carry the target column end
-            // to end (reindent_block). The base-shift dedent is computed
-            // from the submitted content and applied AFTER the inference
-            // has decided (issue 12 — inference must not depend on the
-            // dedent or the target column); the prefix stage runs after the
-            // parinfer reindent so it owns the final columns. A top-level
-            // target takes the seam, so v1 behavior is unchanged there.
-            #[derive(Clone, Copy)]
-            enum BaseShift {
-                None,
-                Column,
-                BlockAfter,
-                BlockBefore,
-            }
-            let (base_col, base_shift) = match handle_node.as_ref() {
-                Some(node) => {
-                    let start = node.start_byte;
-                    let line_start = bytes[..start]
-                        .iter()
-                        .rposition(|&b| b == b'\n')
-                        .map_or(0, |p| p + 1);
-                    let target_col = start - line_start;
-                    let nested = node.path.contains('.');
-                    let anchor_starts_line = bytes[line_start..start]
-                        .iter()
-                        .all(|&b| b == b' ' || b == b'\t');
-                    match mode {
-                        // Nested insert-after: block prefix (target column
-                        // on every line) plus a leading newline.
-                        Mode::InsertAfter if nested => (target_col, BaseShift::BlockAfter),
-                        // Nested insert-before whose anchor starts its
-                        // line: line 0 rides on the anchor's existing line
-                        // prefix; the trailing newline + pad drops the
-                        // anchor onto its own line.
-                        Mode::InsertBefore if nested && anchor_starts_line => {
-                            (target_col, BaseShift::BlockBefore)
-                        }
-                        _ => {
-                            if target_col > 0 || matches!(mode, Mode::InsertAfter) {
-                                (target_col, BaseShift::Column)
-                            } else {
-                                (0, BaseShift::None)
-                            }
-                        }
-                    }
-                }
-                None => (0, BaseShift::None),
-            };
-            // 1. Normalize + repair on the content AS SUBMITTED (view
-            //    markers stripped only): the inference decision/outcome is
-            //    identical with or without the base-shift dedent and the
-            //    parinfer reindent, and at any target column (issue 12).
-            //    The base-shift dedent is computed from the submitted
-            //    content and applied after inference has decided — never
-            //    fed back into it.
-            let mut prepared =
-                content::prepare(&stripped, false, strict, repair).map_err(prepare_fail)?;
-            if !matches!(base_shift, BaseShift::None) {
-                let t = String::from_utf8_lossy(&prepared.bytes).into_owned();
-                prepared.bytes = reindent_dedent_by(&stripped, &t).into_bytes();
-            }
+        1 => {}
+        n => {
+            return Err(Fail(
+                exit::TARGET,
+                ErrorBody::new(
+                    "patch-ambiguous",
+                    format!(
+                        "--old-text occurs {n} times inside {scope_label} — include more surrounding lines to make it unique"
+                    ),
+                )
+                .at(Some(line_range[0]), None),
+            ));
+        }
+    }
+    let i = hits[0];
+    let mut nb = Vec::with_capacity(scoped.len() - needle.len() + new.len());
+    nb.extend_from_slice(&scoped[..i]);
+    nb.extend_from_slice(new.as_bytes());
+    nb.extend_from_slice(&scoped[i + needle.len()..]);
+    let noop = nb == scoped;
+    let diff = if noop {
+        String::new()
+    } else {
+        materialize::unified_diff(
+            &scope_bytes,
+            &String::from_utf8_lossy(&nb),
+            "before",
+            "after",
+        )
+    };
+    Ok(Payload::Patch { bytes: nb, diff, noop })
+}
 
-            // 2. Parinfer paren-mode reindent of the prepared content
-            // (default on; `--no-format-content` disables it). The same
-            // gates as `format`: the candidate must still parse and pass
-            // the token gate (whitespace + closer positions only). A
-            // refused candidate keeps the prepared content — it never
-            // fails the edit, but it is never SILENT either: the note
-            // tells the caller its edit was written unformatted (issue 14).
-            if format_content {
-                let prepared_text = String::from_utf8_lossy(&prepared.bytes).into_owned();
-                if !prepared_text.trim().is_empty() {
-                    match format::format_paren(&prepared_text) {
-                        Ok(cand) if cand == prepared_text => {}
-                        Ok(cand)
-                            if parser::parse(cand.as_bytes()).is_ok()
-                                && format::format_preserves_tokens(&prepared_text, &cand) =>
-                        {
-                            prepared.bytes = cand.into_bytes();
-                            notes.push("reindented content (parinfer paren mode)".to_string());
-                        }
-                        Ok(_) => {
-                            notes.push(
-                                "content was not reindented (the reindent candidate \
-                                 failed verification; the edit was written with unformatted \
-                                 content — report as a cljform bug)"
-                                    .to_string(),
-                            );
-                        }
-                        Err(e) => {
-                            notes.push(format!(
-                                "content was not reindented (parinfer paren mode: {} — the \
-                                 edit was written with unformatted content)",
-                                e.message
-                            ));
-                        }
+#[allow(clippy::too_many_arguments)]
+/// Whole-form payload: read the content, strip view markers, normalize +
+/// repair (content::prepare), apply the base-shift dedent (after inference
+/// has decided — issue 12), parinfer reindent, and base-shift the final
+/// lines to the splice column (seam trim).
+fn build_prepared_payload(
+    mode: Mode,
+    content: &Option<String>,
+    content_file: &Option<PathBuf>,
+    handle_node: Option<&handle::Node>,
+    bytes: &[u8],
+    strict: bool,
+    repair: bool,
+    format_content: bool,
+    notes: &mut Vec<String>,
+) -> Result<Payload, Fail> {
+    let raw = read_content(content, content_file)?;
+    // §10.4: view markers never reach the file.
+    let stripped = seam::strip_view_markers_into(&raw, notes);
+    let (base_col, base_shift) = match handle_node {
+        Some(node) => {
+            let start = node.start_byte;
+            let line_start = bytes[..start]
+                .iter()
+                .rposition(|&b| b == b'\n')
+                .map_or(0, |p| p + 1);
+            let target_col = start - line_start;
+            let nested = node.path.contains('.');
+            let anchor_starts_line = bytes[line_start..start]
+                .iter()
+                .all(|&b| b == b' ' || b == b'\t');
+            match mode {
+                // Nested insert-after: block prefix (target column
+                // on every line) plus a leading newline.
+                Mode::InsertAfter if nested => (target_col, seam::BaseShift::BlockAfter),
+                // Nested insert-before whose anchor starts its
+                // line: line 0 rides on the anchor's existing line
+                // prefix; the trailing newline + pad drops the
+                // anchor onto its own line.
+                Mode::InsertBefore if nested && anchor_starts_line => {
+                    (target_col, seam::BaseShift::BlockBefore)
+                }
+                _ => {
+                    if target_col > 0 || matches!(mode, Mode::InsertAfter) {
+                        (target_col, seam::BaseShift::Column)
+                    } else {
+                        (0, seam::BaseShift::None)
                     }
                 }
             }
+        }
+        None => (0, seam::BaseShift::None),
+    };
+    // 1. Normalize + repair on the content AS SUBMITTED (view
+    //    markers stripped only): the inference decision/outcome is
+    //    identical with or without the base-shift dedent and the
+    //    parinfer reindent, and at any target column (issue 12).
+    //    The base-shift dedent is computed from the submitted
+    //    content and applied after inference has decided — never
+    //    fed back into it.
+    let mut prepared =
+        content::prepare(&stripped, false, strict, repair).map_err(prepare_fail)?;
+    if !matches!(base_shift, seam::BaseShift::None) {
+        let t = String::from_utf8_lossy(&prepared.bytes).into_owned();
+        prepared.bytes = seam::reindent_dedent_by(&stripped, &t).into_bytes();
+    }
 
-            // 3. Base-shift the formatted content to the splice column and
-            // re-apply the line structure the splice introduces. Top-level
-            // inserts take the seam (insert_at), which owns the line
-            // structure and blank-line separation.
-            //
-            // Seam guarantee (issue 14 R3): the spliced content never ends
-            // on a whitespace-only line, so the parent closers displaced by
-            // the splice land on the LAST line of the inserted/replaced
-            // content (paren-trail semantics at the seam) instead of alone
-            // on their own padded line. The trim is whitespace-only and is
-            // confined to the submitted content — the changed region — so
-            // no untouched form can move.
-            let raw_text = String::from_utf8_lossy(&prepared.bytes).into_owned();
-            let text = trim_trailing_blank_lines(&raw_text);
-            let trimmed = text != raw_text;
-            let (out, shift_changed) = match base_shift {
-                BaseShift::None => (text, false),
-                BaseShift::Column => reindent_to_column(&text, base_col),
-                // The new form lands on its own line at the target
-                // column; the following closers stay put (no trailing
-                // newline).
-                BaseShift::BlockAfter => {
-                    let (out, _) = reindent_block(&text, base_col);
-                    (format!("\n{out}"), true)
+    // 2. Parinfer paren-mode reindent of the prepared content
+    // (default on; `--no-format-content` disables it). The same
+    // gates as `format`: the candidate must still parse and pass
+    // the token gate (whitespace + closer positions only). A
+    // refused candidate keeps the prepared content — it never
+    // fails the edit, but it is never SILENT either: the note
+    // tells the caller its edit was written unformatted (issue 14).
+    if format_content {
+        let prepared_text = String::from_utf8_lossy(&prepared.bytes).into_owned();
+        if !prepared_text.trim().is_empty() {
+            match format::format_paren(&prepared_text) {
+                Ok(cand) if cand == prepared_text => {}
+                Ok(cand)
+                    if parser::parse(cand.as_bytes()).is_ok()
+                        && format::format_preserves_tokens(&prepared_text, &cand) =>
+                {
+                    prepared.bytes = cand.into_bytes();
+                    notes.push("reindented content (parinfer paren mode)".to_string());
                 }
-                // The new form takes the line above the anchor (line 0
-                // rides on the anchor's existing line prefix), which drops
-                // to its own line at the target column.
-                BaseShift::BlockBefore => {
-                    let (out, _) = reindent_to_column(&text, base_col);
-                    (format!("{out}\n{}", " ".repeat(base_col)), true)
+                Ok(_) => {
+                    notes.push(
+                        "content was not reindented (the reindent candidate \
+                         failed verification; the edit was written with unformatted \
+                         content — report as a cljform bug)"
+                            .to_string(),
+                    );
                 }
-            };
-            let reind_changed = shift_changed || trimmed;
-            if reind_changed {
-                notes.push(
-                    "reindented submitted content to the target column".to_string(),
-                );
+                Err(e) => {
+                    notes.push(format!(
+                        "content was not reindented (parinfer paren mode: {} — the \
+                         edit was written with unformatted content)",
+                        e.message
+                    ));
+                }
             }
-            prepared.bytes = out.into_bytes();
-            Some(Payload::Prepared(prepared))
+        }
+    }
+
+    // 3. Base-shift the formatted content to the splice column and
+    // re-apply the line structure the splice introduces. Top-level
+    // inserts take the seam (insert_at), which owns the line
+    // structure and blank-line separation.
+    //
+    // Seam guarantee (issue 14 R3): the spliced content never ends
+    // on a whitespace-only line, so the parent closers displaced by
+    // the splice land on the LAST line of the inserted/replaced
+    // content (paren-trail semantics at the seam) instead of alone
+    // on their own padded line. The trim is whitespace-only and is
+    // confined to the submitted content — the changed region — so
+    // no untouched form can move.
+    let raw_text = String::from_utf8_lossy(&prepared.bytes).into_owned();
+    let text = seam::trim_trailing_blank_lines(&raw_text);
+    let trimmed = text != raw_text;
+    let (out, shift_changed) = match base_shift {
+        seam::BaseShift::None => (text, false),
+        seam::BaseShift::Column => seam::reindent_to_column(&text, base_col),
+        // The new form lands on its own line at the target
+        // column; the following closers stay put (no trailing
+        // newline).
+        seam::BaseShift::BlockAfter => {
+            let (out, _) = seam::reindent_block(&text, base_col);
+            (format!("\n{out}"), true)
+        }
+        // The new form takes the line above the anchor (line 0
+        // rides on the anchor's existing line prefix), which drops
+        // to its own line at the target column.
+        seam::BaseShift::BlockBefore => {
+            let (out, _) = seam::reindent_to_column(&text, base_col);
+            (format!("{out}\n{}", " ".repeat(base_col)), true)
         }
     };
+    let reind_changed = shift_changed || trimmed;
+    if reind_changed {
+        notes.push(
+            "reindented submitted content to the target column".to_string(),
+        );
+    }
+    prepared.bytes = out.into_bytes();
+    Ok(Payload::Prepared(prepared))
+}
 
-    // Build splice + allowed-change window + actual splice window (lo, hi):
-    // the node range for replace/patch/delete, and the insert position for
-    // inserts. For a top-level insert-after the position can sit past
-    // node.end_byte (a same-line trailing comment stays with the anchor).
-    let (sp, allowed, mut bound) = if let Some(node) = handle_node.as_ref() {
+/// Build splice + allowed-change window + actual splice window (lo, hi):
+/// the node range for replace/patch/delete, and the insert position for
+/// inserts. For a top-level insert-after the position can sit past
+/// node.end_byte (a same-line trailing comment stays with the anchor).
+fn plan_splice(
+    mode: Mode,
+    bytes: &[u8],
+    before_forms: &[Form],
+    handle_node: Option<&handle::Node>,
+    payload: &Option<Payload>,
+) -> (splice::Splice, invariants::Allowed, (usize, usize)) {
+    if let Some(node) = handle_node {
         let top_level = node.path.split('.').next().unwrap().parse::<usize>().unwrap();
         // The I3 window depends on depth. Nested edits never change the
         // top-level form count: the containing form may change and nothing
@@ -1510,16 +1502,16 @@ fn run_edit(
                 Mode::Delete => invariants::Allowed::Delete { addr: top_level },
                 Mode::Patch => invariants::Allowed::Replace { addr: top_level, n: 1 },
                 Mode::InsertAfter => {
-                    let n = content_forms(&payload);
+                    let n = content_forms(payload);
                     invariants::Allowed::Insert { at: top_level + 1, n }
                 }
                 Mode::InsertBefore => {
-                    let n = content_forms(&payload);
+                    let n = content_forms(payload);
                     invariants::Allowed::Insert { at: top_level, n }
                 }
                 _ => {
                     // Replace: the N content forms take the target's slot.
-                    invariants::Allowed::Replace { addr: top_level, n: content_forms(&payload) }
+                    invariants::Allowed::Replace { addr: top_level, n: content_forms(payload) }
                 }
             }
         };
@@ -1560,7 +1552,7 @@ fn run_edit(
                     // Top-level: the node is the whole form, so take the
                     // seam (blank-line separation) at the form's start.
                     let pos =
-                        splice::insert_before_pos(&bytes, &before_forms, top_level);
+                        splice::insert_before_pos(bytes, before_forms, top_level);
                     (
                         splice::Splice::InsertBefore {
                             before: top_level,
@@ -1591,7 +1583,7 @@ fn run_edit(
                     // line (a same-line trailing comment stays with the
                     // anchor) with blank-line separation.
                     let pos =
-                        splice::insert_after_pos(&bytes, &before_forms, top_level);
+                        splice::insert_after_pos(bytes, before_forms, top_level);
                     (
                         splice::Splice::Insert {
                             after: top_level,
@@ -1657,27 +1649,21 @@ fn run_edit(
             ),
             _ => unreachable!("target-less edit is append/prepend only"),
         }
-    };
-
-    let mut new_bytes = splice::apply(&bytes, &before_forms, &sp);
-
-    // R3 seam (issue 14, delete): a delete that leaves only the displaced
-    // parent closers on its anchor's line pulls them onto the previous
-    // content line — the paren trail's own semantics at the seam, confined
-    // to the deleted node's line tail. Best-effort: if the pull would break
-    // the parse (closers landing inside a multi-line string), the original
-    // splice is kept.
-    if mode == Mode::Delete && handle_node.is_some() {
-        let (start, end) = bound;
-        if let Some(window) = pull_displaced_closers(&bytes, &mut new_bytes, start, end) {
-            if parser::parse(&new_bytes).is_ok() {
-                bound = window;
-            } else {
-                new_bytes = splice::apply(&bytes, &before_forms, &sp);
-            }
-        }
     }
+}
 
+/// The verification tail: the §10.3 boundary proof (the splice only touched
+/// its actual window), the I1 post-splice parse, the I2/I3 untouched-forms
+/// check, and the strict detector gate.
+fn verify_edit(
+    bytes: &[u8],
+    new_bytes: &[u8],
+    before_forms: &[Form],
+    handle_node: Option<&handle::Node>,
+    bound: (usize, usize),
+    allowed: &invariants::Allowed,
+    strict: bool,
+) -> Result<(parser::Parsed, invariants::ShapeCheck, Vec<invariants::DetectorWarning>), Fail> {
     // §10.3 boundary check (I2 extension): the splice may only touch its
     // actual window — [start, end) for replace/patch/delete, and the insert
     // position for inserts (which for a top-level insert-after can be past
@@ -1699,26 +1685,11 @@ fn run_edit(
         }
     }
 
-    // No-op detection.
-    match (&payload, mode) {
-        (Some(Payload::Prepared(p)), Mode::Replace) => {
-            let new_text = String::from_utf8_lossy(&new_bytes).to_string();
-            let old_text = String::from_utf8_lossy(&bytes).to_string();
-            if new_text == old_text && !p.repaired {
-                notes.push("no-op: content identical to the target form".to_string());
-            }
-        }
-        (Some(Payload::Patch { noop: true, .. }), _) => {
-            notes.push("no-op: --new-text equals --old-text".to_string());
-        }
-        _ => {}
-    }
-
     // I1: post-splice parse.
-    let after_parsed = parse_or_fail(&new_bytes, "resulting file")?;
+    let after_parsed = parse_or_fail(new_bytes, "resulting file")?;
 
     // I2/I3: untouched forms byte-identical, count as expected.
-    let shape = invariants::verify_untouched(&before_forms, &after_parsed.forms, &allowed)
+    let shape = invariants::verify_untouched(before_forms, &after_parsed.forms, allowed)
         .map_err(|m| Fail(exit::PARSE, ErrorBody::new("shape-violation", m)))?;
 
     // Detectors on the result.
@@ -1739,6 +1710,106 @@ fn run_edit(
         ));
     }
 
+    Ok((after_parsed, shape, warnings))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_edit(
+    file: &Path,
+    mode: Mode,
+    content: &Option<String>,
+    content_file: &Option<PathBuf>,
+    old_text: &Option<String>,
+    new_text: &Option<String>,
+    handle_opt: &Option<String>,
+    dry_run: bool,
+    strict: bool,
+    repair: bool,
+    format_content: bool,
+) -> Result<Output, Fail> {
+    let (bytes, had_bom) = read_file(file)?;
+    let parsed = parse_or_fail(&bytes, "file")?;
+    let before_forms = parsed.forms.clone();
+
+    // Target (SPEC §5/§10.3): --handle for replace/patch/delete/
+    // insert-before/insert-after; append and prepend are file-level and
+    // take no target.
+    let (handle_node, handle_stripped) =
+        resolve_edit_target(&bytes, mode, handle_opt, file)?;
+
+    // Notes accumulate here (marker-strip / reindent).
+    let mut notes: Vec<String> = Vec::new();
+    if handle_stripped {
+        notes.push(
+            "stripped \u{27E6}…\u{27E7} view markers from the handle".to_string(),
+        );
+    }
+
+    // Payload: whole-form content (normalized/repaired) or a surgical patch
+    // scoped to the target node's bytes (no repair — patch is exact).
+    let payload: Option<Payload> = match mode {
+        Mode::Delete => None,
+        Mode::Patch => {
+            Some(build_patch_payload(
+                &bytes, old_text, new_text, handle_node.as_ref(), &mut notes,
+            )?)
+        }
+        _ => Some(build_prepared_payload(
+            mode, content, content_file, handle_node.as_ref(), &bytes, strict, repair,
+            format_content, &mut notes,
+        )?),
+    };
+
+    // Splice + allowed-change window + actual splice window (lo, hi).
+    let (sp, allowed, mut bound) =
+        plan_splice(mode, &bytes, &before_forms, handle_node.as_ref(), &payload);
+
+    let mut new_bytes = splice::apply(&bytes, &before_forms, &sp);
+
+    // R3 seam (issue 14, delete): a delete that leaves only the displaced
+    // parent closers on its anchor's line pulls them onto the previous
+    // content line — the paren trail's own semantics at the seam, confined
+    // to the deleted node's line tail. Best-effort: if the pull would break
+    // the parse (closers landing inside a multi-line string), the original
+    // splice is kept.
+    if mode == Mode::Delete && handle_node.is_some() {
+        let (start, end) = bound;
+        if let Some(window) = seam::pull_displaced_closers(&bytes, &mut new_bytes, start, end) {
+            if parser::parse(&new_bytes).is_ok() {
+                bound = window;
+            } else {
+                new_bytes = splice::apply(&bytes, &before_forms, &sp);
+            }
+        }
+    }
+
+    // Verification tail: boundary proof, post-splice parse, untouched
+    // forms, strict detector gate.
+    let (after_parsed, shape, warnings) = verify_edit(
+        &bytes,
+        &new_bytes,
+        &before_forms,
+        handle_node.as_ref(),
+        bound,
+        &allowed,
+        strict,
+    )?;
+
+    // No-op detection.
+    match (&payload, mode) {
+        (Some(Payload::Prepared(p)), Mode::Replace) => {
+            let new_text = String::from_utf8_lossy(&new_bytes).to_string();
+            let old_text = String::from_utf8_lossy(&bytes).to_string();
+            if new_text == old_text && !p.repaired {
+                notes.push("no-op: content identical to the target form".to_string());
+            }
+        }
+        (Some(Payload::Patch { noop: true, .. }), _) => {
+            notes.push("no-op: --new-text equals --old-text".to_string());
+        }
+        _ => {}
+    }
+
     // Repair visibility.
     if let Some(Payload::Prepared(p)) = &payload {
         notes.extend(p.notes.clone());
@@ -1749,13 +1820,13 @@ fn run_edit(
 
     // Summary of what sits at the target after the op.
     let (summary, summary_notes) = if let Some(node) = handle_node.as_ref() {
-        build_handle_summary(mode, node, &bytes, &new_bytes, &payload, bound)
+        summary::build_handle_summary(mode, node, &bytes, &new_bytes, &payload, bound)
     } else {
-        (append_prepend_summary(&after_parsed, &allowed), Vec::new())
+        (summary::append_prepend_summary(&after_parsed, &allowed), Vec::new())
     };
     notes.extend(summary_notes);
 
-    let mut text = human_summary(&summary, &shape);
+    let mut text = summary::human_summary(&summary, &shape);
     match &payload {
         Some(Payload::Prepared(p)) if p.repaired && !p.repair_diff.is_empty() => {
             text.push('\n');
@@ -1808,372 +1879,18 @@ fn run_edit(
     )
 }
 
-/// The single note emitted when `⟦…⟧` view markers are stripped from
-/// submitted text (SPEC §10.4: view markers never reach the file).
-const STRIPPED_VIEW_MARKERS_NOTE: &str =
-    "stripped ⟦…⟧ view markers from the submitted text";
 
-/// §10.4: strip `⟦…⟧` view markers from submitted text; reports whether
-/// anything was removed.
-fn strip_view_markers(text: &str) -> (String, bool) {
-    let stripped = handle::strip(text);
-    let changed = stripped != text;
-    (stripped, changed)
-}
 
-/// Strip `⟦…⟧` view markers from submitted text and record the strip in
-/// `notes` if anything was removed. The note is pushed at most once per
-/// edit, even when several submitted texts (a patch's old- and new-text)
-/// are stripped.
-fn strip_view_markers_into(text: &str, notes: &mut Vec<String>) -> String {
-    let (stripped, gone) = strip_view_markers(text);
-    if gone && !notes.iter().any(|n| n == STRIPPED_VIEW_MARKERS_NOTE) {
-        notes.push(STRIPPED_VIEW_MARKERS_NOTE.to_string());
-    }
-    stripped
-}
 
-/// Base-shift reindent for the `--handle` replace/patch/inline-insert
-/// path: the caller sends an isolated form (any indentation); land it at
-/// the splice column. Dedent the content by its common leading whitespace
-/// across non-blank lines, emit line 0 with no leading whitespace (it
-/// lands at the splice point, after the existing line prefix) and prefix
-/// every later line with `target_col` spaces. Whitespace-only and
-/// deterministic; both a caller-indented and a flat block normalize to the
-/// same result.
-fn reindent_to_column(content: &str, target_col: usize) -> (String, bool) {
-    let out = reindent_prefix(&reindent_dedent_by(content, content), target_col, false);
-    let changed = out != content;
-    (out, changed)
-}
 
-/// Block reindent for `--handle` inserts whose splice introduces a line
-/// break (nested insert-after; nested insert-before whose anchor starts
-/// its line): the form lands on its own line(s), so line 0 no longer rides
-/// on the existing line prefix and EVERY line — line 0 included — is
-/// prefixed with `target_col` spaces after the same common-whitespace
-/// dedent as `reindent_to_column`, whose line-0 continuation is only right
-/// while no line break is inserted.
-/// NOTE: on the `--handle` path the dedent is applied AFTER
-/// `content::prepare` (inference must not depend on the dedent — issue
-/// 12) and this prefix stage runs AFTER prepare (and after the parinfer
-/// reindent): insert-after gets the leading newline prepended,
-/// insert-before rides line 0 on the anchor's existing line prefix and
-/// gets only the trailing newline + pad appended, so the final lines
-/// equal this result (the internal dedent is a no-op on already-dedented
-/// content).
-fn reindent_block(content: &str, target_col: usize) -> (String, bool) {
-    let out = reindent_prefix(&reindent_dedent_by(content, content), target_col, true);
-    let changed = out != content;
-    (out, changed)
-}
 
-/// Base-shift dedent: the common leading whitespace is computed from the
-/// submitted content and shed from each prepared line. With
-/// `submitted == prepared` this is the plain dedent of the content itself
-/// (the common leading whitespace across non-blank lines, line 0 included);
-/// otherwise it runs AFTER inference (issue 12) — line 0 may already have
-/// lost its pad to prepare's edge trim (and the repair never adds leading
-/// whitespace), and blank lines shorter than the common indent are kept
-/// verbatim — so each line sheds at most what it still carries.
-/// Whitespace-only and deterministic; both a caller-indented and a flat
-/// block normalize to the same result.
-fn reindent_dedent_by(submitted: &str, prepared: &str) -> String {
-    let common = common_indent(submitted);
-    if common.is_empty() {
-        return prepared.to_string();
-    }
-    let mut lines: Vec<&str> = prepared.split('\n').collect();
-    // A trailing newline does not create a phantom final line.
-    let trailing_nl = lines.last().copied().unwrap_or("").is_empty();
-    if trailing_nl {
-        lines.pop();
-    }
-    let out_lines: Vec<String> = lines
-        .iter()
-        .map(|l| {
-            let ws = l.bytes().take_while(|&b| b == b' ' || b == b'\t').count();
-            if ws >= common.len() {
-                l[common.len()..].to_string()
-            } else {
-                l.to_string()
-            }
-        })
-        .collect();
-    let mut out = out_lines.join("\n");
-    if trailing_nl {
-        out.push('\n');
-    }
-    out
-}
 
-/// The common leading whitespace across the non-blank lines of `content`
-/// (a trailing newline does not create a phantom final line).
-fn common_indent(content: &str) -> String {
-    let mut lines: Vec<&str> = content.split('\n').collect();
-    let trailing_nl = lines.last().copied().unwrap_or("").is_empty();
-    if trailing_nl {
-        lines.pop();
-    }
-    if lines.is_empty() || lines.iter().all(|l| is_blank_line(l)) {
-        return String::new();
-    }
-    let mut common: Option<String> = None;
-    for l in &lines {
-        if is_blank_line(l) {
-            continue;
-        }
-        let indent: String = l.bytes().take_while(|&b| b == b' ' || b == b'\t').map(char::from).collect();
-        common = Some(match common {
-            None => indent,
-            Some(c) => {
-                let n = c.bytes().zip(indent.bytes()).take_while(|(a, b)| a == b).count();
-                c[..n].to_string()
-            }
-        });
-    }
-    common.unwrap_or_default()
-}
 
-/// Base-shift prefix stage: prefix every line — or every line after line 0,
-/// which lands bare at the splice point — with `target_col` spaces.
-/// Whitespace-only and deterministic. Runs on the prepared, parinfer-
-/// reindented content, so it owns the final columns.
-fn reindent_prefix(content: &str, target_col: usize, prefix_first_line: bool) -> String {
-    let mut lines: Vec<&str> = content.split('\n').collect();
-    // A trailing newline does not create a phantom final line.
-    let trailing_nl = lines.last().copied().unwrap_or("").is_empty();
-    if trailing_nl {
-        lines.pop();
-    }
-    let out = if lines.is_empty() || lines.iter().all(|l| is_blank_line(l)) {
-        content.to_string()
-    } else {
-        let prefix = " ".repeat(target_col);
-        let mut out_lines = Vec::with_capacity(lines.len());
-        for (i, l) in lines.iter().enumerate() {
-            out_lines.push(if i == 0 && !prefix_first_line {
-                l.to_string()
-            } else {
-                format!("{prefix}{l}")
-            });
-        }
-        let mut out = out_lines.join("\n");
-        if trailing_nl {
-            out.push('\n');
-        }
-        out
-    };
-    out
-}
 
-fn is_blank_line(l: &str) -> bool {
-    l.bytes().all(|b| b == b' ' || b == b'\t' || b == b'\r')
-}
 
-/// Issue 14 R3 (the delete seam): when a delete leaves only the displaced
-/// parent closers on its tail line (whitespace + a run of closers), the
-/// file would be left unformatted — a closer line the format pass lifts.
-/// The pull is paren-trail semantics at the seam, confined to the deleted
-/// node's line tail: a single-line node whose line is otherwise bare moves
-/// the closers up onto the previous content line; otherwise (content before
-/// the node on the line, or a multi-line node) the closers land at the end
-/// of the node's start line, which is the spliced tail line. Best-effort:
-/// the caller re-parses and reverts on failure (e.g. the closers would
-/// land inside a multi-line string). Returns the changed window (lo, hi) in
-/// original-byte coordinates when it fired.
-fn pull_displaced_closers(bytes: &[u8], new_bytes: &mut Vec<u8>, start: usize, end: usize) -> Option<(usize, usize)> {
-    // All geometry is on the ORIGINAL bytes: the splice deletes
-    // [start, end), so in `new_bytes` everything from `end` on sits shifted
-    // left by `end - start`.
-    let shift = end - start;
-    let end_line_start = bytes[..end].iter().rposition(|&b| b == b'\n').map_or(0, |p| p + 1);
-    let end_line_end = bytes[end..]
-        .iter()
-        .position(|&b| b == b'\n')
-        .map(|p| end + p)
-        .unwrap_or(bytes.len());
-    let tail = &bytes[end..end_line_end];
-    let closers: Vec<u8> = tail.iter().copied().filter(|b| matches!(b, b')' | b']' | b'}')).collect();
-    // Only whitespace plus a run of closers — the displaced parent closers
-    // and nothing else on the tail line.
-    if closers.is_empty()
-        || !tail
-            .iter()
-            .all(|b| matches!(b, b' ' | b'\t' | b')' | b']' | b'}'))
-    {
-        return None;
-    }
-    let stop_orig = (end_line_end + 1).min(bytes.len());
-    let start_line_start =
-        bytes[..start].iter().rposition(|&b| b == b'\n').map_or(0, |p| p + 1);
-    if start_line_start == end_line_start {
-        // Single-line node on a bare line (only indent before it): the
-        // spliced tail line would hold the closers alone — lift them onto
-        // the previous content line. The previous line must carry content
-        // and not be a comment: landing the closers in a comment line
-        // would comment them out (and the pull would not be a no-op for
-        // `format`).
-        if start_line_start == 0 {
-            return None; // nothing above the anchor's line to lift onto
-        }
-        let pad = &bytes[start_line_start..start];
-        if pad.iter().all(|b| matches!(b, b' ' | b'\t')) {
-            let prev_nl = start_line_start - 1; // newline ending the previous line
-            let prev_start =
-                bytes[..prev_nl].iter().rposition(|&b| b == b'\n').map_or(0, |p| p + 1);
-            let prev = &bytes[prev_start..prev_nl];
-            let first = prev.iter().find(|b| !matches!(b, b' ' | b'\t'));
-            if !matches!(first, Some(b) if *b != b';') {
-                return None;
-            }
-            new_bytes.splice(prev_nl..stop_orig - shift, closers.iter().copied());
-            return Some((prev_nl, stop_orig));
-        }
-    }
-    // Content before the node on its line (single- or multi-line node):
-    // land the closers at the end of the node's start line — the spliced
-    // tail line — where they follow real content.
-    new_bytes.splice(start..stop_orig - shift, closers.iter().copied());
-    Some((start, stop_orig))
-}
 
-/// Drop trailing whitespace-only lines from `text` (issue 14 R3, the seam
-/// guarantee): the base-shifted content must end on a real content line so
-/// the closers displaced by the splice land on it, not on their own padded
-/// line. Whitespace-only; a file-internal line structure is untouched.
-fn trim_trailing_blank_lines(text: &str) -> String {
-    let lines: Vec<&str> = text.split('\n').collect();
-    let mut end = lines.len();
-    while end > 0 && is_blank_line(lines[end - 1]) {
-        end -= 1;
-    }
-    if end == lines.len() {
-        text.to_string()
-    } else {
-        lines[..end].join("\n")
-    }
-}
 
-/// Summary of the file-edge insert (append/prepend, the only target-less
-/// edit modes): what now sits at the edge.
-fn append_prepend_summary(
-    after_parsed: &parser::Parsed,
-    allowed: &invariants::Allowed,
-) -> serde_json::Value {
-    let (at, n) = match allowed {
-        invariants::Allowed::Insert { at, n } => (*at, *n),
-        _ => unreachable!("append/prepend carry the Insert window"),
-    };
-    let inserted: Vec<serde_json::Value> = after_parsed.forms[at - 1..at - 1 + n]
-        .iter()
-        .map(|f| {
-            serde_json::json!({
-                "addr": f.addr, "kind": f.kind, "name": f.name, "line": f.line,
-            })
-        })
-        .collect();
-    serde_json::json!({
-        "action": "inserted",
-        "at": at,
-        "forms": inserted,
-    })
-}
 
-/// Summary of the `--handle` path: where the node sits in the new file and
-/// the new handle(s). Handle computation is best-effort — when it cannot be
-/// computed the field is omitted and a note is added; the edit never fails
-/// over it.
-fn build_handle_summary(
-    mode: Mode,
-    node: &handle::Node,
-    bytes: &[u8],
-    new_bytes: &[u8],
-    payload: &Option<Payload>,
-    bound: (usize, usize),
-) -> (serde_json::Value, Vec<String>) {
-    let mut notes: Vec<String> = Vec::new();
-    let new_nodes = handle::collect(new_bytes);
-    let at_path = new_nodes.iter().find(|n| n.path == node.path);
-    match mode {
-        Mode::Replace | Mode::Patch => {
-            let line = at_path.map(|n| n.line).unwrap_or(node.line);
-            let mut summary = serde_json::json!({
-                "action": if mode == Mode::Replace { "replaced" } else { "patched" },
-                "kind": node.kind,
-                "name": node.name,
-                "head": node.head,
-                "line": line,
-                "wasKind": node.kind,
-                "wasLine": node.line,
-                "wasHandle": node.handle,
-            });
-            match at_path {
-                Some(n) => {
-                    summary["handle"] = serde_json::json!(n.handle);
-                }
-                None => notes.push(
-                    "could not compute the new handle at the same path; re-run tree".to_string(),
-                ),
-            }
-            if mode == Mode::Replace {
-                if let Some(Payload::Prepared(p)) = payload {
-                    summary["contentForms"] = serde_json::json!(p.forms);
-                }
-            }
-            (summary, notes)
-        }
-        Mode::Delete => (
-            serde_json::json!({
-                "action": "deleted",
-                "wasKind": node.kind,
-                "name": node.name,
-                "head": node.head,
-                "lineBefore": node.line,
-                "wasHandle": node.handle,
-            }),
-            notes,
-        ),
-        Mode::InsertBefore | Mode::InsertAfter => {
-            // The inserted span in the new file: for an insert the bound
-            // window is (pos, pos) at the actual insert position — which
-            // for a top-level insert-after can sit past node.end_byte — and
-            // the splice is pure, so the position is the same offset in
-            // both files.
-            let anchor = bound.0;
-            let content_len = new_bytes.len() - anchor - (bytes.len() - bound.1);
-            let inserted: Vec<&handle::Node> = new_nodes
-                .iter()
-                .filter(|n| n.start_byte >= anchor && n.start_byte < anchor + content_len)
-                .collect();
-            let handles: Vec<String> = inserted.iter().map(|n| n.handle.clone()).collect();
-            // Line span of the inserted content (min start .. max end over the
-            // inserted nodes); internal to the human/JSON view, not a path.
-            let line: [usize; 2] = if inserted.is_empty() {
-                node.line
-            } else {
-                let lo = inserted.iter().map(|n| n.line[0]).min().unwrap();
-                let hi = inserted.iter().map(|n| n.line[1]).max().unwrap();
-                [lo, hi]
-            };
-            let mut summary = serde_json::json!({
-                "action": "inserted",
-                "side": if mode == Mode::InsertBefore { "before" } else { "after" },
-                "wasHandle": node.handle,
-                "line": line,
-            });
-            if handles.is_empty() {
-                notes.push("could not compute handles for the inserted form(s)".to_string());
-            } else {
-                summary["handles"] = serde_json::json!(handles);
-            }
-            (summary, notes)
-        }
-        Mode::Append | Mode::Prepend => {
-            unreachable!("append/prepend are refused for --handle")
-        }
-    }
-}
 
 /// All byte offsets where `needle` occurs in `haystack` (overlapping not
 /// expected for text patches; non-overlapping scan is correct here).
@@ -2198,129 +1915,9 @@ fn find_all(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
     out
 }
 
-fn human_summary(summary: &serde_json::Value, shape: &invariants::ShapeCheck) -> String {
-    // The --handle summaries carry the target's handle, never a path — a path
-    // is not addressable (there is no `--path`/`--addr`), so it stays internal.
-    // Render the handle plus a semantic label instead.
-    if summary.get("wasHandle").is_some() {
-        return match summary["action"].as_str().unwrap_or("") {
-            "replaced" | "patched" => {
-                let handle = summary["handle"]
-                    .as_str()
-                    .unwrap_or_else(|| summary["wasHandle"].as_str().unwrap_or(""));
-                let kind = summary["kind"].as_str().unwrap_or("form");
-                format!(
-                    "{} form \u{27E6}{}\u{27E7} {} (lines {}–{}) — {} changed, {} untouched",
-                    summary["action"].as_str().unwrap_or(""),
-                    handle,
-                    handle_label(summary, kind),
-                    summary["line"][0],
-                    summary["line"][1],
-                    shape.changed,
-                    shape.untouched
-                )
-            }
-            "deleted" => format!(
-                "deleted form \u{27E6}{}\u{27E7} {} (was lines {}–{}) — {} untouched",
-                summary["wasHandle"].as_str().unwrap_or(""),
-                handle_label(summary, "form"),
-                summary["lineBefore"][0],
-                summary["lineBefore"][1],
-                shape.untouched
-            ),
-            "inserted" => format!(
-                "inserted form(s) {} the form \u{27E6}{}\u{27E7} (lines {}–{}) — {} untouched",
-                summary["side"].as_str().unwrap_or(""),
-                summary["wasHandle"].as_str().unwrap_or(""),
-                summary["line"][0],
-                summary["line"][1],
-                shape.untouched
-            ),
-            _ => String::new(),
-        };
-    }
-    let action = summary["action"].as_str().unwrap_or("");
-    match action {
-        "replaced" => {
-            let was = match (&summary["wasKind"], &summary["wasName"]) {
-                (k, n) if !k.is_null() && !n.is_null() => {
-                    format!(" (was {} {n})", k.as_str().unwrap_or(""))
-                }
-                (k, _) if !k.is_null() => format!(" (was {})", k.as_str().unwrap_or("")),
-                _ => String::new(),
-            };
-            format!(
-                "replaced form {} {}{was} at lines {}–{} — {} changed, {} untouched",
-                summary["addr"],
-                label(summary),
-                summary["line"][0],
-                summary["line"][1],
-                shape.changed,
-                shape.untouched
-            )
-        }
-        "deleted" => format!(
-            "deleted form {} {} (was lines {}–{}) — {} untouched",
-            summary["addr"],
-            label(summary),
-            summary["lineBefore"][0],
-            summary["lineBefore"][1],
-            shape.untouched
-        ),
-        "patched" => format!(
-            "patched form {} {} at lines {}–{} — {} changed, {} untouched",
-            summary["addr"],
-            label(summary),
-            summary["line"][0],
-            summary["line"][1],
-            shape.changed,
-            shape.untouched
-        ),
-        "inserted" => format!(
-            "inserted {} form(s) at addr {} — {} untouched",
-            summary["forms"].as_array().map(|a| a.len()).unwrap_or(0),
-            summary["at"],
-            shape.untouched
-        ),
-        _ => String::new(),
-    }
-}
 
-fn label(summary: &serde_json::Value) -> String {
-    let kind = summary["kind"].as_str().unwrap_or("form");
-    match summary["name"].as_str() {
-        Some(n) => format!("{kind} {n}"),
-        None => kind.to_string(),
-    }
-}
 
-/// The semantic label for a `--handle` summary: the node's name, else its
-/// head (the leading symbol of a list form), else the mode's kind fallback —
-/// the node's kind for replace/patch, or "form" for delete, whose summary
-/// carries no `kind` key.
-fn handle_label(summary: &serde_json::Value, kind_fallback: &str) -> String {
-    if let Some(n) = summary["name"].as_str() {
-        return n.to_string();
-    }
-    if let Some(h) = summary["head"].as_str() {
-        return h.to_string();
-    }
-    kind_fallback.to_string()
-}
 
-fn forms_output(
-    op: &'static str,
-    file: &Path,
-    bytes: &[u8],
-    forms: Vec<Form>,
-    warnings: Vec<invariants::DetectorWarning>,
-) -> Output {
-    Output::ok(op)
-        .file(Some(file.display().to_string()))
-        .file_hash(hashutil::tagged(&hashutil::file_hash(bytes)))
-        .forms(forms)
-        .warnings(warnings)
-}
 
 #[cfg(test)]
 mod tests {
