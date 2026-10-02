@@ -70,3 +70,13 @@ Both reported silent-corruption modes DO NOT reproduce (repros in /tmp/repro17):
   — including 1500 fuzz drafts + independent Python reader validator.
 - Filed: issue-18 (C-1), issue-19 (F-1), issue-20 (F-2), issue-21 (P-1).
   F-3 recorded as minor (message wording on an unreachable-by-tree path).
+## T13 (re-break of fixed build) — 5/5 old repros PASS; 3 new findings (S1/M1/C1, all confirmed by me)
+- Fix validation: C-1/F-1/F-2/F-3/P-1 all hold under direct re-attack;
+  detector fuzz (3700 docs, old vs new) zero divergence; 3200-edit battery:
+  0 crashes, 0 unparsable writes, 0 untouched-form corruption.
+- S1/M1/C1 filed as issues 23/24/25. Note C1's EOF-newline geometry quirk.
+- UX: nested-handle discovery requires python one-liners over tree JSON
+  (no path, index-based); a --name-addressed nested delete or stable
+  nested addressing would remove recurring friction. printf escaping for
+  byte-exact content error-prone; content-file + documented exact-bytes
+  recipe preferred.
