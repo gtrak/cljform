@@ -59,3 +59,14 @@ Both reported silent-corruption modes DO NOT reproduce (repros in /tmp/repro17):
   autoFormat:false for pre-balanced content) remain sensible belt-and-braces,
   and the next-handle affordance makes the re-get cheap. Kept as guidance,
   not requirements.
+## T12 (break-it hunt) — ~2400 invocations. A/B/D/E clean; C-1, F-1, F-2, F-3, P-1 CONFIRMED by me
+- All five repros re-run independently: C-1 (od shows mixed endings; format
+  diff real — my first grep was wrong: diff is embedded in single-line JSON),
+  F-1 (head "defn" vs forms kind "let"), F-2 (materialize-error on a string
+  interior ")"), F-3 (pure content hash across dups -> lying stale-handle),
+  P-1 (35.8s/39.2s at 50k depth).
+- Core guarantees HELD: never-unparsable (A), untouched-form integrity (B),
+  repair never writes wrong structure (D), exit codes/envelopes/no panics (E)
+  — including 1500 fuzz drafts + independent Python reader validator.
+- Filed: issue-18 (C-1), issue-19 (F-1), issue-20 (F-2), issue-21 (P-1).
+  F-3 recorded as minor (message wording on an unreachable-by-tree path).
