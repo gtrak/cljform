@@ -147,7 +147,7 @@ pub fn prepare(
     //    it (issue 12). `strict` + `repair` refuses (strict wins); with
     //    `repair` the candidate is applied; without it the refusal carries
     //    the candidate + diff it would have applied.
-    match materialize::indent_mode_full(&text) {
+    match materialize::indent_mode(&text) {
         Err(e) => Err(PrepareError::Materialize(e)),
         Ok(cand) if cand == text => Err(PrepareError::Unparseable(
             parser::parse(text.as_bytes()).expect_err("parse failed above"),

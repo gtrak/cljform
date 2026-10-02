@@ -23,11 +23,6 @@ struct OpenParen {
 /// Infer brackets from indentation. Returns the candidate text. The
 /// `edit` repair path calls this same inference; the `materialize` op
 /// wraps it with its candidate/diff envelope.
-pub fn indent_mode_full(draft: &str) -> Result<String, MaterializeError> {
-    indent_mode(draft)
-}
-
-/// Infer brackets from indentation. Returns the candidate text.
 pub fn indent_mode(draft: &str) -> Result<String, MaterializeError> {
     let mut lines: Vec<String> = draft.split('\n').map(str::to_string).collect();
     let trailing_newline = draft.ends_with('\n');

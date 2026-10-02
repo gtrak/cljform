@@ -26,6 +26,25 @@ use serde::Serialize;
 
 use parser::Form;
 
+/// Process exit codes (SPEC §4.1 exit table); the wrapper branches on these.
+mod exit {
+    /// Success (including a clean `--dry-run`).
+    pub const OK: u8 = 0;
+    /// Parse/structure error: `parse-error`, `not-one-form`,
+    /// `truncated-content`, `shape-violation`, `detector-fatal`,
+    /// `annotate-conflict`, `materialize-error`, `format-error`.
+    pub const PARSE: u8 = 1;
+    /// Usage error: bad args, target required but missing, handle shorter
+    /// than 6 chars, `--handle` with append/prepend.
+    pub const USAGE: u8 = 2;
+    /// Targeting/refusal: `form-not-found`, `ambiguous`, `stale-handle`,
+    /// `ambiguous-handle`, `patch-not-found`, `patch-ambiguous`,
+    /// `unbalanced-content`, `repair-refused`.
+    pub const TARGET: u8 = 3;
+    /// I/O failure (file/stdin read, stdout/file write).
+    pub const IO: u8 = 4;
+}
+
 #[derive(ClapParser)]
 #[command(name = "cljform", version, about = "Form-addressed Clojure editing")]
 struct Cli {
@@ -204,6 +223,97 @@ struct ErrorBody {
     suggestions: Option<Vec<Suggestion>>,
 }
 
+impl Output {
+    /// A successful envelope with only `op` set; the builder methods below
+    /// fill in the fields an op actually carries (the rest stay empty).
+    fn ok(op: &'static str) -> Self {
+        Self {
+            ok: true,
+            op,
+            file: None,
+            file_hash: None,
+            forms: None,
+            result: None,
+            warnings: None,
+            notes: None,
+            error: None,
+        }
+    }
+
+    /// A failed envelope: `ok: false` with the error body and every other
+    /// field empty (the failure path never carries results).
+    fn fail(op: &'static str, error: ErrorBody) -> Self {
+        Self {
+            ok: false,
+            op,
+            error: Some(error),
+            ..Self::ok(op)
+        }
+    }
+
+    fn file(mut self, file: Option<String>) -> Self {
+        self.file = file;
+        self
+    }
+
+    fn file_hash(mut self, file_hash: String) -> Self {
+        self.file_hash = Some(file_hash);
+        self
+    }
+
+    fn forms(mut self, forms: Vec<Form>) -> Self {
+        self.forms = Some(forms);
+        self
+    }
+
+    fn result(mut self, result: serde_json::Value) -> Self {
+        self.result = Some(result);
+        self
+    }
+
+    fn warnings(mut self, warnings: Vec<invariants::DetectorWarning>) -> Self {
+        self.warnings = Some(warnings);
+        self
+    }
+
+    fn notes(mut self, notes: Vec<String>) -> Self {
+        self.notes = Some(notes);
+        self
+    }
+}
+
+impl ErrorBody {
+    /// A new error body at no position, with no hint and no suggestions;
+    /// the chainable methods below attach what a site actually has.
+    fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            line: None,
+            col: None,
+            message: message.into(),
+            hint: None,
+            suggestions: None,
+        }
+    }
+
+    /// Attach the line/col position (either may be absent).
+    fn at(mut self, line: Option<usize>, col: Option<usize>) -> Self {
+        self.line = line;
+        self.col = col;
+        self
+    }
+
+    fn with_hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
+        self
+    }
+
+    fn with_suggestions(mut self, suggestions: Vec<Suggestion>) -> Self {
+        self.suggestions = Some(suggestions);
+        self
+    }
+}
+
 /// Internal error carrier: (exit code, error body).
 struct Fail(u8, ErrorBody);
 
@@ -227,7 +337,7 @@ fn main() -> ExitCode {
     match dispatch(&cli) {
         Ok(out) => {
             print_envelope(&out, json);
-            ExitCode::from(0)
+            ExitCode::from(exit::OK)
         }
         Err(Fail(exit, ebody)) => fail_envelope(exit, ebody, op_name, json),
     }
@@ -236,18 +346,7 @@ fn main() -> ExitCode {
 /// Failure path shared by the envelope ops and `strip`: one JSON object
 /// (or the human error line) and the op's exit code.
 fn fail_envelope(exit: u8, ebody: ErrorBody, op: &'static str, json: bool) -> ExitCode {
-    let out = Output {
-        ok: false,
-        op,
-        file: None,
-        file_hash: None,
-        forms: None,
-        result: None,
-        warnings: None,
-        notes: None,
-        error: Some(ebody),
-    };
-    print_envelope(&out, json);
+    print_envelope(&Output::fail(op, ebody), json);
     ExitCode::from(exit)
 }
 
@@ -256,32 +355,22 @@ fn fail_envelope(exit: u8, ebody: ErrorBody, op: &'static str, json: bool) -> Ex
 /// Read errors use the normal io error (exit 4).
 fn run_strip(file: &Option<PathBuf>, json: bool) -> ExitCode {
     let text: Result<String, Fail> = match file {
-        Some(p) => std::fs::read_to_string(p).map_err(|e| Fail(
-            4,
-            ErrorBody {
-                code: "io",
-                line: None,
-                col: None,
-                message: format!("cannot read {}: {e}", p.display()),
-                hint: None,
-                suggestions: None,
-            },
-        )),
+        Some(p) => std::fs::read_to_string(p).map_err(|e| {
+            Fail(
+                exit::IO,
+                ErrorBody::new("io", format!("cannot read {}: {e}", p.display())),
+            )
+        }),
         None => {
             let mut buf = String::new();
             std::io::stdin()
                 .read_to_string(&mut buf)
-                .map_err(|e| Fail(
-                    4,
-                    ErrorBody {
-                        code: "io",
-                        line: None,
-                        col: None,
-                        message: format!("cannot read stdin: {e}"),
-                        hint: None,
-                        suggestions: None,
-                    },
-                ))
+                .map_err(|e| {
+                    Fail(
+                        exit::IO,
+                        ErrorBody::new("io", format!("cannot read stdin: {e}")),
+                    )
+                })
                 .map(|_| buf)
         }
     };
@@ -291,17 +380,10 @@ fn run_strip(file: &Option<PathBuf>, json: bool) -> ExitCode {
             let out = handle::strip(&t);
             let mut stdout = std::io::stdout().lock();
             match stdout.write_all(out.as_bytes()).and_then(|_| stdout.flush()) {
-                Ok(()) => ExitCode::from(0),
+                Ok(()) => ExitCode::from(exit::OK),
                 Err(e) => fail_envelope(
-                    4,
-                    ErrorBody {
-                        code: "io",
-                        line: None,
-                        col: None,
-                        message: format!("write failed: {e}"),
-                        hint: None,
-                        suggestions: None,
-                    },
+                    exit::IO,
+                    ErrorBody::new("io", format!("write failed: {e}")),
                     "strip",
                     json,
                 ),
@@ -337,6 +419,16 @@ fn print_envelope(out: &Output, json: bool) {
         return;
     }
     print_human(out);
+}
+
+/// Print a payload verbatim to stdout, adding a trailing newline only when
+/// the payload does not end with one (the exact-bytes guarantee: payloads
+/// that already end in a newline are printed untouched).
+fn print_payload(text: &str) {
+    print!("{text}");
+    if !text.ends_with('\n') {
+        println!();
+    }
 }
 
 fn print_human(out: &Output) {
@@ -393,27 +485,18 @@ fn print_human(out: &Output) {
             }
             println!("{header}");
             if let Some(form) = r.get("form").and_then(|v| v.as_str()) {
-                print!("{form}");
-                if !form.ends_with('\n') {
-                    println!();
-                }
+                print_payload(form);
             }
         }
     } else if out.op == "materialize" || out.op == "format" {
         // The candidate (and its diff) are the payload; the note goes in notes.
         if let Some(r) = &out.result {
             if let Some(cand) = r.get("candidate").and_then(|v| v.as_str()) {
-                print!("{cand}");
-                if !cand.ends_with('\n') {
-                    println!();
-                }
+                print_payload(cand);
             }
             if let Some(diff) = r.get("diff").and_then(|v| v.as_str()) {
                 if !diff.is_empty() {
-                    print!("{diff}");
-                    if !diff.ends_with('\n') {
-                        println!();
-                    }
+                    print_payload(diff);
                 }
             }
         }
@@ -437,10 +520,7 @@ fn print_human(out: &Output) {
         }
         if let Some(r) = &out.result {
             if let Some(text) = r.get("text").and_then(|t| t.as_str()) {
-                print!("{text}");
-                if !text.ends_with('\n') {
-                    println!();
-                }
+                print_payload(text);
             }
         }
     }
@@ -460,17 +540,12 @@ fn print_human(out: &Output) {
 /// every downstream op works on stripped bytes and the write path re-prepends
 /// the BOM so the on-disk encoding is preserved.
 fn read_file(path: &Path) -> Result<(Vec<u8>, bool), Fail> {
-    let raw = std::fs::read(path).map_err(|e| Fail(
-        4,
-        ErrorBody {
-            code: "io",
-            line: None,
-            col: None,
-            message: format!("cannot read {}: {e}", path.display()),
-            hint: None,
-            suggestions: None,
-        },
-    ))?;
+    let raw = std::fs::read(path).map_err(|e| {
+        Fail(
+            exit::IO,
+            ErrorBody::new("io", format!("cannot read {}: {e}", path.display())),
+        )
+    })?;
     const BOM: &[u8] = b"\xef\xbb\xbf";
     if raw.starts_with(BOM) {
         Ok((raw[3..].to_vec(), true))
@@ -491,20 +566,16 @@ fn with_bom(bytes: &[u8], had_bom: bool) -> Vec<u8> {
 }
 
 fn parse_or_fail(bytes: &[u8], what: &str) -> Result<parser::Parsed, Fail> {
-    parser::parse(bytes).map_err(|e| Fail(
-        1,
-        ErrorBody {
-            code: "parse-error",
-            line: Some(e.line),
-            col: Some(e.col),
-            message: format!("{what} does not parse: {}", e.message),
-            hint: Some(
-                "fix the bracket structure first; cljform never writes to a file that does not parse"
-                    .into(),
-            ),
-            suggestions: None,
-        },
-    ))
+    parser::parse(bytes).map_err(|e| {
+        Fail(
+            exit::PARSE,
+            ErrorBody::new("parse-error", format!("{what} does not parse: {}", e.message))
+                .at(Some(e.line), Some(e.col))
+                .with_hint(
+                    "fix the bracket structure first; cljform never writes to a file that does not parse",
+                ),
+        )
+    })
 }
 
 /// Read content from --content, --content-file, or stdin.
@@ -516,30 +587,24 @@ fn read_content(
         return Ok(c.clone());
     }
     if let Some(p) = content_file {
-        return std::fs::read_to_string(p).map_err(|e| Fail(
-            4,
-            ErrorBody {
-                code: "io",
-                line: None,
-                col: None,
-                message: format!("cannot read content file {}: {e}", p.display()),
-                hint: None,
-                suggestions: None,
-            },
-        ));
+        return std::fs::read_to_string(p).map_err(|e| {
+            Fail(
+                exit::IO,
+                ErrorBody::new(
+                    "io",
+                    format!("cannot read content file {}: {e}", p.display()),
+                ),
+            )
+        });
     }
     let mut buf = String::new();
-    std::io::stdin().read_to_string(&mut buf).map_err(|e| Fail(
-        4,
-        ErrorBody {
-            code: "io",
-            line: None,
-            col: None,
-            message: format!("cannot read stdin: {e}"),
-            hint: Some("pass --content or --content-file when stdin is unavailable".into()),
-            suggestions: None,
-        },
-    ))?;
+    std::io::stdin().read_to_string(&mut buf).map_err(|e| {
+        Fail(
+            exit::IO,
+            ErrorBody::new("io", format!("cannot read stdin: {e}"))
+                .with_hint("pass --content or --content-file when stdin is unavailable"),
+        )
+    })?;
     Ok(buf)
 }
 
@@ -635,15 +700,10 @@ fn resolve_target(forms: &[Form], name: &str) -> Result<Target, Fail> {
                 "pick one of the suggestions, or run tree to list handles".to_string()
             };
             Err(Fail(
-                3,
-                ErrorBody {
-                    code: "form-not-found",
-                    line: None,
-                    col: None,
-                    message: format!("no form defines {name:?}"),
-                    hint: Some(hint),
-                    suggestions: Some(suggestions),
-                },
+                exit::TARGET,
+                ErrorBody::new("form-not-found", format!("no form defines {name:?}"))
+                    .with_hint(hint)
+                    .with_suggestions(suggestions),
             ))
         }
         _ => {
@@ -657,15 +717,13 @@ fn resolve_target(forms: &[Form], name: &str) -> Result<Target, Fail> {
                 })
                 .collect();
             Err(Fail(
-                3,
-                ErrorBody {
-                    code: "ambiguous",
-                    line: None,
-                    col: None,
-                    message: format!("{name:?} is defined {} times", matches.len()),
-                    hint: Some("use --handle to pick one (run tree to list handles)".into()),
-                    suggestions: Some(suggestions),
-                },
+                exit::TARGET,
+                ErrorBody::new(
+                    "ambiguous",
+                    format!("{name:?} is defined {} times", matches.len()),
+                )
+                .with_hint("use --handle to pick one (run tree to list handles)")
+                .with_suggestions(suggestions),
             ))
         }
     }
@@ -676,15 +734,12 @@ fn resolve_target(forms: &[Form], name: &str) -> Result<Target, Fail> {
 fn resolve_handle(bytes: &[u8], h: &str, file: &Path) -> Result<handle::Node, Fail> {
     if h.len() < 6 {
         return Err(Fail(
-            2,
-            ErrorBody {
-                code: "usage",
-                line: None,
-                col: None,
-                message: format!("--handle must be at least 6 hex characters, got {h:?}"),
-                hint: Some("run tree to list current handles".into()),
-                suggestions: None,
-            },
+            exit::USAGE,
+            ErrorBody::new(
+                "usage",
+                format!("--handle must be at least 6 hex characters, got {h:?}"),
+            )
+            .with_hint("run tree to list current handles"),
         ));
     }
     let nodes = handle::collect(bytes);
@@ -692,31 +747,22 @@ fn resolve_handle(bytes: &[u8], h: &str, file: &Path) -> Result<handle::Node, Fa
         nodes.iter().filter(|n| n.raw.starts_with(h)).collect();
     match hits.len() {
         0 => Err(Fail(
-            3,
-            ErrorBody {
-                code: "stale-handle",
-                line: None,
-                col: None,
-                message: format!(
+            exit::TARGET,
+            ErrorBody::new(
+                "stale-handle",
+                format!(
                     "handle {h:?} does not match any form in {} — the form it names changed or is gone",
                     file.display()
                 ),
-                hint: Some("re-run tree to get current handles".into()),
-                suggestions: None,
-            },
+            )
+            .with_hint("re-run tree to get current handles"),
         )),
         1 => Ok(hits[0].clone()),
         _n => {
             Err(Fail(
-                3,
-                ErrorBody {
-                    code: "ambiguous-handle",
-                    line: None,
-                    col: None,
-                    message: ambiguous_handle_message(h, &hits),
-                    hint: Some("re-run tree and copy a longer prefix".into()),
-                    suggestions: None,
-                },
+                exit::TARGET,
+                ErrorBody::new("ambiguous-handle", ambiguous_handle_message(h, &hits))
+                    .with_hint("re-run tree and copy a longer prefix"),
             ))
         }
     }
@@ -769,38 +815,27 @@ fn dispatch(cli: &Cli) -> Result<Output, Fail> {
                 let form =
                     String::from_utf8_lossy(&bytes[node.start_byte..node.end_byte]).to_string();
                 let hash = hashutil::file_hash(&bytes[node.start_byte..node.end_byte]);
-                return Ok(Output {
-                    ok: true,
-                    op: "get",
-                    file: Some(file.display().to_string()),
-                    file_hash: Some(hashutil::tagged(&hashutil::file_hash(&bytes))),
-                    forms: Some(parsed.forms),
-                    result: Some(serde_json::json!({
-                        "kind": node.kind,
-                        "head": node.head,
-                        "name": node.name,
-                        "line": node.line,
-                        "depth": node.depth,
-                        "handle": node.handle,
-                        "hash": hashutil::tagged(&hash),
-                        "form": form,
-                    })),
-                    warnings: None,
-                    notes: None,
-                    error: None,
-                });
+                return Ok(
+                    Output::ok("get")
+                        .file(Some(file.display().to_string()))
+                        .file_hash(hashutil::tagged(&hashutil::file_hash(&bytes)))
+                        .forms(parsed.forms)
+                        .result(serde_json::json!({
+                            "kind": node.kind,
+                            "head": node.head,
+                            "name": node.name,
+                            "line": node.line,
+                            "depth": node.depth,
+                            "handle": node.handle,
+                            "hash": hashutil::tagged(&hash),
+                            "form": form,
+                        })),
+                );
             }
             let Some(n) = name else {
                 return Err(Fail(
-                    2,
-                    ErrorBody {
-                        code: "usage",
-                        line: None,
-                        col: None,
-                        message: "no target given: pass --name SYM or --handle H".into(),
-                        hint: None,
-                        suggestions: None,
-                    },
+                    exit::USAGE,
+                    ErrorBody::new("usage", "no target given: pass --name SYM or --handle H"),
                 ));
             };
             let target = resolve_target(&parsed.forms, n)?;
@@ -809,29 +844,23 @@ fn dispatch(cli: &Cli) -> Result<Output, Fail> {
             // The read lookup carries the form's handle for use in an edit
             // (SPEC §5); null for non-collection forms.
             let nodes = handle::collect(&bytes);
-            let form_handle = nodes
-                .iter()
-                .find(|n| n.path == target.addr.to_string())
-                .map(|n| n.handle.clone());
-            Ok(Output {
-                ok: true,
-                op: "get",
-                file: Some(file.display().to_string()),
-                file_hash: Some(hashutil::tagged(&hashutil::file_hash(&bytes))),
-                forms: Some(parsed.forms),
-                result: Some(serde_json::json!({
-                    "addr": f.addr,
-                    "kind": f.kind,
-                    "name": f.name,
-                    "line": f.line,
-                    "hash": hashutil::tagged(&f.hash),
-                    "handle": form_handle,
-                    "form": text,
-                })),
-                warnings: None,
-                notes: None,
-                error: None,
-            })
+            let addr = target.addr.to_string();
+            let form_handle = nodes.iter().find(|n| n.path == addr).map(|n| n.handle.clone());
+            Ok(
+                Output::ok("get")
+                    .file(Some(file.display().to_string()))
+                    .file_hash(hashutil::tagged(&hashutil::file_hash(&bytes)))
+                    .forms(parsed.forms)
+                    .result(serde_json::json!({
+                        "addr": f.addr,
+                        "kind": f.kind,
+                        "name": f.name,
+                        "line": f.line,
+                        "hash": hashutil::tagged(&f.hash),
+                        "handle": form_handle,
+                        "form": text,
+                    })),
+            )
         }
         Op::Check { file } => match file {
             Some(f) => {
@@ -844,17 +873,12 @@ fn dispatch(cli: &Cli) -> Result<Output, Fail> {
                 let text = read_content(&None, &None)?;
                 let parsed = parse_or_fail(text.as_bytes(), "stdin content")?;
                 let warnings = parsed.warnings;
-                Ok(Output {
-                    ok: true,
-                    op: "check",
-                    file: None,
-                    file_hash: Some(hashutil::tagged(&hashutil::file_hash(text.as_bytes()))),
-                    forms: Some(parsed.forms),
-                    result: None,
-                    warnings: Some(warnings),
-                    notes: None,
-                    error: None,
-                })
+                Ok(
+                    Output::ok("check")
+                        .file_hash(hashutil::tagged(&hashutil::file_hash(text.as_bytes())))
+                        .forms(parsed.forms)
+                        .warnings(warnings),
+                )
             }
         },
         Op::Materialize { content, content_file } => {
@@ -865,28 +889,16 @@ fn dispatch(cli: &Cli) -> Result<Output, Fail> {
             let (draft, mut notes, truncated_fence) = content::normalize_draft(&raw);
             if draft.is_empty() {
                 return Err(Fail(
-                    1,
-                    ErrorBody {
-                        code: "materialize-error",
-                        line: None,
-                        col: None,
-                        message: "draft is empty".into(),
-                        hint: None,
-                        suggestions: None,
-                    },
+                    exit::PARSE,
+                    ErrorBody::new("materialize-error", "draft is empty"),
                 ));
             }
-            let candidate = materialize::indent_mode(&draft).map_err(|e| Fail(
-                1,
-                ErrorBody {
-                    code: "materialize-error",
-                    line: Some(e.line),
-                    col: Some(e.col),
-                    message: e.message,
-                    hint: None,
-                    suggestions: None,
-                },
-            ))?;
+            let candidate = materialize::indent_mode(&draft).map_err(|e| {
+                Fail(
+                    exit::PARSE,
+                    ErrorBody::new("materialize-error", e.message).at(Some(e.line), Some(e.col)),
+                )
+            })?;
             let diff = materialize::unified_diff(&draft, &candidate, "draft", "candidate");
             if truncated_fence {
                 notes.push("draft began with a markdown fence that is never closed — if you did not mean this, the paste may be truncated".to_string());
@@ -898,19 +910,14 @@ fn dispatch(cli: &Cli) -> Result<Output, Fail> {
                 // candidate is worse than none.
                 if parser::parse(candidate.as_bytes()).is_err() {
                     return Err(Fail(
-                        1,
-                        ErrorBody {
-                            code: "materialize-error",
-                            line: None,
-                            col: None,
-                            message: "indent inference produced a candidate that does not parse; refusing"
-                                .into(),
-                            hint: Some(
-                                "fix the draft's explicit structure, or add the missing brackets by hand"
-                                    .into(),
-                            ),
-                            suggestions: None,
-                        },
+                        exit::PARSE,
+                        ErrorBody::new(
+                            "materialize-error",
+                            "indent inference produced a candidate that does not parse; refusing",
+                        )
+                        .with_hint(
+                            "fix the draft's explicit structure, or add the missing brackets by hand",
+                        ),
                     ));
                 }
                 notes.push("brackets inferred from indentation; verify nesting before use".to_string());
@@ -920,21 +927,15 @@ fn dispatch(cli: &Cli) -> Result<Output, Fail> {
             } else {
                 "no change inferred — cljform closes brackets implied by indentation but does not invent missing openers; add the open brackets and retry"
             };
-            Ok(Output {
-                ok: true,
-                op: "materialize",
-                file: None,
-                file_hash: None,
-                forms: None,
-                result: Some(serde_json::json!({
-                    "candidate": candidate,
-                    "diff": diff,
-                    "note": note,
-                })),
-                warnings: None,
-                notes: Some(notes),
-                error: None,
-            })
+            Ok(
+                Output::ok("materialize")
+                    .result(serde_json::json!({
+                        "candidate": candidate,
+                        "diff": diff,
+                        "note": note,
+                    }))
+                    .notes(notes),
+            )
         }
         Op::Format { file } => run_format(file),
         Op::Edit {
@@ -968,15 +969,11 @@ fn dispatch(cli: &Cli) -> Result<Output, Fail> {
                         Ok(n) => handle::Depth::Levels(n),
                         Err(_) => {
                             return Err(Fail(
-                                2,
-                                ErrorBody {
-                                    code: "usage",
-                                    line: None,
-                                    col: None,
-                                    message: format!("--depth expects a number or 'all', got {s:?}"),
-                                    hint: None,
-                                    suggestions: None,
-                                },
+                                exit::USAGE,
+                                ErrorBody::new(
+                                    "usage",
+                                    format!("--depth expects a number or 'all', got {s:?}"),
+                                ),
                             ))
                         }
                     },
@@ -985,20 +982,19 @@ fn dispatch(cli: &Cli) -> Result<Output, Fail> {
             };
             let human_mode = cli.human || (!cli.json && atty_stdout());
             if human_mode {
-                let annotated = handle::annotate(&bytes, d).map_err(|_| Fail(
-                    1,
-                    ErrorBody {
-                        code: "annotate-conflict",
-                        line: None,
-                        col: None,
-                        message: format!(
-                            "the source already contains marker glyphs ({}/{}) and the view cannot be stripped losslessly",
-                            handle::MARKER_OPEN, handle::MARKER_CLOSE
-                        ),
-                        hint: Some("use --json to list the nodes without markers".into()),
-                        suggestions: None,
-                    },
-                ))?;
+                let annotated = handle::annotate(&bytes, d).map_err(|_| {
+                    Fail(
+                        exit::PARSE,
+                        ErrorBody::new(
+                            "annotate-conflict",
+                            format!(
+                                "the source already contains marker glyphs ({}/{}) and the view cannot be stripped losslessly",
+                                handle::MARKER_OPEN, handle::MARKER_CLOSE
+                            ),
+                        )
+                        .with_hint("use --json to list the nodes without markers"),
+                    )
+                })?;
                 // Re-prepend the BOM so `strip` recovers the exact on-disk
                 // bytes of BOM-prefixed files.
                 let mut text = if had_bom {
@@ -1007,29 +1003,19 @@ fn dispatch(cli: &Cli) -> Result<Output, Fail> {
                     String::new()
                 };
                 text.push_str(&annotated);
-                return Ok(Output {
-                    ok: true,
-                    op: "tree",
-                    file: Some(file.display().to_string()),
-                    file_hash: Some(hashutil::tagged(&hashutil::file_hash(&bytes))),
-                    forms: None,
-                    result: Some(serde_json::json!({ "text": text })),
-                    warnings: None,
-                    notes: None,
-                    error: None,
-                });
+                return Ok(
+                    Output::ok("tree")
+                        .file(Some(file.display().to_string()))
+                        .file_hash(hashutil::tagged(&hashutil::file_hash(&bytes)))
+                        .result(serde_json::json!({ "text": text })),
+                );
             }
-            Ok(Output {
-                ok: true,
-                op: "tree",
-                file: Some(file.display().to_string()),
-                file_hash: Some(hashutil::tagged(&hashutil::file_hash(&bytes))),
-                forms: None,
-                result: Some(serde_json::json!({ "nodes": nodes })),
-                warnings: None,
-                notes: None,
-                error: None,
-            })
+            Ok(
+                Output::ok("tree")
+                    .file(Some(file.display().to_string()))
+                    .file_hash(hashutil::tagged(&hashutil::file_hash(&bytes)))
+                    .result(serde_json::json!({ "nodes": nodes })),
+            )
         }
         Op::Strip { .. } => unreachable!("strip is handled in main() before the envelope"),
     }
@@ -1045,76 +1031,48 @@ fn run_format(file: &Option<PathBuf>) -> Result<Output, Fail> {
     let (raw, file_path) = match file {
         Some(p) => {
             let (bytes, _bom) = read_file(p)?;
-            let text = String::from_utf8(bytes).map_err(|e| Fail(
-                4,
-                ErrorBody {
-                    code: "io",
-                    line: None,
-                    col: None,
-                    message: format!("{} is not valid UTF-8: {e}", p.display()),
-                    hint: None,
-                    suggestions: None,
-                },
-            ))?;
+            let text = String::from_utf8(bytes).map_err(|e| {
+                Fail(
+                    exit::IO,
+                    ErrorBody::new("io", format!("{} is not valid UTF-8: {e}", p.display())),
+                )
+            })?;
             (text, Some(p.display().to_string()))
         }
         None => (read_content(&None, &None)?, None),
     };
     if raw.trim().is_empty() {
-        return Err(Fail(
-            1,
-            ErrorBody {
-                code: "format-error",
-                line: None,
-                col: None,
-                message: "input is empty".into(),
-                hint: None,
-                suggestions: None,
-            },
-        ));
+        return Err(Fail(exit::PARSE, ErrorBody::new("format-error", "input is empty")));
     }
     // The input must parse clean: format reindents code, it does not repair
     // structure (that is `materialize`'s job).
     parse_or_fail(raw.as_bytes(), "input")?;
-    let candidate = format::format_paren(&raw).map_err(|e| Fail(
-        1,
-        ErrorBody {
-            code: "format-error",
-            line: Some(e.line),
-            col: Some(e.col),
-            message: e.message,
-            hint: None,
-            suggestions: None,
-        },
-    ))?;
+    let candidate = format::format_paren(&raw).map_err(|e| {
+        Fail(
+            exit::PARSE,
+            ErrorBody::new("format-error", e.message).at(Some(e.line), Some(e.col)),
+        )
+    })?;
     // Verification gates: re-parse clean + the token gate (SPEC §10.5):
     // only whitespace and closing-delimiter positions may change, and a
     // lifted closer may reorder against comment bytes (comments are not
     // tokens) without tripping it.
     if let Err(e) = parser::parse(candidate.as_bytes()) {
         return Err(Fail(
-            1,
-            ErrorBody {
-                code: "format-error",
-                line: Some(e.line),
-                col: Some(e.col),
-                message: format!("candidate does not parse: {}", e.message),
-                hint: Some("format must never change structure; report this as a cljform bug".into()),
-                suggestions: None,
-            },
+            exit::PARSE,
+            ErrorBody::new("format-error", format!("candidate does not parse: {}", e.message))
+                .at(Some(e.line), Some(e.col))
+                .with_hint("format must never change structure; report this as a cljform bug"),
         ));
     }
     if !format::format_preserves_tokens(&raw, &candidate) {
         return Err(Fail(
-            1,
-            ErrorBody {
-                code: "format-error",
-                line: None,
-                col: None,
-                message: "candidate's tokens differ from the input (or a closing delimiter moved later); refusing to emit it".into(),
-                hint: Some("report this as a cljform bug".into()),
-                suggestions: None,
-            },
+            exit::PARSE,
+            ErrorBody::new(
+                "format-error",
+                "candidate's tokens differ from the input (or a closing delimiter moved later); refusing to emit it",
+            )
+            .with_hint("report this as a cljform bug"),
         ));
     }
     let diff = materialize::unified_diff(&raw, &candidate, "input", "candidate");
@@ -1123,85 +1081,66 @@ fn run_format(file: &Option<PathBuf>) -> Result<Output, Fail> {
     } else {
         "candidate reformatted to parinfer paren-mode indentation; token stream verified unchanged — not written"
     };
-    Ok(Output {
-        ok: true,
-        op: "format",
-        file: file_path,
-        file_hash: Some(hashutil::tagged(&hashutil::file_hash(raw.as_bytes()))),
-        forms: None,
-        result: Some(serde_json::json!({
-            "candidate": candidate,
-            "diff": diff,
-            "note": note,
-        })),
-        warnings: None,
-        notes: None,
-        error: None,
-    })
+    Ok(
+        Output::ok("format")
+            .file(file_path)
+            .file_hash(hashutil::tagged(&hashutil::file_hash(raw.as_bytes())))
+            .result(serde_json::json!({
+                "candidate": candidate,
+                "diff": diff,
+                "note": note,
+            })),
+    )
 }
 
 fn prepare_fail(p: content::PrepareError) -> Fail {
     match p {
         content::PrepareError::RepairRefused { diff } => Fail(
-            3,
-            ErrorBody {
-                code: "repair-refused",
-                line: None,
-                col: None,
-                message: format!(
+            exit::TARGET,
+            ErrorBody::new(
+                "repair-refused",
+                format!(
                     "--strict beats --repair: submitted content is unbalanced and would have been repaired by indentation — refusing rather than applying it\n{diff}"
                 ),
-                hint: Some(
-                    "submit balanced content, or drop --strict to let --repair apply the reported, verified repair"
-                        .into(),
-                ),
-                suggestions: None,
-            },
+            )
+            .with_hint(
+                "submit balanced content, or drop --strict to let --repair apply the reported, verified repair",
+            ),
         ),
         content::PrepareError::Unbalanced { candidate, diff } => Fail(
-            3,
-            ErrorBody {
-                code: "unbalanced-content",
-                line: None,
-                col: None,
-                message: format!(
+            exit::TARGET,
+            ErrorBody::new(
+                "unbalanced-content",
+                format!(
                     "content is unbalanced and bracket inference is off (opt-in)\n{diff}\ncandidate:\n{candidate}"
                 ),
-                hint: Some(
-                    "pass --repair to apply the inferred brackets, or submit balanced content (clj_draft can help)"
-                        .into(),
-                ),
-                suggestions: None,
-            },
+            )
+            .with_hint(
+                "pass --repair to apply the inferred brackets, or submit balanced content (clj_draft can help)"
+            ),
         ),
         content::PrepareError::TruncatedFence => Fail(
-            1,
-            ErrorBody {
-                code: "truncated-content",
-                line: None,
-                col: None,
-                message: "content starts with a markdown fence that is never closed — the paste looks truncated; refusing to repair it"
-                    .into(),
-                hint: Some(
-                    "resend the complete content, or remove the stray opening fence".into(),
-                ),
-                suggestions: None,
-            },
+            exit::PARSE,
+            ErrorBody::new(
+                "truncated-content",
+                "content starts with a markdown fence that is never closed — the paste looks truncated; refusing to repair it",
+            )
+            .with_hint("resend the complete content, or remove the stray opening fence"),
         ),
-        other => Fail(
-            1,
-            ErrorBody {
-                code: "not-one-form",
-                line: other.line_col().map(|(l, _)| l),
-                col: other.line_col().map(|(_, c)| c),
-                message: other.message(),
-                hint: Some(
-                    "submit balanced content, or run clj_draft to see the inferred candidate; this content needs a human eye"
-                        .into(),
-                ),
-                suggestions: None,
-            },
-        ),
+        other => {
+            let (line, col) = match other.line_col() {
+                Some((l, c)) => (Some(l), Some(c)),
+                None => (None, None),
+            };
+            Fail(
+                exit::PARSE,
+                ErrorBody::new("not-one-form", other.message())
+                    .at(line, col)
+                    .with_hint(
+                        "submit balanced content, or run clj_draft to see the inferred candidate; this content needs a human eye"
+                    ),
+            )
+        }
     }
 }
 
@@ -1230,15 +1169,11 @@ fn run_edit(
     let handle_node: Option<handle::Node> = match handle_opt {
         Some(h) if matches!(mode, Mode::Append | Mode::Prepend) => {
             return Err(Fail(
-                2,
-                ErrorBody {
-                    code: "usage",
-                    line: None,
-                    col: None,
-                    message: "--handle cannot target append/prepend: they are file-level; use insert-before/insert-after to place the new form next to the node".into(),
-                    hint: None,
-                    suggestions: None,
-                },
+                exit::USAGE,
+                ErrorBody::new(
+                    "usage",
+                    "--handle cannot target append/prepend: they are file-level; use insert-before/insert-after to place the new form next to the node",
+                ),
             ))
         }
         Some(h) => {
@@ -1253,18 +1188,15 @@ fn run_edit(
         None if matches!(mode, Mode::Append | Mode::Prepend) => None,
         None => {
             return Err(Fail(
-                2,
-                ErrorBody {
-                    code: "usage",
-                    line: None,
-                    col: None,
-                    message: format!(
+                exit::USAGE,
+                ErrorBody::new(
+                    "usage",
+                    format!(
                         "--mode {} targets a form and needs --handle H (run tree to list current handles)",
                         mode_name(&mode)
                     ),
-                    hint: Some("append and prepend are the only target-less modes".into()),
-                    suggestions: None,
-                },
+                )
+                .with_hint("append and prepend are the only target-less modes"),
             ))
         }
     };
@@ -1283,25 +1215,16 @@ fn run_edit(
         Mode::Patch => {
             let Some(old_raw) = old_text.as_deref().filter(|s| !s.is_empty()) else {
                 return Err(Fail(
-                    2,
-                    ErrorBody {
-                        code: "usage",
-                        line: None,
-                        col: None,
-                        message: "patch mode requires non-empty --old-text".into(),
-                        hint: Some("patch replaces an exact snippet inside one form; for whole-form edits use --content".into()),
-                        suggestions: None,
-                    },
+                    exit::USAGE,
+                    ErrorBody::new("usage", "patch mode requires non-empty --old-text")
+                        .with_hint(
+                            "patch replaces an exact snippet inside one form; for whole-form edits use --content"
+                        ),
                 ));
             };
             // §10.4: view markers never reach the file.
-            let (old, old_gone) = strip_view_markers(old_raw);
-            let (new, new_gone) = strip_view_markers(new_text.as_deref().unwrap_or(""));
-            if old_gone || new_gone {
-                notes.push(
-                    "stripped \u{27E6}…\u{27E7} view markers from the submitted text".to_string(),
-                );
-            }
+            let old = strip_view_markers_into(old_raw, &mut notes);
+            let new = strip_view_markers_into(new_text.as_deref().unwrap_or(""), &mut notes);
             // Patch is handle-only: the usage check above guarantees a node.
             let node = handle_node
                 .as_ref()
@@ -1322,48 +1245,43 @@ fn run_edit(
             match hits.len() {
                 0 => {
                     return Err(Fail(
-                        3,
-                        ErrorBody {
-                            code: "patch-not-found",
-                            line: Some(line_range[0]),
-                            col: None,
+                        exit::TARGET,
+                        ErrorBody::new(
+                            "patch-not-found",
                             // Hand back the exact form bytes: the dominant
                             // failure is oldText re-typed from a sed/cat read,
                             // and this makes recovery one call, no clj_get.
-                            message: format!(
+                            format!(
                                 "--old-text not found inside {scope_label} (lines {}–{}); occurrences elsewhere in the file do not count\n\nexact form bytes (copy oldText from these):\n{}",
                                 line_range[0],
                                 line_range[1],
                                 scope_bytes
                             ),
-                            hint: {
-                                let mut hint = "use the exact bytes above verbatim; only re-fetch with clj_get if the file changed since you read it"
-                                    .to_string();
-                                if escape_suspect {
-                                    hint.push_str(
-                                        "; oldText contains the literal two characters backslash-n (or backslash-t); if you meant a newline or tab, send a real one",
-                                    );
-                                }
-                                Some(hint)
-                            },
-                            suggestions: None,
-                        },
+                        )
+                        .at(Some(line_range[0]), None)
+                        .with_hint({
+                            let mut hint = "use the exact bytes above verbatim; only re-fetch with clj_get if the file changed since you read it"
+                                .to_string();
+                            if escape_suspect {
+                                hint.push_str(
+                                    "; oldText contains the literal two characters backslash-n (or backslash-t); if you meant a newline or tab, send a real one",
+                                );
+                            }
+                            hint
+                        }),
                     ));
                 }
                 1 => {}
                 n => {
                     return Err(Fail(
-                        3,
-                        ErrorBody {
-                            code: "patch-ambiguous",
-                            line: Some(line_range[0]),
-                            col: None,
-                            message: format!(
+                        exit::TARGET,
+                        ErrorBody::new(
+                            "patch-ambiguous",
+                            format!(
                                 "--old-text occurs {n} times inside {scope_label} — include more surrounding lines to make it unique"
                             ),
-                            hint: None,
-                            suggestions: None,
-                        },
+                        )
+                        .at(Some(line_range[0]), None),
                     ));
                 }
             }
@@ -1388,12 +1306,7 @@ fn run_edit(
         _ => {
             let raw = read_content(content, content_file)?;
             // §10.4: view markers never reach the file.
-            let (stripped, markers_gone) = strip_view_markers(&raw);
-            if markers_gone {
-                notes.push(
-                    "stripped \u{27E6}…\u{27E7} view markers from the submitted text".to_string(),
-                );
-            }
+            let stripped = strip_view_markers_into(&raw, &mut notes);
             // Base-shift geometry (SPEC §10.3): replace/patch and inline
             // inserts splice mid-line, so line 0 lands bare at the splice
             // point (reindent_to_column: continuation reindent). When the
@@ -1740,15 +1653,11 @@ fn run_edit(
             || new_bytes[lo + content_len..] != bytes[hi..]
         {
             return Err(Fail(
-                1,
-                ErrorBody {
-                    code: "shape-violation",
-                    line: None,
-                    col: None,
-                    message: "boundary check failed: the splice changed bytes outside the target range; nothing was written".into(),
-                    hint: None,
-                    suggestions: None,
-                },
+                exit::PARSE,
+                ErrorBody::new(
+                    "shape-violation",
+                    "boundary check failed: the splice changed bytes outside the target range; nothing was written",
+                ),
             ));
         }
     }
@@ -1773,35 +1682,23 @@ fn run_edit(
 
     // I2/I3: untouched forms byte-identical, count as expected.
     let shape = invariants::verify_untouched(&before_forms, &after_parsed.forms, &allowed)
-        .map_err(|m| Fail(
-            1,
-            ErrorBody {
-                code: "shape-violation",
-                line: None,
-                col: None,
-                message: m,
-                hint: None,
-                suggestions: None,
-            },
-        ))?;
+        .map_err(|m| Fail(exit::PARSE, ErrorBody::new("shape-violation", m)))?;
 
     // Detectors on the result.
     let warnings = after_parsed.warnings.clone();
     if strict && !warnings.is_empty() {
         return Err(Fail(
-            1,
-            ErrorBody {
-                code: "detector-fatal",
-                line: Some(warnings[0].line),
-                col: None,
-                message: format!(
+            exit::PARSE,
+            ErrorBody::new(
+                "detector-fatal",
+                format!(
                     "--strict: {} detector warning(s), first: {}",
                     warnings.len(),
                     warnings[0].message
                 ),
-                hint: Some("address the warnings or drop --strict".into()),
-                suggestions: None,
-            },
+            )
+            .at(Some(warnings[0].line), None)
+            .with_hint("address the warnings or drop --strict"),
         ));
     }
 
@@ -1854,31 +1751,30 @@ fn run_edit(
     if dry_run {
         notes.push("dry run: nothing written".to_string());
     } else {
-        invariants::atomic_write(file, &with_bom(&new_bytes, had_bom)).map_err(|e| Fail(
-            4,
-            ErrorBody {
-                code: "io",
-                line: None,
-                col: None,
-                message: format!("write failed: {e} (file unchanged)"),
-                hint: None,
-                suggestions: None,
-            },
-        ))?;
+        invariants::atomic_write(file, &with_bom(&new_bytes, had_bom))
+            .map_err(|e| {
+                Fail(
+                    exit::IO,
+                    ErrorBody::new("io", format!("write failed: {e} (file unchanged)")),
+                )
+            })?;
     }
 
-    Ok(Output {
-        ok: true,
-        op: "edit",
-        file: Some(file.display().to_string()),
-        file_hash: Some(hashutil::tagged(&hashutil::file_hash(&new_bytes))),
-        forms: Some(after_parsed.forms),
-        result: Some(result),
-        warnings: Some(warnings),
-        notes: Some(notes),
-        error: None,
-    })
+    Ok(
+        Output::ok("edit")
+            .file(Some(file.display().to_string()))
+            .file_hash(hashutil::tagged(&hashutil::file_hash(&new_bytes)))
+            .forms(after_parsed.forms)
+            .result(result)
+            .warnings(warnings)
+            .notes(notes),
+    )
 }
+
+/// The single note emitted when `⟦…⟧` view markers are stripped from
+/// submitted text (SPEC §10.4: view markers never reach the file).
+const STRIPPED_VIEW_MARKERS_NOTE: &str =
+    "stripped ⟦…⟧ view markers from the submitted text";
 
 /// §10.4: strip `⟦…⟧` view markers from submitted text; reports whether
 /// anything was removed.
@@ -1886,6 +1782,18 @@ fn strip_view_markers(text: &str) -> (String, bool) {
     let stripped = handle::strip(text);
     let changed = stripped != text;
     (stripped, changed)
+}
+
+/// Strip `⟦…⟧` view markers from submitted text and record the strip in
+/// `notes` if anything was removed. The note is pushed at most once per
+/// edit, even when several submitted texts (a patch's old- and new-text)
+/// are stripped.
+fn strip_view_markers_into(text: &str, notes: &mut Vec<String>) -> String {
+    let (stripped, gone) = strip_view_markers(text);
+    if gone && !notes.iter().any(|n| n == STRIPPED_VIEW_MARKERS_NOTE) {
+        notes.push(STRIPPED_VIEW_MARKERS_NOTE.to_string());
+    }
+    stripped
 }
 
 /// Base-shift reindent for the `--handle` replace/patch/inline-insert
@@ -1897,7 +1805,7 @@ fn strip_view_markers(text: &str) -> (String, bool) {
 /// deterministic; both a caller-indented and a flat block normalize to the
 /// same result.
 fn reindent_to_column(content: &str, target_col: usize) -> (String, bool) {
-    let out = reindent_prefix(&reindent_dedent(content), target_col, false);
+    let out = reindent_prefix(&reindent_dedent_by(content, content), target_col, false);
     let changed = out != content;
     (out, changed)
 }
@@ -1918,24 +1826,21 @@ fn reindent_to_column(content: &str, target_col: usize) -> (String, bool) {
 /// equal this result (the internal dedent is a no-op on already-dedented
 /// content).
 fn reindent_block(content: &str, target_col: usize) -> (String, bool) {
-    let out = reindent_prefix(&reindent_dedent(content), target_col, true);
+    let out = reindent_prefix(&reindent_dedent_by(content, content), target_col, true);
     let changed = out != content;
     (out, changed)
 }
 
-/// Base-shift dedent applied to `content` itself: strip the common
-/// leading whitespace across non-blank lines (line 0 included).
-fn reindent_dedent(content: &str) -> String {
-    reindent_dedent_by(content, content)
-}
-
-/// Base-shift dedent applied AFTER inference (issue 12): the common
-/// leading whitespace is computed from the submitted content and shed from
-/// each prepared line. Line 0 may already have lost its pad to prepare's
-/// edge trim (and the repair never adds leading whitespace), and blank
-/// lines shorter than the common indent are kept verbatim — so each line
-/// sheds at most what it still carries. Whitespace-only and deterministic;
-/// both a caller-indented and a flat block normalize to the same result.
+/// Base-shift dedent: the common leading whitespace is computed from the
+/// submitted content and shed from each prepared line. With
+/// `submitted == prepared` this is the plain dedent of the content itself
+/// (the common leading whitespace across non-blank lines, line 0 included);
+/// otherwise it runs AFTER inference (issue 12) — line 0 may already have
+/// lost its pad to prepare's edge trim (and the repair never adds leading
+/// whitespace), and blank lines shorter than the common indent are kept
+/// verbatim — so each line sheds at most what it still carries.
+/// Whitespace-only and deterministic; both a caller-indented and a flat
+/// block normalize to the same result.
 fn reindent_dedent_by(submitted: &str, prepared: &str) -> String {
     let common = common_indent(submitted);
     if common.is_empty() {
@@ -2373,17 +2278,11 @@ fn forms_output(
     forms: Vec<Form>,
     warnings: Vec<invariants::DetectorWarning>,
 ) -> Output {
-    Output {
-        ok: true,
-        op,
-        file: Some(file.display().to_string()),
-        file_hash: Some(hashutil::tagged(&hashutil::file_hash(bytes))),
-        forms: Some(forms),
-        result: None,
-        warnings: Some(warnings),
-        notes: None,
-        error: None,
-    }
+    Output::ok(op)
+        .file(Some(file.display().to_string()))
+        .file_hash(hashutil::tagged(&hashutil::file_hash(bytes)))
+        .forms(forms)
+        .warnings(warnings)
 }
 
 #[cfg(test)]
