@@ -97,3 +97,8 @@ Sequence (one worker subagent per issue):
   hint on `patch-not-found` when oldText contains literal backslash-n/t
   sequences (refusal stands — Clojure strings/regex can legitimately contain
   them); one guidance sentence on exact-text/real newlines. Depends on 15.
+- **17 — guard hook shape-delta reachable** (`issue-17-shape-delta.md`,
+  found during refactor C5): the guard hook remembered the fresh table before
+  reading the cached previous one, so the delta line never fired. Two-line
+  reorder; harness-verified delta line now names lost forms; non-delta paths
+  byte-identical. Depends on the refactor-consolidate pass.

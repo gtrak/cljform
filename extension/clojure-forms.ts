@@ -660,8 +660,8 @@ export default function ClojureForms(pi: ExtensionAPI) {
 			);
 			report.push("Fix the bracket structure immediately; nothing else about this edit is verified.");
 		} else {
-			remember(abs, out.forms);
 			const prev = cache.get(abs);
+			remember(abs, out.forms);
 			const delta = prev ? shapeDelta(prev, out.forms) : null;
 			const warnings = warningsText(out.warnings ?? []);
 			if (delta) {
