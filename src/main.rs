@@ -1314,6 +1314,11 @@ fn run_edit(
             );
             let needle = old.as_bytes();
             let hits = find_all(scoped, needle);
+            // Issue 16: agents sometimes encode newlines/tabs as the literal
+            // two-character sequences `\n` / `\t`. Flag that possibility in
+            // the refusal — never a fix, since Clojure strings and regexes
+            // can legitimately contain them.
+            let escape_suspect = old_raw.contains("\\n") || old_raw.contains("\\t");
             match hits.len() {
                 0 => {
                     return Err(Fail(
@@ -1331,10 +1336,16 @@ fn run_edit(
                                 line_range[1],
                                 scope_bytes
                             ),
-                            hint: Some(
-                                "use the exact bytes above verbatim; only re-fetch with clj_get if the file changed since you read it"
-                                    .into(),
-                            ),
+                            hint: {
+                                let mut hint = "use the exact bytes above verbatim; only re-fetch with clj_get if the file changed since you read it"
+                                    .to_string();
+                                if escape_suspect {
+                                    hint.push_str(
+                                        "; oldText contains the literal two characters backslash-n (or backslash-t); if you meant a newline or tab, send a real one",
+                                    );
+                                }
+                                Some(hint)
+                            },
                             suggestions: None,
                         },
                     ));

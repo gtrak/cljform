@@ -364,6 +364,43 @@ fn patch_mode_surgical_replacement() {
 }
 
 #[test]
+fn patch_not_found_literal_escape_hint() {
+    let f = fixture(
+        "escape-hint.clj",
+        b"(ns e)\n\n(defn f [x]\n  {:k 1\n   :v 2})\n",
+    );
+    let h = handle_of(&f, "f");
+
+    // Literal backslash-n in --old-text: refusal stands, but the hint flags
+    // the escape-sequence possibility.
+    let (code, d, err) = run_json(
+        &["edit", &f, "--handle", &h, "--mode", "patch", "--old-text", "foo\\nbar", "--new-text", "X", "--json"],
+        None,
+    );
+    assert_eq!(code, 3, "{d} {err}");
+    assert_eq!(d["error"]["code"], "patch-not-found");
+    let hint = d["error"]["hint"].as_str().unwrap();
+    assert!(
+        hint.contains("literal two characters backslash-n (or backslash-t)"),
+        "escape hint present: {hint}"
+    );
+    assert!(
+        hint.contains("send a real one"),
+        "possibility phrasing, not a directive: {hint}"
+    );
+
+    // A plain miss carries the base hint only — no escape note.
+    let (code, d, err) = run_json(
+        &["edit", &f, "--handle", &h, "--mode", "patch", "--old-text", "foo bar", "--new-text", "X", "--json"],
+        None,
+    );
+    assert_eq!(code, 3, "{d} {err}");
+    assert_eq!(d["error"]["code"], "patch-not-found");
+    let hint = d["error"]["hint"].as_str().unwrap();
+    assert!(!hint.contains("backslash-n"), "no escape hint for a plain miss: {hint}");
+}
+
+#[test]
 fn patch_mode_line_growth_shifts_later_forms() {
     let f = fixture(
         "patch-shift.clj",
