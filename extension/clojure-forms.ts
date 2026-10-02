@@ -26,8 +26,6 @@ interface FormRow {
 	kind: string;
 	name: string | null;
 	line: [number, number];
-	hash: string;
-	contains: Record<string, number>;
 }
 
 /** One collection node from `cljform tree --json` (SPEC §10.2). */
@@ -45,7 +43,6 @@ interface DetectorWarning {
 	line: number;
 	end_line: number;
 	message: string;
-	hint: string;
 }
 
 interface CljformOutput {
@@ -76,6 +73,41 @@ interface CljformOutput {
 }
 
 const CLJ_EXT = /\.(clj|cljs|cljc|cljx|edn)$/;
+
+/** clj_edit's modes — the single source for the parameter's literal union. */
+const MODES = ["replace", "patch", "insert-after", "insert-before", "append", "prepend", "delete"] as const;
+
+/** pi.exec result plus the ENOENT/spawn-failure flag (execCljform never rejects). */
+type ExecResult = { stdout: string; stderr: string; code: number; execError: boolean };
+
+/** A tool's result payload (error or success; details are op-specific). */
+type ToolOutcome = { content: { type: "text"; text: string }[]; isError?: boolean; details?: unknown };
+
+/**
+ * Write `content` to a temp file for the duration of `fn` (cljform takes
+ * content via --content-file; pi.exec has no stdin and argv is length-
+ * limited). The file is removed when `fn` settles.
+ */
+async function withTempFile(
+	prefix: string,
+	content: string,
+	fn: (tmp: string) => Promise<ToolOutcome>,
+): Promise<ToolOutcome> {
+	const { writeFileSync, unlinkSync } = await import("node:fs");
+	const { tmpdir } = await import("node:os");
+	const { join } = await import("node:path");
+	const tmp = join(tmpdir(), `cljform-${prefix}-${process.pid}-${Date.now()}.clj`);
+	writeFileSync(tmp, content);
+	try {
+		return await fn(tmp);
+	} finally {
+		try {
+			unlinkSync(tmp);
+		} catch {
+			/* already removed */
+		}
+	}
+}
 
 function resolveBin(): string {
 	return process.env.CLJFORM_BIN || "cljform";
@@ -128,14 +160,10 @@ function errorText(out: CljformOutput): string {
 export default function ClojureForms(pi: ExtensionAPI) {
 	// Fingerprint cache for the guard hook's shape delta. Correctness never
 	// depends on it: a missing entry just means no delta line.
-	const cache = new Map<string, { forms: FormRow[]; at: number }>();
-
-	function cacheKey(path: string): string {
-		return path;
-	}
+	const cache = new Map<string, FormRow[]>();
 
 	function remember(path: string, forms: FormRow[] | undefined) {
-		if (forms) cache.set(cacheKey(path), { forms, at: Date.now() });
+		if (forms) cache.set(path, forms);
 	}
 
 	/**
@@ -147,7 +175,7 @@ export default function ClojureForms(pi: ExtensionAPI) {
 	async function execCljform(
 		args: string[],
 		opts: { timeout: number },
-	): Promise<{ stdout: string; stderr: string; code: number; execError: boolean }> {
+	): Promise<ExecResult> {
 		try {
 			const result = await pi.exec(resolveBin(), args, opts);
 			return { stdout: result.stdout, stderr: result.stderr, code: result.code, execError: false };
@@ -160,6 +188,33 @@ export default function ClojureForms(pi: ExtensionAPI) {
 				: `cljform failed to run: ${err instanceof Error ? err.message : String(err)}`;
 			return { stdout: "", stderr, code: -1, execError: true };
 		}
+	}
+
+	/**
+	 * Run a cljform subcommand and unwrap its JSON envelope. A spawn
+	 * failure (execError), a missing envelope, or ok:false all collapse
+	 * into one isError ToolOutcome — the `cljform failed: …` fallback
+	 * lives here and nowhere else. The raw exec result is carried on both
+	 * branches so callers whose success path is not envelope-based
+	 * (clj_tree's human passthrough checks exit 0) can inspect it.
+	 */
+	async function runClj(
+		args: string[],
+		timeout: number,
+	): Promise<
+		| { ok: true; out: CljformOutput; raw: ExecResult }
+		| { ok: false; result: ToolOutcome; raw: ExecResult }
+	> {
+		const raw = await execCljform(args, { timeout });
+		if (raw.execError) {
+			return { ok: false, result: { content: [{ type: "text", text: raw.stderr }], isError: true }, raw };
+		}
+		const out = parseEnvelope(raw.stdout);
+		if (!out || !out.ok) {
+			const text = out?.error ? errorText(out) : `cljform failed: ${raw.stderr || raw.stdout}`;
+			return { ok: false, result: { content: [{ type: "text", text }], isError: true }, raw };
+		}
+		return { ok: true, out, raw };
 	}
 
 	function shapeSummary(forms: FormRow[]): string {
@@ -212,17 +267,9 @@ export default function ClojureForms(pi: ExtensionAPI) {
 		}),
 
 		async execute(_toolCallId, params, _signal, _onUpdate) {
-			const result = await execCljform(["forms", params.path, "--json"], {
-				timeout: 15_000,
-			});
-			if (result.execError) {
-				return { content: [{ type: "text", text: result.stderr }], isError: true };
-			}
-			const out = parseEnvelope(result.stdout);
-			if (!out || !out.ok) {
-				const text = out?.error ? errorText(out) : `cljform failed: ${result.stderr || result.stdout}`;
-				return { content: [{ type: "text", text }], isError: true };
-			}
+			const run = await runClj(["forms", params.path, "--json"], 15_000);
+			if (!run.ok) return run.result;
+			const out = run.out;
 			remember(params.path, out.forms);
 			const lines = [
 				`${params.path}: ${out.forms!.length} top-level forms · ${out.file_hash?.slice(0, 19)}…`,
@@ -273,40 +320,29 @@ export default function ClojureForms(pi: ExtensionAPI) {
 			if (params.depth !== undefined) {
 				args.push("--depth", params.depth === "all" ? "all" : String(params.depth));
 			}
-			const result = await execCljform(args, { timeout: 15_000 });
-			if (result.execError) {
-				return { content: [{ type: "text", text: result.stderr }], isError: true };
-			}
-			// JSON path: the CLI emits a JSON envelope (tree --json). Parse it as
-			// before.
-			if (params.json) {
-				const out = parseEnvelope(result.stdout);
-				if (!out || !out.ok) {
-					const text = out?.error ? errorText(out) : `cljform failed: ${result.stderr || result.stdout}`;
-					return { content: [{ type: "text", text }], isError: true };
-				}
-				const r = out.result ?? {};
-				const nodes: TreeNode[] = (r.nodes as TreeNode[]) ?? [];
-				const lines = [
-					`${params.path}: ${nodes.length} nodes · ${out.file_hash?.slice(0, 19)}…`,
-					...nodes.map(
-						(n) =>
-							`${"  ".repeat(Math.max(0, n.depth - 1))}⟦${n.handle}⟧ ${n.kind}${n.name ? ` ${n.name}` : ""} · lines ${n.line[0]}–${n.line[1]}`,
-					),
-				];
-				return { content: [{ type: "text", text: lines.join("\n") }], details: { nodes } };
-			}
+			const run = await runClj(args, 15_000);
 			// Human path: `tree --human` prints the annotated source directly — not a
-			// JSON envelope. On success (exit 0) pass the stdout text straight through;
-			// on failure surface the error envelope if parseable, else stderr/stdout.
-			if (result.code === 0) {
+			// JSON envelope. On success (exit 0) pass the stdout text straight
+			// through; on failure runClj has already surfaced the error envelope
+			// (if parseable) or the fallback line.
+			if (params.json !== true && run.raw.code === 0) {
 				return {
-					content: [{ type: "text", text: result.stdout.replace(/^\uFEFF/, "").trimEnd() }],
+					content: [{ type: "text", text: run.raw.stdout.replace(/^\uFEFF/, "").trimEnd() }],
 				};
 			}
-			const out = parseEnvelope(result.stdout);
-			const text = out?.error ? errorText(out) : `cljform failed: ${result.stderr || result.stdout}`;
-			return { content: [{ type: "text", text }], isError: true };
+			if (!run.ok) return run.result;
+			// JSON path: the CLI emits a JSON envelope (tree --json).
+			const out = run.out;
+			const r = out.result ?? {};
+			const nodes: TreeNode[] = (r.nodes as TreeNode[]) ?? [];
+			const lines = [
+				`${params.path}: ${nodes.length} nodes · ${out.file_hash?.slice(0, 19)}…`,
+				...nodes.map(
+					(n) =>
+						`${"  ".repeat(Math.max(0, n.depth - 1))}⟦${n.handle}⟧ ${n.kind}${n.name ? ` ${n.name}` : ""} · lines ${n.line[0]}–${n.line[1]}`,
+				),
+			];
+			return { content: [{ type: "text", text: lines.join("\n") }], details: { nodes } };
 		},
 	});
 
@@ -339,15 +375,9 @@ export default function ClojureForms(pi: ExtensionAPI) {
 			const args = ["get", params.path, "--json"];
 			if (params.name !== undefined) args.push("--name", params.name);
 			if (params.handle !== undefined) args.push("--handle", params.handle);
-			const result = await execCljform(args, { timeout: 15_000 });
-			if (result.execError) {
-				return { content: [{ type: "text", text: result.stderr }], isError: true };
-			}
-			const out = parseEnvelope(result.stdout);
-			if (!out || !out.ok) {
-				const text = out?.error ? errorText(out) : `cljform failed: ${result.stderr || result.stdout}`;
-				return { content: [{ type: "text", text }], isError: true };
-			}
+			const run = await runClj(args, 15_000);
+			if (!run.ok) return run.result;
+			const out = run.out;
 			remember(params.path, out.forms);
 			const r = out.result ?? {};
 			const handleLine = r.handle
@@ -387,24 +417,10 @@ export default function ClojureForms(pi: ExtensionAPI) {
 		}),
 
 		async execute(_toolCallId, params, _signal, _onUpdate) {
-			const { writeFileSync, unlinkSync } = await import("node:fs");
-			const { tmpdir } = await import("node:os");
-			const { join } = await import("node:path");
-			const tmp = join(tmpdir(), `cljform-draft-${process.pid}-${Date.now()}.clj`);
-			writeFileSync(tmp, params.content);
-			try {
-				const result = await execCljform(["materialize", "--content-file", tmp, "--json"], {
-					timeout: 15_000,
-				});
-				if (result.execError) {
-					return { content: [{ type: "text", text: result.stderr }], isError: true };
-				}
-				const out = parseEnvelope(result.stdout);
-				if (!out || !out.ok) {
-					const text = out?.error ? errorText(out) : `cljform failed: ${result.stderr || result.stdout}`;
-					return { content: [{ type: "text", text }], isError: true };
-				}
-				const r = out.result ?? {};
+			return await withTempFile("draft", params.content, async (tmp) => {
+				const run = await runClj(["materialize", "--content-file", tmp, "--json"], 15_000);
+				if (!run.ok) return run.result;
+				const r = run.out.result ?? {};
 				const lines = [
 					`candidate (${r.note ?? "brackets inferred from indentation"}):`,
 					"",
@@ -417,13 +433,7 @@ export default function ClojureForms(pi: ExtensionAPI) {
 					content: [{ type: "text", text: lines.join("\n") }],
 					details: { candidate: r.candidate, diff: r.diff, note: r.note },
 				};
-			} finally {
-				try {
-					unlinkSync(tmp);
-				} catch {
-					/* already removed */
-				}
-			}
+			});
 		},
 	});
 
@@ -484,15 +494,7 @@ export default function ClojureForms(pi: ExtensionAPI) {
 				}),
 			),
 			mode: Type.Optional(
-				Type.Union([
-					Type.Literal("replace"),
-					Type.Literal("patch"),
-					Type.Literal("insert-after"),
-					Type.Literal("insert-before"),
-					Type.Literal("append"),
-					Type.Literal("prepend"),
-					Type.Literal("delete"),
-				], { description: "Default replace" }),
+				Type.Union(MODES.map((m) => Type.Literal(m)), { description: "Default replace" }),
 			),
 			dryRun: Type.Optional(Type.Boolean({ description: "Validate and report without writing" })),
 			strict: Type.Optional(
@@ -518,9 +520,7 @@ export default function ClojureForms(pi: ExtensionAPI) {
 		async execute(_toolCallId, params, _signal, _onUpdate) {
 			const mode = params.mode ?? (params.oldText !== undefined ? "patch" : "replace");
 			// Validate payload vs mode.
-			if (mode === "delete" || mode === "patch") {
-				// content not needed
-			} else if (params.content === undefined) {
+			if (mode !== "delete" && mode !== "patch" && params.content === undefined) {
 				return {
 					content: [{ type: "text", text: `clj_edit ${mode} requires content (or use patch mode with oldText/newText)` }],
 					isError: true,
@@ -578,37 +578,20 @@ export default function ClojureForms(pi: ExtensionAPI) {
 			// passes --no-format-content so the content stays verbatim.
 			if (params.autoFormat === false) args.push("--no-format-content");
 			// Content via temp file: no stdin in pi.exec, no argv limits.
-			const { writeFileSync, unlinkSync } = await import("node:fs");
-			const { tmpdir } = await import("node:os");
-			const { join } = await import("node:path");
-			const tmp = join(tmpdir(), `cljform-content-${process.pid}-${Date.now()}.clj`);
-			writeFileSync(tmp, params.content!);
-			args.push("--content-file", tmp);
-			try {
+			return await withTempFile("content", params.content!, async (tmp) => {
+				args.push("--content-file", tmp);
 				return await runEdit(args, params);
-			} finally {
-				try {
-					unlinkSync(tmp);
-				} catch {
-					/* already removed */
-				}
-			}
+			});
 		},
 	});
 
 	async function runEdit(
 		args: string[],
 		params: { path: string; mode?: string; dryRun?: boolean },
-	): Promise<{ content: { type: "text"; text: string }[]; isError?: boolean; details?: unknown }> {
-		const result = await execCljform(args, { timeout: 20_000 });
-		if (result.execError) {
-			return { content: [{ type: "text", text: result.stderr }], isError: true };
-		}
-		const out = parseEnvelope(result.stdout);
-		if (!out || !out.ok) {
-			const text = out?.error ? errorText(out) : `cljform failed: ${result.stderr || result.stdout}`;
-			return { content: [{ type: "text", text }], isError: true };
-		}
+	): Promise<ToolOutcome> {
+		const run = await runClj(args, 20_000);
+		if (!run.ok) return run.result;
+		const out = run.out;
 		if (!params.dryRun) remember(params.path, out.forms);
 
 		const r = out.result ?? {};
@@ -678,8 +661,8 @@ export default function ClojureForms(pi: ExtensionAPI) {
 			report.push("Fix the bracket structure immediately; nothing else about this edit is verified.");
 		} else {
 			remember(abs, out.forms);
-			const prev = cache.get(cacheKey(abs));
-			const delta = prev ? shapeDelta(prev.forms, out.forms) : null;
+			const prev = cache.get(abs);
+			const delta = prev ? shapeDelta(prev, out.forms) : null;
 			const warnings = warningsText(out.warnings ?? []);
 			if (delta) {
 				report.push(delta);
@@ -744,12 +727,11 @@ async function probeForClojure(cwd: string): Promise<boolean> {
 			if (skip.has(e)) continue;
 			const full = join(dir, e);
 			try {
-				if (readdirSync(full).length >= 0 && budget > 0) {
-					if (scan(full, depth + 1)) return true;
-				}
+				readdirSync(full);
 			} catch {
 				/* not a directory */
 			}
+			if (budget > 0 && scan(full, depth + 1)) return true;
 		}
 		return false;
 	}
