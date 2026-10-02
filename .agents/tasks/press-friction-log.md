@@ -30,3 +30,14 @@
   shape report caught its bracket bugs faster than manual counting.
 - Implication: F4-class hint (exact bytes on mismatch) is the load-bearing
   affordance; it is what converts byte-mismatch retries into 1-shot recovery.
+## T11 (clj-kondo) — 16 edits, 0 refusals, 0 in-chain refetches, sub-200ms at 4744 lines
+- F10 insert-after/insert-before return empty result.diff (replace/patch
+  populate it). Reporting gap: the edit summary is the only seam visibility.
+- F11 check D2 warning noise on data-structure-of-defs files (21 warnings,
+  ok:true) — consider a --quiet or warnings summary line.
+- Confirmed pre-existing format non-emptiness on clj-kondo source (parinfer
+  +1 vs cljfmt +2) — worker proved via pristine-vs-post candidate diff;
+  edits added zero reflow. Not a cljform regression.
+- #_ discards: invisible to tree/get (no handle), bytes preserved — correct.
+- Two-forms-on-one-line insert-after: split cleanly, sibling form's content
+  hash unchanged. Correct seam behavior.
