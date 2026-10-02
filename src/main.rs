@@ -772,17 +772,43 @@ fn resolve_handle(bytes: &[u8], h: &str, file: &Path) -> Result<handle::Node, Fa
     let hits: Vec<&handle::Node> =
         nodes.iter().filter(|n| n.raw.starts_with(h)).collect();
     match hits.len() {
-        0 => Err(Fail(
-            exit::TARGET,
-            ErrorBody::new(
-                "stale-handle",
-                format!(
-                    "handle {h:?} does not match any form in {} — the form it names changed or is gone",
-                    file.display()
-                ),
-            )
-            .with_hint("re-run tree to get current handles"),
-        )),
+        0 => {
+            // No assigned handle matches. A hand-computed pure content hash —
+            // the blake3 of the form's own bytes — is not a node's `raw` when
+            // that content is duplicated: every copy of a duplicated form gets
+            // a position-folded `raw`. So fall back to matching the raw
+            // *content* hash: a form the user named by its content resolves to
+            // the form(s) carrying that exact content. More than one such form
+            // is ambiguous, never a lying "changed or is gone".
+            let content_hits: Vec<&handle::Node> = nodes
+                .iter()
+                .filter(|n| {
+                    blake3::hash(&bytes[n.start_byte..n.end_byte])
+                        .to_hex()
+                        .to_string()
+                        .starts_with(h)
+                })
+                .collect();
+            match content_hits.len() {
+                0 => Err(Fail(
+                    exit::TARGET,
+                    ErrorBody::new(
+                        "stale-handle",
+                        format!(
+                            "handle {h:?} does not match any form in {} — the form it names changed or is gone",
+                            file.display()
+                        ),
+                    )
+                    .with_hint("re-run tree to get current handles"),
+                )),
+                1 => Ok(content_hits[0].clone()),
+                _n => Err(Fail(
+                    exit::TARGET,
+                    ErrorBody::new("ambiguous-handle", ambiguous_handle_message(h, &content_hits))
+                        .with_hint("re-run tree and copy a longer prefix"),
+                )),
+            }
+        }
         1 => Ok(hits[0].clone()),
         _n => {
             Err(Fail(

@@ -51,12 +51,19 @@ pub(crate) fn build_handle_summary(
     let at_path = new_nodes.iter().find(|n| n.path == node.path);
     match mode {
         Mode::Replace | Mode::Patch => {
-            let line = at_path.map(|n| n.line).unwrap_or(node.line);
+            // Head/name/kind describe what now sits at the target — the
+            // POST-edit node at the same path, so the summary never
+            // contradicts its own forms table. When the new node can't be
+            // located the pre-edit node stands in (its handle was not
+            // recomputable); a name may legitimately be absent, in which case
+            // the label falls back through head -> kind as usual.
+            let post = at_path.unwrap_or(node);
+            let line = post.line;
             let mut summary = serde_json::json!({
                 "action": if mode == Mode::Replace { "replaced" } else { "patched" },
-                "kind": node.kind,
-                "name": node.name,
-                "head": node.head,
+                "kind": post.kind,
+                "name": post.name,
+                "head": post.head,
                 "line": line,
                 "wasKind": node.kind,
                 "wasLine": node.line,

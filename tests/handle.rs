@@ -643,3 +643,127 @@ fn human_summary_label_uses_head_not_kind() {
     assert!(!has_dotted_path(text), "no dotted path in the human summary: {text}");
     assert_eq!(d["result"]["summary"]["head"], "inner");
 }
+
+// issue-19 (F-1): after replace/patch the edit summary's `head`/`name`/`kind`
+// describe what now sits at the target — the POST-edit node — never the
+// pre-edit form. A defn replaced by a `let` must not keep the old defn's
+// head/name, which would contradict the envelope's own forms table.
+#[test]
+fn replace_summary_reflects_post_edit_head_and_name() {
+    let f = fixture("sum-replace.clj", b"(defn one [] :x)\n");
+    let h = handle_at_full(&f, 1, 1);
+    // Replace the whole defn with a `let` (no def name, head `let`).
+    let (code, d, stderr) =
+        run_json(&["edit", &f, "--handle", &h, "--content", "(let [x 1] x)", "--json"], None);
+    assert_eq!(code, 0, "{d} {stderr}");
+    let s = &d["result"]["summary"];
+    // Post-edit identity: a `let`, head `let`, no name — matching the forms
+    // table, not the pre-edit defn.
+    assert_eq!(s["head"], "let");
+    assert!(s["name"].is_null(), "post-edit `let` has no def name: {d}");
+    assert_eq!(s["kind"], "list_lit");
+    // The pre-edit form's handle is preserved under the `was*` key.
+    assert_eq!(s["wasHandle"], h);
+    // The human text labels the new form by its post-edit head, and must not
+    // leak the stale pre-edit def name `one`.
+    let text = d["result"]["text"].as_str().expect("result.text");
+    assert!(text.contains("let"), "human text names the post-edit head: {text}");
+    assert!(!text.contains("one"), "stale pre-edit name must not leak: {text}");
+}
+
+#[test]
+fn replace_defn_to_defn_keeps_post_edit_name() {
+    // Sanity: a defn -> defn swap keeps the correct (post-edit) name, so the
+    // fix does not just drop names — it reports the new form's.
+    let f = fixture("sum-replace-same.clj", b"(defn one [x] (* x 2))\n");
+    let h = handle_at_full(&f, 1, 1);
+    let (code, d, stderr) = run_json(
+        &[
+            "edit", &f, "--handle", &h, "--content", "(defn one [x] (* x 3))", "--json",
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "{d} {stderr}");
+    let s = &d["result"]["summary"];
+    assert_eq!(s["name"], "one");
+    assert_eq!(s["head"], "defn");
+}
+
+#[test]
+fn patch_summary_keeps_post_edit_head_and_name() {
+    // Sanity: a patch keeps the enclosing form's head/name (unchanged), and
+    // reports them from the post-edit node rather than a hardcoded defn.
+    let f = fixture("sum-patch.clj", b"(defn helper [x] (inc x))\n");
+    let h = handle_at_full(&f, 1, 1);
+    let (code, d, stderr) = run_json(
+        &[
+            "edit", &f, "--handle", &h, "--mode", "patch", "--old-text", "inc",
+            "--new-text", "dec", "--json",
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "{d} {stderr}");
+    let s = &d["result"]["summary"];
+    assert_eq!(s["head"], "defn");
+    assert_eq!(s["name"], "helper");
+    let text = d["result"]["text"].as_str().expect("result.text");
+    assert!(text.contains("helper"), "patch human text names the form: {text}");
+}
+
+// issue-19 companion (F-3): a pure content hash (the blake3 of a form's own
+// bytes) for a form that is duplicated is not a node's `raw` — every copy of
+// a duplicated form carries a position-folded `raw`. The pre-fix resolver
+// therefore reported a lying `stale-handle`; it must report
+// `ambiguous-handle` naming both candidates instead.
+#[test]
+fn pure_content_hash_of_duplicate_forms_is_ambiguous_not_stale() {
+    let f = fixture("dup-hash.clj", b"(defn dup [] :x)\n\n(defn dup [] :x)\n");
+    // The pure content hash: neither node's `raw` (both are position-folded).
+    let content_hash = blake3::hash(b"(defn dup [] :x)").to_hex().to_string();
+    let (code, d, stderr) = run_json(
+        &[
+            "edit", &f, "--handle", &content_hash, "--dry-run",
+            "--content", "(defn dup [] :y)", "--json",
+        ],
+        None,
+    );
+    assert_eq!(code, 3, "{d} {stderr}");
+    assert_eq!(d["error"]["code"], "ambiguous-handle");
+    // Both candidates are named: the two line ranges (forms on lines 1 and 3).
+    let msg = d["error"]["message"].as_str().expect("error.message");
+    assert!(msg.contains("2 forms"), "message names both candidates: {msg}");
+    assert!(msg.contains("1\u{2013}1"), "first candidate's line range: {msg}");
+    assert!(msg.contains("3\u{2013}3"), "second candidate's line range: {msg}");
+    // Dry run: nothing written.
+    assert_eq!(
+        std::fs::read(&f).unwrap(),
+        b"(defn dup [] :x)\n\n(defn dup [] :x)\n",
+        "dry-run must not write"
+    );
+}
+
+// A pure content hash for a UNIQUE form still resolves (its `raw` IS the
+// content hash), and a genuinely unknown hash is still a `stale-handle`.
+#[test]
+fn pure_content_hash_unique_resolves_unknown_is_stale() {
+    let f = fixture("dup-hash-unique.clj", b"(defn solo [] :x)\n");
+    let solo_hash = blake3::hash(b"(defn solo [] :x)").to_hex().to_string();
+    let (code, d, stderr) = run_json(
+        &[
+            "edit", &f, "--handle", &solo_hash, "--dry-run",
+            "--content", "(defn solo [] :y)", "--json",
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "unique pure content hash resolves: {d} {stderr}");
+    // A hash matching no content and no raw is still a genuine stale handle.
+    let (code, d, stderr) = run_json(
+        &[
+            "edit", &f, "--handle", "ffffffff", "--dry-run",
+            "--content", "(defn solo [] :y)", "--json",
+        ],
+        None,
+    );
+    assert_eq!(code, 3, "{d} {stderr}");
+    assert_eq!(d["error"]["code"], "stale-handle");
+}
