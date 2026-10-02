@@ -21,6 +21,10 @@ You are the single writer thread. Execute the assigned task with narrow, coheren
 - For a small change inside a large form, do not re-transcribe the whole form. `clj_get`
   the exact bytes, then `clj_edit` with `oldText`/`newText`: the patch must occur exactly
   once inside that form and never cross its boundary. Untouched bytes stay byte-identical.
+- For sequential edits to the same form, use the handle returned by the previous `clj_edit`
+  (the `next handle:` line); do not re-fetch (`clj_tree`/`clj_get`) between patches. Insert
+  results list the `inserted handles:` instead. Only re-run `clj_tree` after a `stale-handle`
+  refusal.
 - **On any `patch-not-found`/`patch-ambiguous`: re-run `clj_get` and build the patch from
   those exact bytes.** Never re-type form content from a `bash`/`sed` read — that is the
   transcription failure patch mode exists to prevent. (Tool guidance finding: agents burn

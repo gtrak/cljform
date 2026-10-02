@@ -147,10 +147,10 @@ export default function ClojureForms(pi: ExtensionAPI) {
 	async function execCljform(
 		args: string[],
 		opts: { timeout: number },
-	): Promise<{ stdout: string; stderr: string; execError: boolean }> {
+	): Promise<{ stdout: string; stderr: string; code: number; execError: boolean }> {
 		try {
 			const result = await pi.exec(resolveBin(), args, opts);
-			return { stdout: result.stdout, stderr: result.stderr, execError: false };
+			return { stdout: result.stdout, stderr: result.stderr, code: result.code, execError: false };
 		} catch (err) {
 			const isENOENT =
 				typeof err === "object" && err !== null && (err as { code?: string }).code === "ENOENT";
@@ -158,7 +158,7 @@ export default function ClojureForms(pi: ExtensionAPI) {
 			const stderr = isENOENT
 				? `${bin} not found — run \`cargo install --path .\` or set CLJFORM_BIN to the cljform binary`
 				: `cljform failed to run: ${err instanceof Error ? err.message : String(err)}`;
-			return { stdout: "", stderr, execError: true };
+			return { stdout: "", stderr, code: -1, execError: true };
 		}
 	}
 
@@ -277,13 +277,15 @@ export default function ClojureForms(pi: ExtensionAPI) {
 			if (result.execError) {
 				return { content: [{ type: "text", text: result.stderr }], isError: true };
 			}
-			const out = parseEnvelope(result.stdout);
-			if (!out || !out.ok) {
-				const text = out?.error ? errorText(out) : `cljform failed: ${result.stderr || result.stdout}`;
-				return { content: [{ type: "text", text }], isError: true };
-			}
-			const r = out.result ?? {};
+			// JSON path: the CLI emits a JSON envelope (tree --json). Parse it as
+			// before.
 			if (params.json) {
+				const out = parseEnvelope(result.stdout);
+				if (!out || !out.ok) {
+					const text = out?.error ? errorText(out) : `cljform failed: ${result.stderr || result.stdout}`;
+					return { content: [{ type: "text", text }], isError: true };
+				}
+				const r = out.result ?? {};
 				const nodes: TreeNode[] = (r.nodes as TreeNode[]) ?? [];
 				const lines = [
 					`${params.path}: ${nodes.length} nodes · ${out.file_hash?.slice(0, 19)}…`,
@@ -294,10 +296,17 @@ export default function ClojureForms(pi: ExtensionAPI) {
 				];
 				return { content: [{ type: "text", text: lines.join("\n") }], details: { nodes } };
 			}
-			return {
-				content: [{ type: "text", text: (r.text ?? "").replace(/^\uFEFF/, "").trimEnd() }],
-				details: { fileHash: out.file_hash },
-			};
+			// Human path: `tree --human` prints the annotated source directly — not a
+			// JSON envelope. On success (exit 0) pass the stdout text straight through;
+			// on failure surface the error envelope if parseable, else stderr/stdout.
+			if (result.code === 0) {
+				return {
+					content: [{ type: "text", text: result.stdout.replace(/^\uFEFF/, "").trimEnd() }],
+				};
+			}
+			const out = parseEnvelope(result.stdout);
+			const text = out?.error ? errorText(out) : `cljform failed: ${result.stderr || result.stdout}`;
+			return { content: [{ type: "text", text }], isError: true };
 		},
 	});
 
@@ -620,7 +629,22 @@ export default function ClojureForms(pi: ExtensionAPI) {
 		lines.push(...warningsText(out.warnings ?? []));
 		for (const n of out.notes ?? []) lines.push(`note: ${n}`);
 		if (r.changed !== undefined) lines.push(`changed: ${r.changed}, untouched: ${r.untouched}`);
-		if (params.dryRun) lines.push("(dry run — nothing written)");
+		if (params.dryRun) {
+			lines.push("(dry run — nothing written)");
+		} else {
+			// Next-handle affordance: source from the JSON envelope (never re-parse the
+			// human text). replace/patch point at the target's new handle; insert-
+			// after/before list the inserted forms' handles; delete prints nothing.
+			const s: any = r.summary ?? {};
+			if (s.action === "replaced" || s.action === "patched") {
+				const h = s.handle ?? s.wasHandle;
+				if (h) lines.push(`next handle: ⟦${h}⟧ — use it for the next edit to this form`);
+			} else if (s.action === "inserted" && Array.isArray(s.handles) && s.handles.length > 0) {
+				const handles = s.handles.map((hh: string) => `⟦${hh}⟧`).join(", ");
+				const anchor = s.wasHandle ? ` (anchor ⟦${s.wasHandle}⟧)` : "";
+				lines.push(`inserted handles: ${handles}${anchor} — use these for the next edit`);
+			}
+		}
 		return { content: [{ type: "text", text: lines.join("\n") }], details: { forms: out.forms, result: r } };
 	}
 
