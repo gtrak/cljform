@@ -45,8 +45,14 @@ const INERT_KINDS: &[&str] = &[
     "str_lit",
 ];
 
-/// Worker-thread stack size for parsing (deep data structures recurse hard).
-const PARSE_STACK_BYTES: usize = 64 * 1024 * 1024;
+/// Worker-thread stack size for parsing (deep data structures recurse hard;
+/// the recursive walks below each carry a frame per nesting level, so the
+/// stack is bounded by nesting depth, not by file size). Measured on the
+/// state-carrying detector walk: 64 MiB aborts (rc 134) at ~100k depth, 128 MiB
+/// at ~200k, so 256 MiB covers the 50k spec target with wide margin (reaching
+/// ~300k+ depth). The reservation is virtual-only — peak RSS stays ~200 MiB
+/// regardless — so the larger bound costs nothing but address space.
+const PARSE_STACK_BYTES: usize = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Form {
@@ -284,20 +290,55 @@ fn build_table(root: &Node, bytes: &[u8]) -> Vec<Form> {
     forms
 }
 
+/// Predicate: does this (base or qualified) head act as a host for one
+/// detector rule. One per rule, passed in rule order.
+pub type HostMatcher = Box<dyn Fn(&str) -> bool>;
+
+/// Per-rule "innermost enclosing host" state carried down the
+/// [`walk_with_ancestors`] stack, so each visited node reads its answer in
+/// O(rules) instead of rescanning the whole ancestor stack. One entry per
+/// rule; `None` = no enclosing host for that rule. A level whose stack top
+/// hosts a rule shadows (replaces) the entry above; levels whose head hosts
+/// no rule — including transparent ones such as reader conditionals — keep
+/// the entries unchanged (their branches splice into the enclosing scope).
+#[derive(Clone)]
+pub struct RuleHost<'a> {
+    /// Base (unqualified) head of the innermost host.
+    pub head: String,
+    pub node: Option<Node<'a>>,
+}
+
+impl RuleHost<'_> {
+    fn none() -> Self {
+        RuleHost {
+            head: String::new(),
+            node: None,
+        }
+    }
+}
+
 /// Run `f` over every node in the subtree, with the stack of enclosing
-/// list-form heads. `f` returns false to skip the node's subtree.
+/// list-form heads and the per-rule [`RuleHost`] state for that node.
+/// `f` returns false to skip the node's subtree.
 /// Must run on the big-stack worker (recursion depth ∝ nesting depth).
-pub fn walk_with_ancestors<F>(root: Node, bytes: &[u8], f: &mut F)
-where
-    F: FnMut(Node, &[(String, Node)]) -> bool,
+pub fn walk_with_ancestors<'a, F>(
+    root: Node<'a>,
+    bytes: &[u8],
+    rule_hosts: &mut Vec<Vec<RuleHost<'a>>>,
+    host_match: &[HostMatcher],
+    f: &mut F,
+) where
+    F: FnMut(Node<'a>, &[(String, Node<'a>)], &[RuleHost<'a>]) -> bool,
 {
     fn go<'a, F>(
         node: Node<'a>,
         bytes: &[u8],
         stack: &mut Vec<(String, Node<'a>)>,
+        rule_hosts: &mut Vec<Vec<RuleHost<'a>>>,
+        host_match: &[HostMatcher],
         f: &mut F,
     ) where
-        F: FnMut(Node<'a>, &[(String, Node<'a>)]) -> bool,
+        F: FnMut(Node<'a>, &[(String, Node<'a>)], &[RuleHost<'a>]) -> bool,
     {
         if INERT_KINDS.contains(&node.kind()) {
             return;
@@ -311,29 +352,46 @@ where
             None
         };
         // Visit with ancestors only (the node itself is not its own host).
-        let descend = f(node, stack);
+        let current = rule_hosts.last().map(Vec::as_slice).unwrap_or(&[]);
+        let descend = f(node, stack, current);
         if let Some(h) = &head {
             // `(comment ...)` bodies are inert scratch space.
             if h == "comment" || !descend {
                 return;
             }
+            // Shadow the entries above for the rules this level hosts; the
+            // rest are carried through unchanged.
+            let mut entry = if current.is_empty() {
+                (0..host_match.len()).map(|_| RuleHost::none()).collect()
+            } else {
+                current.to_vec()
+            };
+            let base = base_head(h);
+            for (rh, matches) in entry.iter_mut().zip(host_match.iter()) {
+                if matches(base) {
+                    rh.head = base.to_string();
+                    rh.node = Some(node);
+                }
+            }
             stack.push((h.clone(), node));
+            rule_hosts.push(entry);
         }
         if descend {
             let mut cursor = node.walk();
             let children: Vec<Node> = node.children(&mut cursor).collect();
             for child in children {
-                go(child, bytes, stack, f);
+                go(child, bytes, stack, rule_hosts, host_match, f);
             }
         }
         if head.is_some() {
             stack.pop();
+            rule_hosts.pop();
         }
     }
     let mut stack = Vec::new();
     let mut cursor = root.walk();
     let children: Vec<Node> = root.children(&mut cursor).collect();
     for child in children {
-        go(child, bytes, &mut stack, f);
+        go(child, bytes, &mut stack, rule_hosts, host_match, f);
     }
 }

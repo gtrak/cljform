@@ -79,8 +79,20 @@ fn detect_d3(forms: &[Form]) -> Vec<DetectorWarning> {
 pub fn run_detectors(root: &Node, forms: &[Form], bytes: &[u8]) -> Vec<DetectorWarning> {
     let mut warnings = detect_d3(forms);
 
-    parser::walk_with_ancestors(*root, bytes, &mut |node: Node,
-                                                    stack: &[(String, Node)]| {
+    // Host-membership matchers (one per rule, in rule order) handed to the
+    // walker, which shadows the carried state per level.
+    let host_match: Vec<parser::HostMatcher> = RULES
+        .iter()
+        .map(|(_, hosts, _)| -> parser::HostMatcher {
+            let hosts: Vec<String> = hosts.iter().map(|s| s.to_string()).collect();
+            Box::new(move |head: &str| hosts.iter().any(|h| parser::head_matches(head, h)))
+        })
+        .collect();
+    let mut rule_hosts: Vec<Vec<parser::RuleHost>> = Vec::new();
+
+    parser::walk_with_ancestors(*root, bytes, &mut rule_hosts, &host_match, &mut |node: Node,
+                                                                          _stack,
+                                                                          rule_hosts| {
         let head = match parser::head_symbol(node, bytes) {
             Some(h) => h,
             None => return true,
@@ -90,23 +102,26 @@ pub fn run_detectors(root: &Node, forms: &[Form], bytes: &[u8]) -> Vec<DetectorW
         if node.kind() == "read_cond_lit" {
             return true;
         }
-        // Innermost enclosing host that forbids this head (by base name).
-        for (host_head, host_node) in stack.iter().rev() {
-            let mut matched: Option<(&str, Node)> = None;
-            for (id, hosts, forb) in RULES.iter() {
-                // D2 is "accidental local def": any definition-like head
-                // counts, so `defmethod` and project def-macros are caught too.
-                let forbidden = forb.iter().any(|f| parser::head_matches(&head, f))
-                    || (*id == "D2" && parser::is_def_like(parser::base_head(&head)));
-                if forbidden && hosts.iter().any(|h| parser::head_matches(host_head, h)) {
-                    matched = Some((*id, *host_node));
-                    break;
-                }
-            }
-            let Some((id, host_node)) = matched else {
-                continue;
+        // `rule_hosts` carries the innermost enclosing host for each rule at
+        // this depth — what the old per-node ancestor stack scan recomputed.
+        // Scanning rules in order against per-rule innermost hosts fires the
+        // same (rule, host) pair the level scan did, because D2's host list
+        // is a subset of D1's: the innermost host of any rule is a D1 host,
+        // and a D2-only fallthrough lands on the innermost D2 host exactly
+        // as the level scan's fallthrough did.
+        for ((id, _hosts, forb), rh) in RULES.iter().zip(rule_hosts.iter()) {
+            let host_node = match rh.node {
+                Some(n) => n,
+                None => continue,
             };
-            let host_base = parser::base_head(host_head);
+            // D2 is "accidental local def": any definition-like head
+            // counts, so `defmethod` and project def-macros are caught too.
+            let forbidden = forb.iter().any(|f| parser::head_matches(&head, f))
+                || (*id == "D2" && parser::is_def_like(parser::base_head(&head)));
+            if !forbidden {
+                continue;
+            }
+            let host_base = &rh.head; // carried state stores the base head
             let host_name = parser::def_name(host_node, host_base, bytes);
             let host_label = match host_name {
                 Some(n) => format!("{host_base} {n}"),
