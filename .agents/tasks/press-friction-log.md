@@ -41,3 +41,21 @@
 - #_ discards: invisible to tree/get (no handle), bytes preserved — correct.
 - Two-forms-on-one-line insert-after: split cleanly, sibling form's content
   hash unchanged. Correct seam behavior.
+## Older-build findings re-tested against current build (user report, pre-T12)
+Both reported silent-corruption modes DO NOT reproduce (repros in /tmp/repro17):
+- "Reindent moved an if-let else-branch out to defn level": NOT reproducible.
+  Lying indentation (else at col 2 under a col-2 if-let) -> structure preserved,
+  else still inside (get's contains: if-let:1); only an alignment nudge. Mixed
+  tabs/spaces -> normalized to spaces, structure correct. Col-0 closer ->
+  pulled up to the last content line, same form structure. Credible fixes:
+  paren-mode-only reindent (paren mode never inserts closers mid-line, so it
+  cannot relocate a branch), plus the format_preserves_tokens gate (closers
+  may only move earlier) and I1-I6 post-splice verification.
+- "Multi-form insert-after silently dropped a trailing form": NOT reproducible.
+  4-form insert (comment + 3 defs): all inserted, count in table; no-trailing-
+  newline variant: both forms inserted. contentForms count is visible in the
+  JSON for sent-vs-written comparison.
+- The reporter's defensive rules (re-get to verify after deep inserts;
+  autoFormat:false for pre-balanced content) remain sensible belt-and-braces,
+  and the next-handle affordance makes the re-get cheap. Kept as guidance,
+  not requirements.
