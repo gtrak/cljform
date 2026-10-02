@@ -1278,6 +1278,13 @@ fn build_patch_payload(
     // §10.4: view markers never reach the file.
     let old = seam::strip_view_markers_into(old_raw, notes);
     let new = seam::strip_view_markers_into(new_text.as_deref().unwrap_or(""), notes);
+    // Issue 18 (C-1): the bytes actually WRITTEN (the replacement) must adopt
+    // the file's dominant line ending so the spliced region stays
+    // format-canonical. `old` is left byte-exact on purpose: it is the
+    // exact-match needle (the F4 "exact bytes on mismatch" affordance), and
+    // a mismatching needle is a refusal, not a normalization.
+    let crlf = seam::dominant_crlf(bytes);
+    let new = seam::normalize_line_endings(&new, crlf);
     // Patch is handle-only: the usage check above guarantees a node.
     let node = handle_node
         .expect("patch requires --handle (validated above)");
@@ -1375,6 +1382,18 @@ fn build_prepared_payload(
     let raw = read_content(content, content_file)?;
     // §10.4: view markers never reach the file.
     let stripped = seam::strip_view_markers_into(&raw, notes);
+    // Issue 18 (C-1): the spliced region must use the FILE's dominant line
+    // ending, not the content's, so the edit keeps the file format-canonical
+    // (format shows an empty diff after the edit). The pipeline itself is
+    // LF-native — the bracket repair (materialize::indent_mode) places closers
+    // against raw line bytes, and a CRLF `\r` would land mid-line, so the
+    // content is run through prepare / base-shift dedent / parinfer reindent /
+    // base-shift prefix on clean LF, then the finished region is converted to
+    // the file's ending in one shot below (a no-op for an already-LF file). The
+    // seam separators the splicer adds around the region take the file's
+    // ending independently (splice.rs).
+    let crlf = seam::dominant_crlf(bytes);
+    let stripped = seam::normalize_line_endings(&stripped, false);
     let (base_col, base_shift) = match handle_node {
         Some(node) => {
             let start = node.start_byte;
@@ -1500,6 +1519,10 @@ fn build_prepared_payload(
             "reindented submitted content to the target column".to_string(),
         );
     }
+    // Issue 18 (C-1): the whole pipeline above ran on LF; convert the
+    // finished region (content + any base-shift line break) to the file's
+    // dominant line ending. No-op for an LF file.
+    let out = seam::normalize_line_endings(&out, crlf);
     prepared.bytes = out.into_bytes();
     Ok(Payload::Prepared(prepared))
 }

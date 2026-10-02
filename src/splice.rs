@@ -39,7 +39,9 @@ pub fn apply(bytes: &[u8], forms: &[Form], splice: &Splice) -> Vec<u8> {
                 && *end < bytes.len()
                 && bytes[*end] != b'\n'
             {
-                content.push(b'\n');
+                // Issue 18 (C-1): the guard newline takes the file's ending
+                // so the written region does not mix line endings.
+                content.extend_from_slice(if crate::seam::dominant_crlf(bytes) { b"\r\n" } else { b"\n" });
             }
             let mut out = Vec::with_capacity(bytes.len() + content.len());
             out.extend_from_slice(&bytes[..*start]);
@@ -108,34 +110,46 @@ fn leading_newlines(bytes: &[u8]) -> usize {
 fn insert_at(bytes: &[u8], pos: usize, content: &[u8]) -> Vec<u8> {
     // Separate the inserted block from its neighbours with a blank line
     // (top-level Clojure convention). Whitespace only: no form's bytes move.
-    let before_sep: &[u8] = if pos == 0 {
-        b""
+    // Issue 18 (C-1): the separators take the FILE's dominant line ending so
+    // an insert into a CRLF file does not leave LF seams (which would make
+    // the file non-format-canonical).
+    let eol: &[u8] = if crate::seam::dominant_crlf(bytes) { b"\r\n" } else { b"\n" };
+    let before_sep: Vec<u8> = if pos == 0 {
+        Vec::new()
     } else {
         match trailing_newlines(&bytes[..pos]) {
-            0 => b"\n\n",
-            1 => b"\n",
-            _ => b"",
+            0 => {
+                let mut v = eol.to_vec();
+                v.extend_from_slice(eol);
+                v
+            }
+            1 => eol.to_vec(),
+            _ => Vec::new(),
         }
     };
     let at_eof = pos >= bytes.len();
-    let after_sep: &[u8] = if at_eof {
-        b""
+    let after_sep: Vec<u8> = if at_eof {
+        Vec::new()
     } else {
         match leading_newlines(&bytes[pos..]) {
-            0 => b"\n\n",
-            1 => b"\n",
-            _ => b"",
+            0 => {
+                let mut v = eol.to_vec();
+                v.extend_from_slice(eol);
+                v
+            }
+            1 => eol.to_vec(),
+            _ => Vec::new(),
         }
     };
     let mut out =
         Vec::with_capacity(bytes.len() + content.len() + before_sep.len() + after_sep.len() + 1);
     out.extend_from_slice(&bytes[..pos]);
-    out.extend_from_slice(before_sep);
+    out.extend_from_slice(&before_sep);
     out.extend_from_slice(content);
-    out.extend_from_slice(after_sep);
+    out.extend_from_slice(&after_sep);
     out.extend_from_slice(&bytes[pos..]);
     if at_eof {
-        out.push(b'\n');
+        out.extend_from_slice(eol);
     }
     out
 }

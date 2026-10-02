@@ -175,6 +175,41 @@ pub(crate) fn reindent_prefix(content: &str, target_col: usize, prefix_first_lin
 pub(crate) fn is_blank_line(l: &str) -> bool {
     l.bytes().all(|b| b == b' ' || b == b'\t' || b == b'\r')
 }
+/// Issue 18 (C-1): the file's dominant line ending. Counts CRLF (`\r\n`)
+/// against bare LF (a `\n` not preceded by `\r`); a lone `\r` (legacy Mac)
+/// counts neither way. CRLF wins on a strict majority; a tie, an LF
+/// majority, or a newline-free file all resolve to LF. Deterministic and
+/// documented: all-CRLF -> CRLF, all-LF -> LF, mixed -> majority (tie -> LF).
+pub(crate) fn dominant_crlf(bytes: &[u8]) -> bool {
+    let mut crlf = 0usize;
+    let mut lf = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\n' {
+            if i > 0 && bytes[i - 1] == b'\r' {
+                crlf += 1;
+            } else {
+                lf += 1;
+            }
+            i += 1;
+        } else {
+            i += 1;
+        }
+    }
+    crlf > lf
+}
+/// Issue 18 (C-1): rewrite `text`'s line endings to the file's dominant
+/// style so a spliced region never mixes endings with its neighbours. Each
+/// line sheds a trailing `\r`, then the lines rejoin with `\r\n` (crlf) or
+/// `\n`. Idempotent; preserves the number of lines and the trailing-newline
+/// property. A lone `\r` not at a line end is left alone (out of scope).
+pub(crate) fn normalize_line_endings(text: &str, crlf: bool) -> String {
+    let sep = if crlf { "\r\n" } else { "\n" };
+    text.split('\n')
+        .map(|l| l.strip_suffix('\r').unwrap_or(l))
+        .collect::<Vec<_>>()
+        .join(sep)
+}
 /// Issue 14 R3 (the delete seam): when a delete leaves only the displaced
 /// parent closers on its tail line (whitespace + a run of closers), the
 /// file would be left unformatted — a closer line the format pass lifts.
