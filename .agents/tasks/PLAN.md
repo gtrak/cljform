@@ -78,3 +78,17 @@ Sequence (one worker subagent per issue):
   node table, the summary JSON, and the `ambiguous-handle` message; show the
   handle + a semantic label instead. `Node.path` stays internal (duplicate
   folding + post-edit lookup). Depends on 12.
+- **14 — edit output must be format-canonical**
+  (`issue-14-format-canonical.md`): live use caught a parse-valid,
+  format-non-canonical write (lone top-level closer). Root causes:
+  format_paren diverges from parinfer-rust on comment-adjacent pull-ups
+  (errors instead of formatting); the edit pipeline silently skips failed
+  content formatting; the insert seam displaces parent closers onto their
+  own line; pull-up leaves whitespace-only vacated lines. Invariant:
+  canonical input → edit → `format` is a no-op.
+- **15 — wrapper honesty + next-handle affordance**
+  (`issue-15-wrapper-affordance.md`): clj_tree's non-JSON path labels its own
+  output `cljform failed:` (parses an envelope out of human text); every
+  successful clj_edit appends `next handle: ⟦H⟧` so sequential patches chase
+  the returned handle instead of re-fetching (the sound replacement for the
+  requested valid-until-own-next-patch semantics). Depends on 14.

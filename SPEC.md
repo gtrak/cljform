@@ -186,9 +186,10 @@ of it feeds back into the inference. Other refusals: `not-one-form`
 (exit 1 — needs a human eye), `truncated-content` (exit 1, an unterminated
 opening fence). Content modes then reindent
 the prepared content in parinfer paren mode (default on; `--no-format-content`
-disables it): the candidate must re-parse and keep the token stream (the
-`format` gates, §10.5), otherwise the prepared content is kept with a note —
-never a failure. The content is then base-shifted to the target's column.
+disables it): the candidate must re-parse and pass the token gate (the
+`format` gates, §10.5), otherwise the prepared content is kept with a note
+saying the edit was written unformatted — never a failure, and never
+silent (issue 14). The content is then base-shifted to the target's column.
 `patch`'s `--old-text`/`--new-text` and `delete` carry no reformat of any
 kind. `patch` mode is exact-match:
 `--old-text` must occur exactly once inside the target form's bytes,
@@ -562,9 +563,11 @@ collection delimiter:
   before / insert-after / append / prepend — never patch or delete), the
   prepared content is reindented with the `format` parinfer paren-mode pass
   (§10.5) **by default**, gated exactly as `format` gates (candidate must
-  re-parse and keep the token stream; on refusal the prepared content is
-  kept and a note added, the edit never fails), and the result is then
-  base-shifted to the target's column. The reindent and the base-shift only
+  re-parse and pass the token gate, `format_preserves_tokens`; on refusal
+  — verification failure or a `format` pass error — the prepared content is
+  kept and a note is added saying the edit was written with unformatted
+  content, so a refused reindent is never silent, issue 14; the edit never
+  fails), and the result is then base-shifted to the target's column. The reindent and the base-shift only
   ever see the balanced, prepared content (issue 12): they are applied
   after the inference decision and never feed back into it, so the
   inference outcome is identical with or without the reindent and at any
@@ -606,14 +609,24 @@ checkout's `src/parinfer.rs`, not added as a dependency):
 - leading closing delimiters move up onto the previous content line (the
   paren trail), and whitespace between trailing closers is removed so
   closers become contiguous;
+- a line the pull-up empties is deleted, not left whitespace-only
+  (issue 14 — a deliberate extension beyond parinfer-rust, which leaves
+  the vacated line as-is; cljfmt-land removes it, and the pass itself
+  creates the line); a blank line the input already had, or a line that
+  still carries content after the lift, is left alone;
 - comment lines, string interiors, and blank lines are left alone.
 
 Candidate-first: the result mirrors `materialize`'s shape
 (`candidate`, `diff`, `note`) and is never written. Verification before
-emission: the candidate must re-parse clean and its token stream (the
-non-whitespace byte sequence) must equal the input's — only whitespace and
-the position of closing delimiters may change. A candidate that fails
-either is `format-error` (exit 1) and is never emitted.
+emission: the candidate must re-parse clean, and only whitespace and
+closing-delimiter positions may have changed. The gate is
+`format_preserves_tokens` (issue 14): the non-closer token stream is
+identical in order, the closer count is unchanged, and no closer moved
+LATER in the file (closer trails lift upward only). The raw
+non-whitespace byte sequence is deliberately NOT the gate: a closer
+lifted across a comment line reorders against the comment's bytes — a
+comment is not a token — and rejecting that reorder made comment-adjacent
+pull-ups `format-error` while the reference formatted them fine.
 
 **Differential gate:** `format_matches_parinfer_rust` runs both cljform and
 the installed parinfer-rust binary (`--input-format json --output-format
@@ -621,7 +634,13 @@ text`, paren mode) over a fixture corpus (existing fixtures plus
 flat / over-indented / under-indented / nested / standalone-closer /
 comment-line / string-with-newline / regex / `#(...)`/`#{...}` / CRLF /
 tab cases) and asserts byte equality. The test skips (never fails) when
-the binary is absent, so the suite stays hermetic.
+the binary is absent, so the suite stays hermetic. The vacated-line
+shapes (standalone closer line, CRLF/tab variants, the closer-after-
+string line, and the two comment-adjacent pull-ups) are excluded from
+that byte-equality corpus and asserted instead by
+`format_vacated_lines_documented_divergence`, which pins both sides:
+parinfer-rust's exact output (vacated line kept) and cljform's (vacated
+line deleted).
 
 ### 10.6 Deferred / out of scope
 
@@ -775,8 +794,9 @@ design):
   reference's `indent_delta` incremental machinery and mirrors its failure
   rules too (unmatched closer, hanging backslash, unbalanced comment
   quotes, unclosed string/opener → `format-error`, exit 1). Emission is
-  gated on re-parse + token-stream equality (only whitespace and
-  closing-delimiter position may move). Gated by the differential test
+  gated on re-parse + the token gate (only whitespace and
+  closing-delimiter position may move; a lifted closer may reorder against
+  comment bytes — §10.5, issue 14). Gated by the differential test
   `format_matches_parinfer_rust` against the installed parinfer-rust
   binary, which skips when the binary is absent.
 - **Definition heads are recognized by prefix, not a fixed list**, and the
@@ -817,3 +837,27 @@ design):
   column; nested inserts that introduce a line break carry the target
   column end to end). The wrapper exposes `clj_tree`, `clj_get` takes
   `--name`/`--handle`, and `clj_edit` targets by `handle` only.
+- **Edit output is format-canonical (issue 14).** A project format gate
+  caught a file cljform wrote: parse-valid but format-non-canonical (a
+  top-level closing paren alone on its own line). Four root causes
+  removed: (1) the verification gate rejected a closer lifted across a
+  comment line (the raw token stream reorders — comments are not tokens);
+  the gate is now `format_preserves_tokens` (non-closer stream equal, no
+  closer moves later), and the in-edit reindent uses it too. (2) A refused
+  in-edit reindent (gate failure or a `format_paren` error) is always
+  reported by a note naming that the edit was written unformatted —
+  best-effort, never silent. (3) The splice seam no longer leaves
+  displaced parent closers on their own line: the base-shifted content
+  never ends on a whitespace-only line, so insert-after / insert-before /
+  replace carry the displaced closers onto the last content line, and a
+  delete whose tail line holds only the displaced closers pulls them onto
+  the previous content line (re-parsed before commit; reverted on
+  failure). (4) A line emptied by a pull-up is deleted rather than left
+  whitespace-only — the documented §10.5 extension beyond parinfer-rust,
+  asserted by `format_vacated_lines_documented_divergence` on exactly the
+  vacated shapes (the differential byte-equality corpus keeps everything
+  else). New gate: `edit_output_is_format_canonical` — a canonical fixture
+  matrix × {replace, patch, insert-after, insert-before, delete, append},
+  and every successful edit must come back from `cljform format` as a
+  no-op (candidate == content); the R1–R4 repros are golden tests in
+  `tests/canonical.rs` and `tests/format.rs`.
