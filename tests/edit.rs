@@ -3,45 +3,10 @@
 
 mod common;
 
-use common::{assert_untouched, check_ok, fixture, fresh, forms, handle_of, run_json};
-
-/// The standard multi-form fixture (kept in sync with `common::fresh`):
-/// ns, def, defn, deftest, defn.
-const MULTI_FIXTURE: &[u8] =
-    br#"(ns c)
-
-(def config {:a 1})
-
-(defn helper [x]
-  (* x 2))
-
-(deftest helper-test
-  (is (= 4 (helper 2))))
-
-(defn last-one [] :done)
-"#;
-
-/// The multi-line nested fixture (nested-edit battery).
-const HEDIT_FIXTURE: &[u8] =
-    b"(ns t)\n\n(def config {:a 1})\n\n(defn helper [x]\n  (let [y [1 2]]\n    (when x\n      (+ y 1))))\n\n(def after :ok)\n";
-
-/// A nested node's handle, by (start line, depth). The structural position is
-/// carried in the JSON as `line` + `depth`; the `path` coordinate is internal
-/// and no longer serialized, so it cannot key the lookup (needs the full table).
-fn handle_at_path(file: &str, line: usize, depth: usize) -> String {
-    let (code, d, err) = run_json(&["tree", file, "--full", "--json"], None);
-    assert_eq!(code, 0, "{d} {err}");
-    d["result"]["nodes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|n| n["line"][0] == line && n["depth"] == depth)
-        .unwrap_or_else(|| panic!("no node at line {line} depth {depth}"))
-        ["handle"]
-        .as_str()
-        .unwrap()
-        .to_string()
-}
+use common::{
+    assert_untouched, check_ok, edit_args, fixture, fresh, forms, handle_at_full, handle_of,
+    run_json, FRESH_FIXTURE, HEDIT_FIXTURE,
+};
 
 #[test]
 fn replace_by_handle() {
@@ -170,15 +135,12 @@ fn comment_gap_reseaming() {
         let name = c.name;
         let f = fixture(&format!("reseam-{name}.clj"), c.src.as_bytes());
         let h = handle_of(&f, c.op.1);
-        let mut argv: Vec<String> =
-            vec!["edit".into(), f.clone(), "--handle".into(), h, "--mode".into(), c.op.0.into()];
+        let mut extra: Vec<&str> = Vec::new();
         if let Some(content) = c.op.2 {
-            argv.push("--content".into());
-            argv.push(content.into());
+            extra.push("--content");
+            extra.push(content);
         }
-        argv.push("--json".into());
-        let args: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
-        let (code, d, err) = run_json(&args, None);
+        let (code, d, err) = edit_args(&f, Some(c.op.0), Some(&h), &extra);
         assert_eq!(code, 0, "{name}: {d} {err}");
         let text = std::fs::read_to_string(&f).unwrap();
         for s in c.must_contain {
@@ -237,18 +199,28 @@ fn battery_of_mutations_all_leave_parseable_file() {
     let hb = handle_of(&f, "b");
     let hc = handle_of(&f, "c");
     let hd = handle_of(&f, "d");
-    let ops: Vec<Vec<String>> = vec![
-        vec!["edit".into(), f.clone(), "--handle".into(), ha, "--content".into(), "(def a 10)".into()],
-        vec!["edit".into(), f.clone(), "--handle".into(), hb, "--content".into(), "(defn b [x] (inc x))".into()],
-        vec!["edit".into(), f.clone(), "--mode".into(), "append".into(), "--content".into(), "(def appended 1)".into()],
-        vec!["edit".into(), f.clone(), "--mode".into(), "prepend".into(), "--content".into(), "(def prepended 0)".into()],
-        vec!["edit".into(), f.clone(), "--handle".into(), hc, "--mode".into(), "delete".into()],
-        vec!["edit".into(), f.clone(), "--mode".into(), "insert-after".into(), "--handle".into(), hd, "--content".into(), "(def after-d 1)".into()],
+    #[derive(Debug)]
+    struct Op {
+        /// `--mode` (None: the default replace mode).
+        mode: Option<&'static str>,
+        handle: Option<String>,
+        content: Option<&'static str>,
+    }
+    let ops = vec![
+        Op { mode: None, handle: Some(ha), content: Some("(def a 10)") },
+        Op { mode: None, handle: Some(hb), content: Some("(defn b [x] (inc x))") },
+        Op { mode: Some("append"), handle: None, content: Some("(def appended 1)") },
+        Op { mode: Some("prepend"), handle: None, content: Some("(def prepended 0)") },
+        Op { mode: Some("delete"), handle: Some(hc), content: None },
+        Op { mode: Some("insert-after"), handle: Some(hd), content: Some("(def after-d 1)") },
     ];
     for op in &ops {
-        let mut args: Vec<&str> = op.iter().map(|s| s.as_str()).collect();
-        args.push("--json");
-        let (code, d, err) = run_json(&args, None);
+        let mut extra: Vec<&str> = Vec::new();
+        if let Some(content) = op.content {
+            extra.push("--content");
+            extra.push(content);
+        }
+        let (code, d, err) = edit_args(&f, op.mode, op.handle.as_deref(), &extra);
         assert_eq!(code, 0, "op {op:?} failed: {d} {err}");
         check_ok(&f);
     }
@@ -428,7 +400,7 @@ fn edit_format_content_reindents() {
     // it in parinfer paren mode (the flat body raises to the opener's
     // column + 1) and then base-shifts the result to the target column.
     let f = fixture("fmt-reindent.clj", b"(def x {:a 1})\n");
-    let h = handle_at_path(&f, 1, 2); // the map, at column 7
+    let h = handle_at_full(&f, 1, 2); // the map, at column 7
     let (code, d, stderr) = run_json(
         &[
             "edit",
@@ -461,7 +433,7 @@ fn edit_format_content_reindents() {
     // --no-format-content: the relative shape is preserved verbatim —
     // base-shift only, no parinfer raise.
     std::fs::write(&f, b"(def x {:a 1})\n").unwrap();
-    let h = handle_at_path(&f, 1, 2);
+    let h = handle_at_full(&f, 1, 2);
     let (code, d, stderr) = run_json(
         &[
             "edit",
@@ -498,7 +470,7 @@ fn edit_format_content_skips_unbalanced() {
     // first, then the parindent of the REPAIRED candidate — no format-error,
     // the edit still succeeds and lands base-shifted.
     let f = fixture("fmt-unbalanced.clj", b"(def x {:a 1})\n");
-    let h = handle_at_path(&f, 1, 2);
+    let h = handle_at_full(&f, 1, 2);
     let (code, d, stderr) = run_json(
         &[
             "edit",
@@ -616,7 +588,7 @@ fn mutations_leave_untouched_forms_identical() {
             // originals.
             name: "top-level replace",
             file: "bytes-top.clj",
-            src: MULTI_FIXTURE,
+            src: FRESH_FIXTURE.as_bytes(),
             target: Target::Named("helper"),
             content: "(defn helper [x]\n  (* x 10))",
             allowed: &[3],
@@ -640,7 +612,7 @@ fn mutations_leave_untouched_forms_identical() {
         let before = forms(&f);
         let h = match c.target {
             Target::Named(s) => handle_of(&f, s),
-            Target::Node(line, depth) => handle_at_path(&f, line, depth),
+            Target::Node(line, depth) => handle_at_full(&f, line, depth),
         };
         let (code, d, err) = run_json(
             &["edit", &f, "--handle", &h, "--content", c.content, "--json"],

@@ -5,7 +5,10 @@
 
 mod common;
 
-use common::{check_ok, fixture, forms, handle_of, run_json};
+use common::{
+    check_ok, deep_payload, fixture, forms, handle_of, run_json, BRACKET_LIT_CODE_FIXTURE,
+    BOM_FIXTURE, CRLF_DEF_FIXTURE,
+};
 use serde_json::json;
 
 // ─── line endings and BOM (table-driven) ────────────────────────────────────
@@ -28,7 +31,7 @@ fn line_endings_and_bom() {
         Case {
             // A BOM-prefixed file: the BOM must survive on disk after an edit.
             name: "bom",
-            src: b"\xef\xbb\xbf(ns bom)\n\n(def target 1)\n\n(def other 2)\n",
+            src: BOM_FIXTURE,
             form_count: 3,
             form_kind_at: Some((0, "ns")),
             form_name_at: None,
@@ -39,7 +42,7 @@ fn line_endings_and_bom() {
         },
         Case {
             name: "crlf",
-            src: b"(ns p)\r\n\r\n(def target 1)\r\n\r\n(defn f [x]\r\n  x)\r\n",
+            src: CRLF_DEF_FIXTURE,
             form_count: 3,
             form_kind_at: None,
             form_name_at: None,
@@ -99,14 +102,7 @@ fn line_endings_and_bom() {
 #[test]
 fn deeply_nested_data_parses_and_edits() {
     // 20k-deep vectors plus maps at depth: recursive walks must not overflow.
-    let depth = 20_000;
-    let mut s = String::from("(ns deep)\n(def payload ");
-    s.push_str(&"[".repeat(depth));
-    s.push_str(&"{:k ".repeat(200));
-    s.push('1');
-    s.push_str(&"}".repeat(200));
-    s.push_str(&"]".repeat(depth));
-    s.push_str(")\n");
+    let s = deep_payload(20_000);
     let f = fixture("deep-data.clj", s.as_bytes());
     let (code, d, _err) = run_json(&["check", &f, "--json"], None);
     assert_eq!(code, 0, "deep data must parse: {}",
@@ -167,7 +163,7 @@ fn deep_nesting_does_not_stack_overflow() {
 fn brackets_inside_strings_regex_chars_are_not_structure() {
     let f = fixture(
         "literals.clj",
-        b"(ns lit)\n\n(def tricky \"unclosed ( [ {\")\n\n(def pattern #\"\\(\\[\\{)\")\n\n(def chars \\( \\[ \\{)\n\n(defn f [] (str \")\" \\} #\"[)]\"))\n",
+        BRACKET_LIT_CODE_FIXTURE,
     );
     let (code, d, err) = run_json(&["check", &f, "--json"], None);
     assert_eq!(code, 0, "literal brackets are not structure: {d} {err}");

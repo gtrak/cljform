@@ -5,36 +5,12 @@
 
 mod common;
 
-use common::{fixture, forms, fresh, handle_of, run_json};
+use common::{fixture, forms, fresh, handle_of, run_json, GOLDEN_FIXTURE};
 use serde_json::json;
-
-const GOLDEN: &str = r#"(ns app.golden
-  (:require [clojure.string :as str]))
-
-(def ^:private config
-  "Top-level config."
-  {:retries 3})
-
-(defn- helper [x]
-  (let [y (str/trim x)]
-    y))
-
-(defmulti dispatch :type)
-
-(defmethod dispatch :k [m] m)
-
-(deftest helper-test
-  (is (= "a" (helper "a "))))
-
-#_(def discarded (throw (ex-info "never" {})))
-
-;; trailing comment
-(def final-thing 42)
-"#;
 
 #[test]
 fn form_table_is_stable() {
-    let f = fixture("golden.clj", GOLDEN.as_bytes());
+    let f = fixture("golden.clj", GOLDEN_FIXTURE.as_bytes());
     let (code, d, err) = run_json(&["forms", &f, "--json"], None);
     assert_eq!(code, 0, "{d} {err}");
     let forms = d["forms"].as_array().unwrap();
@@ -67,7 +43,7 @@ fn form_table_is_stable() {
 
 #[test]
 fn get_by_name_roundtrips_exact_bytes() {
-    let f = fixture("golden-roundtrip.clj", GOLDEN.as_bytes());
+    let f = fixture("golden-roundtrip.clj", GOLDEN_FIXTURE.as_bytes());
     let (code, d, err) = run_json(&["get", &f, "--name", "helper", "--json"], None);
     assert_eq!(code, 0, "{d} {err}");
     let form = d["result"]["form"].as_str().unwrap();
@@ -273,7 +249,7 @@ fn name_extraction() {
         Case {
             name: "metadata and docstrings",
             file: "name-golden.clj",
-            src: GOLDEN,
+            src: GOLDEN_FIXTURE,
             query: "config",
             kind: Some("def"),
             form_contains: &["^:private", "Top-level config."],

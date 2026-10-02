@@ -7,7 +7,7 @@
 
 mod common;
 
-use common::{fixture, run_json};
+use common::{fixture, run_json, FRESH_FIXTURE, GOLDEN_FIXTURE};
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -16,48 +16,12 @@ fn format_stdin(input: &str) -> (i32, serde_json::Value, String) {
     run_json(&["format", "--json"], Some(input.as_bytes()))
 }
 
-/// The existing fixtures from the other suites, reused as corpus entries.
-const GOLDEN_FIXTURE: &str = r#"(ns app.golden
-  (:require [clojure.string :as str]))
-
-(def ^:private config
-  "Top-level config."
-  {:retries 3})
-
-(defn- helper [x]
-  (let [y (str/trim x)]
-    y))
-
-(defmulti dispatch :type)
-
-(defmethod dispatch :k [m] m)
-
-(deftest helper-test
-  (is (= "a" (helper "a "))))
-
-#_(def discarded (throw (ex-info "never" {})))
-
-;; trailing comment
-(def final-thing 42)
-"#;
-
-const CLI_FIXTURE: &str = r#"(ns c)
-
-(def config {:a 1})
-
-(defn helper [x]
-  (* x 2))
-
-(deftest helper-test
-  (is (= 4 (helper 2))))
-
-(defn last-one [] :done)
-"#;
-
+/// The existing fixtures from the other suites (the golden and the fresh
+/// multi-form fixtures, now shared in `common`), reused as corpus entries.
 fn corpus() -> Vec<(&'static str, &'static str)> {
     vec![
         ("existing golden fixture", GOLDEN_FIXTURE),
-        ("existing cli fixture", CLI_FIXTURE),
+        ("existing cli fixture", FRESH_FIXTURE),
         ("flat", "(def a 1) (def b 2)\n"),
         ("over-indented", "  (def a 1)\n    (def b 2)\n"),
         ("under-indented", "(defn f [x]\n(inc x))\n"),

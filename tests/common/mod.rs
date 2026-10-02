@@ -1,12 +1,92 @@
 //! Shared helpers for the integration suite (issue 07). Every test crate
 //! declares `mod common;` and uses these instead of re-declaring its own
-//! copies of the envelope runner, fixture writer, and handle lookup.
+//! copies of the fixture content, envelope runner, handle lookups, and
+//! edit-invocation helpers.
 
 #![allow(dead_code)]
 
 use serde_json::Value;
 use std::io::Write;
 use std::process::{Command, Stdio};
+
+// ─── fixtures ──────────────────────────────────────────────────────────────
+
+/// The standard multi-form fixture: ns, def, defn, deftest, defn.
+pub const FRESH_FIXTURE: &str = r#"(ns c)
+
+(def config {:a 1})
+
+(defn helper [x]
+  (* x 2))
+
+(deftest helper-test
+  (is (= 4 (helper 2))))
+
+(defn last-one [] :done)
+"#;
+
+/// The multi-line nested fixture (the nested-edit battery): ns, a def with a
+/// map, a defn wrapping a let/when nest, and a trailing def.
+pub const HEDIT_FIXTURE: &[u8] =
+    b"(ns t)\n\n(def config {:a 1})\n\n(defn helper [x]\n  (let [y [1 2]]\n    (when x\n      (+ y 1))))\n\n(def after :ok)\n";
+
+/// The golden multi-form fixture: metadata + docstring, defn-, defmulti,
+/// defmethod, deftest, a discarded form, and a trailing comment.
+pub const GOLDEN_FIXTURE: &str = r#"(ns app.golden
+  (:require [clojure.string :as str]))
+
+(def ^:private config
+  "Top-level config."
+  {:retries 3})
+
+(defn- helper [x]
+  (let [y (str/trim x)]
+    y))
+
+(defmulti dispatch :type)
+
+(defmethod dispatch :k [m] m)
+
+(deftest helper-test
+  (is (= "a" (helper "a "))))
+
+#_(def discarded (throw (ex-info "never" {})))
+
+;; trailing comment
+(def final-thing 42)
+"#;
+
+/// A BOM-prefixed file (the BOM must survive round trips and edits).
+pub const BOM_FIXTURE: &[u8] = b"\xef\xbb\xbf(ns bom)\n\n(def target 1)\n\n(def other 2)\n";
+
+/// A CRLF file (round-trip shape: ns + two-line defn).
+pub const CRLF_FIXTURE: &[u8] = b"(ns p)\r\n\r\n(defn f [x]\r\n  x)\r\n";
+
+/// A CRLF file with an extra top-level def (parse/edit shape).
+pub const CRLF_DEF_FIXTURE: &[u8] = b"(ns p)\r\n\r\n(def target 1)\r\n\r\n(defn f [x]\r\n  x)\r\n";
+
+/// Bracket look-alikes inside a string, a regex, char literals, and a
+/// comment — none of them is structure.
+pub const BRACKET_LIT_FIXTURE: &[u8] = b"(ns lit)\n\n(def tricky \"unclosed ( [ {\")\n\n(def pattern #\"\\(\\[\\{)\")\n\n(def chars \\( \\[ \\{)\n\n; noise ( [ { }\n";
+
+/// The same bracket look-alikes, ending in a stringy defn instead of the
+/// noise comment.
+pub const BRACKET_LIT_CODE_FIXTURE: &[u8] = b"(ns lit)\n\n(def tricky \"unclosed ( [ {\")\n\n(def pattern #\"\\(\\[\\{)\")\n\n(def chars \\( \\[ \\{)\n\n(defn f [] (str \")\" \\} #\"[)]\"))\n";
+
+/// The deep-data payload shape: `depth`-nested vectors around 200 single-key
+/// maps (the 20k-deep round-trip / parse stress shape).
+pub fn deep_payload(depth: usize) -> String {
+    let mut s = String::from("(ns deep)\n(def payload ");
+    s.push_str(&"[".repeat(depth));
+    s.push_str(&"{:k ".repeat(200));
+    s.push('1');
+    s.push_str(&"}".repeat(200));
+    s.push_str(&"]".repeat(depth));
+    s.push_str(")\n");
+    s
+}
+
+// ─── runner and fixture writer ─────────────────────────────────────────────
 
 /// One temp dir for every fixture in the suite.
 fn dir() -> std::path::PathBuf {
@@ -63,24 +143,12 @@ pub fn fixture(name: &str, bytes: &[u8]) -> String {
     p.to_str().unwrap().to_string()
 }
 
-/// The standard multi-form fixture: ns, def, defn, deftest, defn.
+/// Write `FRESH_FIXTURE` as a fresh file; returns its path.
 pub fn fresh(name: &str) -> String {
-    fixture(
-        name,
-        br#"(ns c)
-
-(def config {:a 1})
-
-(defn helper [x]
-  (* x 2))
-
-(deftest helper-test
-  (is (= 4 (helper 2))))
-
-(defn last-one [] :done)
-"#,
-    )
+    fixture(name, FRESH_FIXTURE.as_bytes())
 }
+
+// ─── lookups ───────────────────────────────────────────────────────────────
 
 /// The top-level forms of `file` (the `forms --json` table).
 pub fn forms(file: &str) -> Vec<Value> {
@@ -97,6 +165,40 @@ pub fn tree_nodes(file: &str) -> Vec<Value> {
         .as_array()
         .unwrap()
         .clone()
+}
+
+/// The full node table (`tree --full --json`): every collection, top-level
+/// and nested. The default `tree --json` table carries the same nodes (the
+/// depth flags gate only the human view); the explicit `--full` keeps the
+/// full-tree intent of a caller spelled out.
+pub fn tree_full_nodes(file: &str) -> Vec<Value> {
+    let (code, out, stderr) = run_json(&["tree", file, "--full", "--json"], None);
+    assert_eq!(code, 0, "{stderr}");
+    out["result"]["nodes"]
+        .as_array()
+        .cloned()
+        .expect("tree --json carries result.nodes")
+}
+
+/// The node at a given (start line, depth) within a node table. The
+/// structural position is carried as `line` + `depth` — the `path` coordinate
+/// is internal and no longer serialized, so it cannot key the lookup.
+pub fn node_at(nodes: &[Value], line: usize, depth: usize) -> &Value {
+    nodes
+        .iter()
+        .find(|n| n["line"][0] == line && n["depth"] == depth)
+        .unwrap_or_else(|| panic!("no node at line {line} depth {depth}: {nodes:?}"))
+}
+
+/// A node's handle at a given (start line, depth) in the `tree --json` table.
+pub fn handle_at(file: &str, line: usize, depth: usize) -> String {
+    node_at(&tree_nodes(file), line, depth)["handle"].as_str().unwrap().to_string()
+}
+
+/// A node's handle at a given (start line, depth) in the full node table
+/// (nested nodes included).
+pub fn handle_at_full(file: &str, line: usize, depth: usize) -> String {
+    node_at(&tree_full_nodes(file), line, depth)["handle"].as_str().unwrap().to_string()
 }
 
 /// A node's handle, found by def name, or — for a top-level form — by its
@@ -118,19 +220,51 @@ pub fn handle_of(file: &str, name_or_addr: &str) -> String {
     panic!("no node named/addressed {name_or_addr:?}")
 }
 
-/// A node's handle at a given (start line, depth) in the `tree --json` table.
-/// The structural position is now carried as `line` + `depth` — the `path`
-/// coordinate is internal and no longer serialized.
-pub fn handle_at(file: &str, line: usize, depth: usize) -> String {
-    tree_nodes(file)
-        .iter()
-        .find(|n| n["line"][0] == line && n["depth"] == depth)
-        .unwrap_or_else(|| panic!("no node at line {line} depth {depth}"))
-        ["handle"]
-        .as_str()
-        .unwrap()
-        .to_string()
+// ─── edit invocation ───────────────────────────────────────────────────────
+
+/// `edit <file> --handle H --content C --json` → (exit, envelope, stderr).
+pub fn edit_content(file: &str, handle: &str, content: &str) -> (i32, Value, String) {
+    edit_content_extra(file, handle, content, &[])
 }
+
+/// `edit <file> --handle H --content C --json <extra flags…>` → (exit,
+/// envelope, stderr).
+pub fn edit_content_extra(
+    file: &str,
+    handle: &str,
+    content: &str,
+    extra: &[&str],
+) -> (i32, Value, String) {
+    let mut args: Vec<&str> = vec!["edit", file, "--handle", handle, "--content", content];
+    args.extend_from_slice(extra);
+    args.push("--json");
+    run_json(&args, None)
+}
+
+/// `edit <file> [--mode M] [--handle H] <extra flags…> --json` → (exit,
+/// envelope, stderr). The table-driven edit shapes: mode+handle,
+/// mode+content, and the patch flag pairs.
+pub fn edit_args(
+    file: &str,
+    mode: Option<&str>,
+    handle: Option<&str>,
+    extra: &[&str],
+) -> (i32, Value, String) {
+    let mut args: Vec<&str> = vec!["edit", file];
+    if let Some(m) = mode {
+        args.push("--mode");
+        args.push(m);
+    }
+    if let Some(h) = handle {
+        args.push("--handle");
+        args.push(h);
+    }
+    args.extend_from_slice(extra);
+    args.push("--json");
+    run_json(&args, None)
+}
+
+// ─── invariants ────────────────────────────────────────────────────────────
 
 /// `check --json` must come back ok: the file stayed parseable.
 pub fn check_ok(file: &str) {

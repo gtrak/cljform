@@ -4,7 +4,10 @@
 
 mod common;
 
-use common::{fixture, fresh, run_bytes, run_json};
+use common::{
+    fixture, fresh, handle_at_full, node_at, run_bytes, run_json, tree_full_nodes, deep_payload,
+    BRACKET_LIT_FIXTURE, BOM_FIXTURE, CRLF_FIXTURE, HEDIT_FIXTURE,
+};
 use serde_json::Value;
 
 /// The lossless property, end to end through the binary:
@@ -27,28 +30,18 @@ fn assert_roundtrip(file: &str, original: &[u8]) {
 #[test]
 fn strip_roundtrip_on_fixtures() {
     // Deeply nested data (the adversarial deep-data shape).
-    let depth = 20_000;
-    let mut s = String::from("(ns deep)\n(def payload ");
-    s.push_str(&"[".repeat(depth));
-    s.push_str(&"{:k ".repeat(200));
-    s.push('1');
-    s.push_str(&"}".repeat(200));
-    s.push_str(&"]".repeat(depth));
-    s.push_str(")\n");
+    let s = deep_payload(20_000);
     assert_roundtrip(&fixture("rt-deep.clj", s.as_bytes()), s.as_bytes());
 
     // BOM-prefixed file: the BOM must survive the round trip.
-    let bom = b"\xef\xbb\xbf(ns bom)\n\n(def target 1)\n\n(def other 2)\n";
-    assert_roundtrip(&fixture("rt-bom.clj", bom), bom);
+    assert_roundtrip(&fixture("rt-bom.clj", BOM_FIXTURE), BOM_FIXTURE);
 
     // CRLF file.
-    let crlf = b"(ns p)\r\n\r\n(defn f [x]\r\n  x)\r\n";
-    assert_roundtrip(&fixture("rt-crlf.clj", crlf), crlf);
+    assert_roundtrip(&fixture("rt-crlf.clj", CRLF_FIXTURE), CRLF_FIXTURE);
 
     // Brackets inside strings, a regex, char literals, and a comment —
     // none of them is structure.
-    let lit = b"(ns lit)\n\n(def tricky \"unclosed ( [ {\")\n\n(def pattern #\"\\(\\[\\{)\")\n\n(def chars \\( \\[ \\{)\n\n; noise ( [ { }\n";
-    assert_roundtrip(&fixture("rt-lit.clj", lit), lit);
+    assert_roundtrip(&fixture("rt-lit.clj", BRACKET_LIT_FIXTURE), BRACKET_LIT_FIXTURE);
 
     // `#(...)`, `#{...}`, reader conditionals, ns-maps, and quoted data.
     let reader = b"(ns r)\n\n(def fnl #(apply + %))\n\n(def s #{:a :b})\n\n(def q '(1 2 [3 4]))\n\n(defn f [x]\n  #?(:clj (inc x)\n     :cljs x)\n  x)\n\n(def m #:clj{:k 1}\n     :cljs{:k 2})\n";
@@ -154,34 +147,6 @@ fn annotate_conflict_is_refused() {
 // --handle edit resolution (issue 03, SPEC §10.3/§10.4)
 // ==============================================================
 
-const HEDIT_FIXTURE: &[u8] =
-    b"(ns t)\n\n(def config {:a 1})\n\n(defn helper [x]\n  (let [y [1 2]]\n    (when x\n      (+ y 1))))\n\n(def after :ok)\n";
-
-/// The full node table (nested nodes included), as JSON values.
-fn tree_full_nodes(file: &str) -> Vec<Value> {
-    let (code, out, stderr) = run_json(&["tree", file, "--full", "--json"], None);
-    assert_eq!(code, 0, "{stderr}");
-    out["result"]["nodes"]
-        .as_array()
-        .cloned()
-        .expect("tree --json carries result.nodes")
-}
-
-/// The node at a given (start line, depth). The structural position now lives
-/// in the JSON as `line` + `depth` — the `path` coordinate is internal and no
-/// longer serialized, so it cannot key the lookup.
-fn node_at(nodes: &[Value], line: usize, depth: usize) -> &Value {
-    nodes
-        .iter()
-        .find(|n| n["line"][0] == line && n["depth"] == depth)
-        .unwrap_or_else(|| panic!("no node at line {line} depth {depth}: {nodes:?}"))
-}
-
-fn handle_at(file: &str, line: usize, depth: usize) -> String {
-    let nodes = tree_full_nodes(file);
-    node_at(&nodes, line, depth)["handle"].as_str().unwrap().to_string()
-}
-
 #[test]
 fn edit_handle_replaces_nested_form() {
     let f = fixture("he-replace.clj", HEDIT_FIXTURE);
@@ -204,7 +169,7 @@ fn edit_handle_replaces_nested_form() {
 #[test]
 fn edit_handle_patch_delete_insert() {
     let f = fixture("he-modes.clj", HEDIT_FIXTURE);
-    let h = handle_at(&f, 6, 4); // [1 2]
+    let h = handle_at_full(&f, 6, 4); // [1 2]
 
     // Patch scoped to the node's bytes.
     let (code, d, stderr) = run_json(&[
@@ -217,7 +182,7 @@ fn edit_handle_patch_delete_insert() {
     assert!(text.contains("[1 9]"), "{text}");
 
     // Re-fetch: the patched node got a new handle.
-    let h2 = handle_at(&f, 6, 4);
+    let h2 = handle_at_full(&f, 6, 4);
     assert_ne!(h2, h);
 
     // Insert-after: the new form lands as a sibling on its own line, at the
@@ -235,7 +200,7 @@ fn edit_handle_patch_delete_insert() {
     );
 
     // Delete the node's byte range (re-fetched: the insert-after changed it).
-    let h3 = handle_at(&f, 6, 4);
+    let h3 = handle_at_full(&f, 6, 4);
     let (code, d, stderr) =
         run_json(&["edit", &f, "--handle", &h3, "--mode", "delete", "--json"], None);
     assert_eq!(code, 0, "{d} {stderr}");
@@ -248,7 +213,7 @@ fn edit_handle_patch_delete_insert() {
     assert!(text.contains("(inc 0)"), "sibling kept: {text}");
 
     // Insert before a different node: the def's map.
-    let hmap = handle_at(&f, 3, 2);
+    let hmap = handle_at_full(&f, 3, 2);
     let (code, d, stderr) = run_json(&[
         "edit", &f, "--handle", &hmap, "--mode", "insert-before", "--content", "(def marker :ok)", "--json",
     ], None);
@@ -274,7 +239,7 @@ fn edit_handle_nested_inserts_own_lines() {
     // Nested insert-after, single-line content: the new form lands on its
     // own line at the anchor's start column (4), after the anchor's last
     // child; the following closers stay put.
-    let h = handle_at(&f, 5, 3); // (when x ...)
+    let h = handle_at_full(&f, 5, 3); // (when x ...)
     let (code, d, stderr) = run_json(&[
         "edit", &f, "--handle", &h, "--mode", "insert-after", "--content", "(log x)", "--json",
     ], None);
@@ -289,7 +254,7 @@ fn edit_handle_nested_inserts_own_lines() {
     // anchor's start column (line 0 at 4, the body line at 4 + its relative
     // 2-space indent).
     std::fs::write(&f, src.as_bytes()).unwrap();
-    let h = handle_at(&f, 5, 3);
+    let h = handle_at_full(&f, 5, 3);
     let (code, d, stderr) = run_json(&[
         "edit", &f, "--handle", &h, "--mode", "insert-after",
         "--content", "(defn g [a]\n  a)", "--json",
@@ -304,7 +269,7 @@ fn edit_handle_nested_inserts_own_lines() {
     // the line above at the anchor's column and the anchor drops to its own
     // line at the same column.
     std::fs::write(&f, src.as_bytes()).unwrap();
-    let h = handle_at(&f, 6, 4); // (inner x)
+    let h = handle_at_full(&f, 6, 4); // (inner x)
     let (code, d, stderr) = run_json(&[
         "edit", &f, "--handle", &h, "--mode", "insert-before", "--content", "(log x)", "--json",
     ], None);
@@ -327,10 +292,10 @@ fn edit_handle_stale_is_refused() {
         "he-stale.clj",
         b"(def a 1)\n\n(defn f [x]\n  (let [q 5]\n    q))\n",
     );
-    let h = handle_at(&f, 4, 3);
+    let h = handle_at_full(&f, 4, 3);
     // Out-of-band: form 2 is replaced entirely, so the target node's content
     // changes (or disappears).
-    let h2 = handle_at(&f, 3, 1);
+    let h2 = handle_at_full(&f, 3, 1);
     let (code, _, stderr) = run_json(&[
         "edit", &f, "--handle", &h2, "--content", "(defn f [x] (inc x))", "--json",
     ], None);
@@ -351,7 +316,7 @@ fn edit_handle_stale_is_refused() {
 #[test]
 fn edit_handle_reaims_moved_form() {
     let f = fixture("he-reaim.clj", HEDIT_FIXTURE);
-    let h = handle_at(&f, 3, 1);
+    let h = handle_at_full(&f, 3, 1);
     // An earlier top-level insert moves the form from addr 2 to addr 3
     // (the seam inserts a blank-line-separated sibling before it).
     let (code, _, stderr) = run_json(&[
@@ -406,7 +371,7 @@ fn handle_survives_form_moves_and_edits_elsewhere() {
 #[test]
 fn edit_strips_view_markers_from_content() {
     let f = fixture("he-markers.clj", HEDIT_FIXTURE);
-    let h = handle_at(&f, 3, 1);
+    let h = handle_at_full(&f, 3, 1);
     // A form lifted straight from the human tree view, markers and all.
     let (code, out, stderr) = run_bytes(&["tree", &f, "--depth", "1", "--human"], None);
     assert_eq!(code, 0, "{stderr}");
@@ -443,7 +408,7 @@ fn edit_strips_view_markers_from_content() {
 #[test]
 fn edit_reindents_isolated_content() {
     let f = fixture("he-reindent.clj", b"(def x {:a 1})\n");
-    let h = handle_at(&f, 1, 2);
+    let h = handle_at_full(&f, 1, 2);
     // Isolated form at column 0; the target node sits at column 7.
     let (code, d, stderr) =
         run_json(&["edit", &f, "--handle", &h, "--content", "(defn f [a]\n  a)\n", "--json"], None);
@@ -472,7 +437,7 @@ fn get_and_edit_accept_decorated_handles() {
     // A handle lifted from the annotated tree view carries the ⟦…⟧ markers;
     // both resolvers must resolve it exactly like the bare handle.
     let f = fixture("he-decorated-handle.clj", HEDIT_FIXTURE);
-    let h = handle_at(&f, 3, 1); // def config
+    let h = handle_at_full(&f, 3, 1); // def config
     let decorated = format!("\u{27E6}{h}\u{27E7}");
 
     // get: the decorated handle resolves identically to the bare one.
@@ -508,7 +473,7 @@ fn get_and_edit_accept_decorated_handles() {
     );
 
     // A bare handle still works, with no strip note.
-    let h2 = handle_at(&f, 3, 1);
+    let h2 = handle_at_full(&f, 3, 1);
     let (code, d, stderr) = run_json(
         &["edit", &f, "--handle", &h2, "--content", "(def config {:a 8})", "--json"],
         None,
@@ -524,7 +489,7 @@ fn get_and_edit_accept_decorated_handles() {
     );
 
     // A bare handle with surrounding spaces resolves too (trim only, no note).
-    let h3 = handle_at(&f, 3, 1);
+    let h3 = handle_at_full(&f, 3, 1);
     let (code, d, stderr) = run_json(
         &["edit", &f, "--handle", &format!(" {h3} "), "--content", "(def config {:a 7})", "--json"],
         None,
@@ -577,7 +542,7 @@ fn tree_json_has_no_path() {
 #[test]
 fn human_summary_has_no_path() {
     let f = fixture("human-no-path.clj", HEDIT_FIXTURE);
-    let h = handle_at(&f, 6, 4); // the nested [1 2]
+    let h = handle_at_full(&f, 6, 4); // the nested [1 2]
     let (code, d, stderr) = run_json(
         &[
             "edit",
@@ -618,7 +583,7 @@ fn human_summary_label_uses_head_not_kind() {
     // Patch: exact text replacement inside the form. The label must be the
     // head symbol `inner`, not the kind `list_lit`, and no dotted path.
     let f = fixture("human-inner.clj", HINNER_FIXTURE);
-    let h = handle_at(&f, INNER_POS.0, INNER_POS.1);
+    let h = handle_at_full(&f, INNER_POS.0, INNER_POS.1);
     let (code, d, stderr) = run_json(
         &[
             "edit",
@@ -653,7 +618,7 @@ fn human_summary_label_uses_head_not_kind() {
     // Replace: whole-form swap. The label is the ORIGINAL node's head, still
     // `inner`, and still no dotted path.
     let f2 = fixture("human-inner-rep.clj", HINNER_FIXTURE);
-    let h2 = handle_at(&f2, INNER_POS.0, INNER_POS.1);
+    let h2 = handle_at_full(&f2, INNER_POS.0, INNER_POS.1);
     let (code, d, stderr) =
         run_json(&["edit", &f2, "--handle", &h2, "--content", "(inner z [9 9])", "--json"], None);
     assert_eq!(code, 0, "{d} {stderr}");
@@ -666,7 +631,7 @@ fn human_summary_label_uses_head_not_kind() {
     // Delete: the label falls back through name -> head -> "form", so `inner`
     // (the head) wins over the plain "form" fallback.
     let f3 = fixture("human-inner-del.clj", HINNER_FIXTURE);
-    let h3 = handle_at(&f3, INNER_POS.0, INNER_POS.1);
+    let h3 = handle_at_full(&f3, INNER_POS.0, INNER_POS.1);
     let (code, d, stderr) =
         run_json(&["edit", &f3, "--handle", &h3, "--mode", "delete", "--json"], None);
     assert_eq!(code, 0, "{d} {stderr}");

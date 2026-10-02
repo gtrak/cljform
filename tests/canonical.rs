@@ -8,7 +8,7 @@
 
 mod common;
 
-use common::{fixture, handle_at, handle_of, run_json};
+use common::{edit_args, fixture, handle_at, handle_of, run_json};
 
 /// Canonical fixture: flat top-level forms (no nested closers to displace).
 const FLAT: &str = "(ns a)\n\n(def x 1)\n\n(defn f [v]\n  (g v))\n\n(def y 2)\n";
@@ -40,9 +40,15 @@ fn assert_format_noop(file: &str, ctx: &str) {
 
 /// Run one edit and assert it succeeded (exit 0, `ok`, the file's bytes
 /// actually changed) and left a format-canonical file.
-fn edit_and_assert_canonical(file: &str, args: &[&str], ctx: &str) {
+fn edit_and_assert_canonical(
+    file: &str,
+    mode: &str,
+    handle: Option<String>,
+    extra: &[&str],
+    ctx: &str,
+) {
     let before = std::fs::read(file).unwrap();
-    let (code, d, err) = run_json(args, None);
+    let (code, d, err) = edit_args(file, Some(mode), handle.as_deref(), extra);
     assert_eq!(code, 0, "{ctx}: edit failed: {d} {err}");
     assert_eq!(d["ok"], true, "{ctx}: {d}");
     let after = std::fs::read(file).unwrap();
@@ -79,169 +85,111 @@ fn edit_output_is_format_canonical() {
         assert_format_noop(file, &format!("{name}: canonical precondition"));
     }
 
-    // (fixture label, file, edit args without the leading "edit"/file)
-    let cases: Vec<(&str, &str, Vec<String>)> = vec![
+    // One case: (fixture label, file, --mode, --handle value, extra flags).
+    struct Case<'a> {
+        label: &'static str,
+        file: &'a str,
+        mode: &'static str,
+        handle: Option<String>,
+        extra: Vec<&'static str>,
+    }
+    let cases: Vec<Case> = vec![
         // replace (top level, multi-line content)
-        (
-            "flat × replace",
-            &flat_replace,
-            vec![
-                "--mode".into(),
-                "replace".into(),
-                "--handle".into(),
-                handle_of(&flat_replace, "f"),
-                "--content".into(),
-                "(defn f [v]\n  (h v))".into(),
-                "--json".into(),
-            ],
-        ),
+        Case {
+            label: "flat × replace",
+            file: &flat_replace,
+            mode: "replace",
+            handle: Some(handle_of(&flat_replace, "f")),
+            extra: vec!["--content", "(defn f [v]\n  (h v))"],
+        },
         // replace (nested; the multi-line replacement's displaced parent
         // closers must land on the last content line)
-        (
-            "nested × replace",
-            &nested_replace,
-            vec![
-                "--mode".into(),
-                "replace".into(),
-                "--handle".into(),
-                handle_at(&nested_replace, 6, 4),
-                "--content".into(),
-                "(when a\n  (deep x))".into(),
-                "--json".into(),
-            ],
-        ),
+        Case {
+            label: "nested × replace",
+            file: &nested_replace,
+            mode: "replace",
+            handle: Some(handle_at(&nested_replace, 6, 4)),
+            extra: vec!["--content", "(when a\n  (deep x))"],
+        },
         // replace (R1: the content reindent lifts a closer across a
         // comment line; the gate must accept it, not silently skip it)
-        (
-            "comment × replace (R1)",
-            &comment_replace,
-            vec![
-                "--mode".into(),
-                "replace".into(),
-                "--handle".into(),
-                handle_of(&comment_replace, "h"),
-                "--content".into(),
-                "(defn k [x]\n  (bar x)\n  ;; note\n  )".into(),
-                "--json".into(),
-            ],
-        ),
+        Case {
+            label: "comment × replace (R1)",
+            file: &comment_replace,
+            mode: "replace",
+            handle: Some(handle_of(&comment_replace, "h")),
+            extra: vec!["--content", "(defn k [x]\n  (bar x)\n  ;; note\n  )"],
+        },
         // patch (exact-match; patch text is never reformatted)
-        (
-            "flat × patch",
-            &flat_patch,
-            vec![
-                "--mode".into(),
-                "patch".into(),
-                "--handle".into(),
-                handle_of(&flat_patch, "x"),
-                "--old-text".into(),
-                "1".into(),
-                "--new-text".into(),
-                "7".into(),
-                "--json".into(),
-            ],
-        ),
+        Case {
+            label: "flat × patch",
+            file: &flat_patch,
+            mode: "patch",
+            handle: Some(handle_of(&flat_patch, "x")),
+            extra: vec!["--old-text", "1", "--new-text", "7"],
+        },
         // insert-after (top-level seam)
-        (
-            "flat × insert-after",
-            &flat_after,
-            vec![
-                "--mode".into(),
-                "insert-after".into(),
-                "--handle".into(),
-                handle_of(&flat_after, "y"),
-                "--content".into(),
-                "(def w 9)".into(),
-                "--json".into(),
-            ],
-        ),
+        Case {
+            label: "flat × insert-after",
+            file: &flat_after,
+            mode: "insert-after",
+            handle: Some(handle_of(&flat_after, "y")),
+            extra: vec!["--content", "(def w 9)"],
+        },
         // insert-after (nested; the R3 seam — the displaced parent closers
         // must land on the last line of the inserted content)
-        (
-            "nested × insert-after (R3)",
-            &nested_after,
-            vec![
-                "--mode".into(),
-                "insert-after".into(),
-                "--handle".into(),
-                handle_at(&nested_after, 6, 4),
-                "--content".into(),
-                "(defn helper [x]\n  (bar x)\n  )".into(),
-                "--json".into(),
-            ],
-        ),
+        Case {
+            label: "nested × insert-after (R3)",
+            file: &nested_after,
+            mode: "insert-after",
+            handle: Some(handle_at(&nested_after, 6, 4)),
+            extra: vec!["--content", "(defn helper [x]\n  (bar x)\n  )"],
+        },
         // insert-before (nested; the anchor drops onto its own line at the
         // target column)
-        (
-            "nested × insert-before",
-            &nested_before,
-            vec![
-                "--mode".into(),
-                "insert-before".into(),
-                "--handle".into(),
-                handle_at(&nested_before, 6, 4),
-                "--content".into(),
-                "(pre x)".into(),
-                "--json".into(),
-            ],
-        ),
+        Case {
+            label: "nested × insert-before",
+            file: &nested_before,
+            mode: "insert-before",
+            handle: Some(handle_at(&nested_before, 6, 4)),
+            extra: vec!["--content", "(pre x)"],
+        },
         // insert-before (top-level seam)
-        (
-            "flat × insert-before",
-            &flat_before,
-            vec![
-                "--mode".into(),
-                "insert-before".into(),
-                "--handle".into(),
-                handle_of(&flat_before, "y"),
-                "--content".into(),
-                "(def w 9)".into(),
-                "--json".into(),
-            ],
-        ),
+        Case {
+            label: "flat × insert-before",
+            file: &flat_before,
+            mode: "insert-before",
+            handle: Some(handle_of(&flat_before, "y")),
+            extra: vec!["--content", "(def w 9)"],
+        },
         // delete (top-level whole form)
-        (
-            "flat × delete",
-            &flat_delete,
-            vec![
-                "--mode".into(),
-                "delete".into(),
-                "--handle".into(),
-                handle_of(&flat_delete, "y"),
-                "--json".into(),
-            ],
-        ),
+        Case {
+            label: "flat × delete",
+            file: &flat_delete,
+            mode: "delete",
+            handle: Some(handle_of(&flat_delete, "y")),
+            extra: vec![],
+        },
         // delete (nested form owning its whole line)
-        (
-            "deletable × delete (nested)",
-            &del_delete,
-            vec![
-                "--mode".into(),
-                "delete".into(),
-                "--handle".into(),
-                handle_at(&del_delete, 6, 4),
-                "--json".into(),
-            ],
-        ),
+        Case {
+            label: "deletable × delete (nested)",
+            file: &del_delete,
+            mode: "delete",
+            handle: Some(handle_at(&del_delete, 6, 4)),
+            extra: vec![],
+        },
         // append (file-level)
-        (
-            "deletable × append",
-            &del_append,
-            vec![
-                "--mode".into(),
-                "append".into(),
-                "--content".into(),
-                "(def z 9)".into(),
-                "--json".into(),
-            ],
-        ),
+        Case {
+            label: "deletable × append",
+            file: &del_append,
+            mode: "append",
+            handle: None,
+            extra: vec!["--content", "(def z 9)"],
+        },
     ];
 
-    for (label, file, mut args) in cases {
-        let mut full: Vec<String> = vec!["edit".into(), file.to_string()];
-        full.append(&mut args);
-        let ref_args: Vec<&str> = full.iter().map(|s| s.as_str()).collect();
-        edit_and_assert_canonical(file, &ref_args, label);
+    for c in cases {
+        edit_and_assert_canonical(c.file, c.mode, c.handle, &c.extra, c.label);
     }
 }
 
