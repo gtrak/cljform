@@ -8,10 +8,10 @@ to leave a file unparsable.
 ## Philosophy
 
 1. **Do what the caller means.** Target forms by `⟦handle⟧` (copied from
-   `tree`; names are read lookups); content may be unbalanced, fenced in
-   markdown, or padded with blank lines — it is normalized, and brackets are
-   repaired from indentation when the fix is unambiguous (reported, never
-   silent).
+   `tree`; names are read lookups); content may be fenced in markdown or
+   padded with blank lines — it is normalized. Unbalanced brackets are
+   refused by default with the inferred candidate attached; `--repair`
+   infers them from indentation (reported, never silent).
 2. **Never leave the file broken.** A write happens only if the post-splice
    file parses clean and every untouched form is byte-identical to before.
    Otherwise: nothing is written and the error carries the exact line/col.
@@ -33,33 +33,34 @@ cljform [--json|--human] <op> …
 | `strip [file]` | Delete every `⟦…⟧` marker span → recovers the exact original bytes (BOM/CRLF preserved). Pure filter on stdout, no envelope; file or stdin |
 | `get <file> [--name sym\|--handle H]` | One form's exact bytes + metadata, including its `⟦handle⟧` (pass it to `edit`). `--name` is a top-level read lookup — names are extracted for var-defining `def…` heads (`defn`, `defapifn`, …; not `defmethod`, which extends an existing multimethod); `--handle` reads any collection node |
 | `check [file]` | Parse + table + nesting warnings (file or stdin) |
-| `edit <file> --handle H [--mode M] [--content C\|--content-file F] [--repair] [--no-format-content]` | Whole-form edit; modes `replace` (default), `insert-after` / `insert-before` (anchor: `--handle`), `append`, `prepend` (file ends, no target), `delete`. Submitted content is reindented in parinfer paren mode (default on; `--no-format-content` sends it verbatim, and patch/delete never reformat) and then base-shifted to the target's column. `--repair` allows a guessed mid-file dedent closure |
+| `edit <file> --handle H [--mode M] [--content C\|--content-file F] [--repair] [--no-format-content]` | Whole-form edit; modes `replace` (default), `insert-after` / `insert-before` (anchor: `--handle`), `append`, `prepend` (file ends, no target), `delete`. Submitted content is reindented in parinfer paren mode (default on; `--no-format-content` sends it verbatim, and patch/delete never reformat) and then base-shifted to the target's column. `--repair` enables bracket inference (missing trailing closers + a guessed mid-file dedent closure); without it, unbalanced content is refused (`unbalanced-content`, exit 3, candidate + diff attached). Inference runs on the content as submitted — its decision/outcome is identical with or without the reindent and at any target column |
 | `edit <file> --handle H --mode patch --old-text T [--new-text U]` | Surgical text patch inside one form: `T` must occur exactly once in the form's byte range and never cross its boundary; `U` (default empty) replaces it. Bytes outside the match are untouched; no bracket repair, but I1–I3 still gate the write. A mismatch error returns the form's **exact bytes**, so recovery needs no `clj_get` round-trip |
 | `materialize --content C` | Indent-mode bracket completion → labeled candidate + diff (never writes). Completes missing **closers** implied by indentation; it does not invent missing openers, so a fully bracket-less draft comes back unchanged with a note |
 | `format [file]` | Reformat indentation the way parinfer paren mode does — the only op that imposes a style on a whole file (the edit path reindents its submitted content with the same pass, by default, then base-shifts it). Candidate-first: candidate + unified diff vs the input + note, never writes. The candidate must re-parse clean and keep the input's token stream (only whitespace and closing-delimiter position may move); otherwise `format-error`, exit 1, nothing emitted |
 
 Exit codes: `0` ok · `1` parse/structure failure or `annotate-conflict`
-(nothing written) · `2` usage · `3` targeting failure or refused repair
-(`form-not-found` / `ambiguous` / `stale-handle` / `ambiguous-handle` /
-`repair-refused` / `dedent-repair`) · `4` I/O.
+(nothing written) · `2` usage · `3` targeting failure or refused content /
+repair (`form-not-found` / `ambiguous` / `stale-handle` / `ambiguous-handle`
+/ `unbalanced-content` / `repair-refused`) · `4` I/O.
 
 Guards: the `⟦handle⟧` is a content pin — resolution either matches the one
 form it names or refuses (`stale-handle` / `ambiguous-handle`, exit 3,
 "re-run `tree`"), so a stale view can never target the wrong form. Handles
 are content-addressed: an unchanged form keeps its handle across edits
 elsewhere. `--strict` turns detector warnings into a refusal (exit 1,
-`detector-fatal`) and **content repairs** into a refusal (exit 3,
-`repair-refused`, with the diff it declined to apply).
+`detector-fatal`) and, together with `--repair`, **content repairs** into a
+refusal (exit 3, `repair-refused`, with the diff it declined to apply —
+`--strict` wins).
 `--dry-run` validates and writes nothing.
 
-Refusal beats guessed repair. By default cljform only *completes* unbalanced
-content the forced way — appending missing trailing closers. A repair that
-would close an inner form at a mid-file **dedent** is a placement guessed
-from indentation, so it is refused with the candidate diff (exit 3,
-`dedent-repair`); pass `--repair` to apply it. Two more cases are refused
-outright: content from an **unterminated markdown fence** (a likely
+Refusal beats inferred repair. Unbalanced content is refused by default
+(exit 3, `unbalanced-content`, nothing written) with the inferred candidate
+and its diff attached; pass `--repair` to apply it. The inference decision
+runs on the content as submitted — it does not depend on the base-shift
+dedent, the parinfer reindent, or the target column. Two more cases are
+refused outright: content from an **unterminated markdown fence** (a likely
 truncated paste — exit 1, `truncated-content`), and any repair under
-`--strict`.
+`--strict` together with `--repair` (exit 3, `repair-refused`).
 
 ## Detectors
 
@@ -154,6 +155,8 @@ No network, no Clojure runtime, nothing is ever evaluated.
   per-line indent, closing an inner form a line early (`(let [y 2])` with
   the body escaping it); balance-only assertions passed the wrong output.
   Now the repaired form text is compared exactly; an unterminated
-  markdown fence around unbalanced content is refused, not repaired; and a
-  mid-file **dedent** closure (the last guessed placement) is refused unless
-  `--repair` opts in.
+  markdown fence around unbalanced content is refused, not repaired;
+  inference is opt-in (`--repair` — the default refuses with the
+  `unbalanced-content` candidate); `--repair --strict` refuses
+  (`repair-refused`); and the inference outcome is asserted byte-identical
+  with or without `--format-content` and at two different target columns.

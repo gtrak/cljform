@@ -66,3 +66,9 @@ Sequence (one worker subagent per issue):
   its separate `cljform format` call and just maps `autoFormat: false` to
   `--no-format-content`. Supersedes issue 10's wrapper-side mechanism.
   Depends on 10.
+- **12 — inference opt-in, decoupled** (`issue-12-inference-optin.md`):
+  bracket inference is explicit opt-in (`--repair`); the default refuses
+  unbalanced content (`unbalanced-content`, exit 3, candidate + hint). The
+  repair decision must not depend on `--format-content` or the target column
+  (drop the dedent-before-prepare coupling). Migrate the repair tests.
+  Depends on 11.

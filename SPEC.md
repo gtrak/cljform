@@ -106,7 +106,8 @@ cljform [--json|--human] <op> [args]
     append/prepend)
   - `3` — targeting/refusal: `form-not-found`, `ambiguous`, `stale-handle`,
     `ambiguous-handle`, `patch-not-found`, `patch-ambiguous`,
-    `repair-refused` (under `--strict`), `dedent-repair`
+    `unbalanced-content` (unbalanced content, inference is opt-in),
+    `repair-refused` (`--strict` beats `--repair`)
   - `4` — I/O error: `io` (unreadable file, write failure)
 - **JSON envelope** (success):
   ```json
@@ -168,13 +169,21 @@ The `forms` array is the **top-level listing**. The **nested view** is the
 **Content rule (edit):** content is normalized (markdown fences stripped,
 blank edges trimmed) and may carry several top-level forms — the I3 window
 generalizes to an N-form allowed change (the v1 "exactly one complete
-balanced form" gate is gone; §14). Unbalanced content is repaired by
-indent-mode inference when the fix is unambiguous, with a reported diff; the
-default only completes missing trailing closers. Refusals: `not-one-form`
+balanced form" gate is gone; §14). Bracket inference is **opt-in**:
+unbalanced content is refused by default (exit 3, `unbalanced-content`,
+nothing written) with the inferred candidate and its diff attached and the
+hint `pass --repair to apply the inferred brackets, or submit balanced
+content (clj_draft can help)`; `--repair` enables the inference (forced
+missing trailing closers, and mid-file dedent closures at the caller's
+explicit risk); `--strict` + `--repair` refuses it (`repair-refused`, exit
+3, with the declined diff — `--strict` wins). The inference decision and
+outcome are **independent of indentation**: inference runs on the content
+as submitted (markers/fences stripped only); the base-shift dedent is
+computed from the submitted content and applied after the decision; and
+the parinfer reindent below runs on the balanced prepared content — none
+of it feeds back into the inference. Other refusals: `not-one-form`
 (exit 1 — needs a human eye), `truncated-content` (exit 1, an unterminated
-opening fence), `repair-refused` (exit 3, any repair under `--strict`), and
-`dedent-repair` (exit 3, a mid-file dedent closure — a guessed placement;
-`--repair` opts in, candidate + diff attached). Content modes then reindent
+opening fence). Content modes then reindent
 the prepared content in parinfer paren mode (default on; `--no-format-content`
 disables it): the candidate must re-parse and keep the token stream (the
 `format` gates, §10.5), otherwise the prepared content is kept with a note —
@@ -228,10 +237,11 @@ string/comment/char/regex-aware scanner used elsewhere) and returns:
 ```
 
 Rules: **never** writes to a file, **never** applies smart mode silently —
-this is the *only* mode in the tool where brackets are inferred, and the
-output is explicitly labeled a candidate. The skill's "never use smart mode"
-rule is preserved as: no inference path exists without an explicit,
-attributable invocation whose output the agent must verify.
+this is the tool's candidate-only inference mode (the other path, `edit
+--repair`, applies the same inference only behind an explicit flag, §4.3),
+and the output is explicitly labeled a candidate. The skill's "never use
+smart mode" rule is preserved as: no inference path exists without an
+explicit, attributable invocation whose output the agent must verify.
 
 ## 5. Addressing
 
@@ -275,8 +285,11 @@ token. Numeric insert anchors (`--after N`) go likewise — anchor by handle, an
 - **I4 — content-addressed handle resolution** (§5, §10.1). A handle pins
   position + content; a stale view (its form changed or deleted) ⇒ hard
   refusal, exit 3 (`stale-handle` / `ambiguous-handle`), nothing written.
-- **I5 — no silent inference.** Bracket inference exists only in
-  `materialize`, candidate-only, labeled (§4.4).
+- **I5 — no silent inference.** Bracket inference exists candidate-only and
+  labeled in `materialize` (§4.4), and in `edit` only behind the explicit
+  `--repair` opt-in — with a reported diff, never silent; the default
+  refuses unbalanced content (`unbalanced-content`, §4.3), and the
+  inference decision never depends on the reindent or target column (§4.3).
 - **I6 — dry-run is complete.** `--dry-run` performs the entire I1–I5
   pipeline (incl. the boundary check) minus the write.
 
@@ -549,7 +562,11 @@ collection delimiter:
   (§10.5) **by default**, gated exactly as `format` gates (candidate must
   re-parse and keep the token stream; on refusal the prepared content is
   kept and a note added, the edit never fails), and the result is then
-  base-shifted to the target's column. `--no-format-content` disables the
+  base-shifted to the target's column. The reindent and the base-shift only
+  ever see the balanced, prepared content (issue 12): they are applied
+  after the inference decision and never feed back into it, so the
+  inference outcome is identical with or without the reindent and at any
+  target column. `--no-format-content` disables the
   reindent (`--format-content` is accepted as explicit opt-in); the wrapper's
   `autoFormat: false` maps to that flag, and the wrapper no longer runs a
   separate `cljform format` call.
@@ -674,21 +691,30 @@ design):
 - **Repair beats refusal.** The "content must be exactly one form" gate and
   the hard generation stop are gone. Content is normalized (markdown fences
   stripped, edges trimmed) and unbalanced brackets are repaired by
-  indent-mode inference when unambiguous — with a reported diff. Only
+  indent-mode inference when the caller opts in (`--repair`) — with a
+  reported diff; the default refuses with the candidate attached. Only
   structurally ambiguous content is refused (exit 1, line/col, nothing
   written). Comments-only/empty content is still rejected (interpolation
   accidents).
-- **Repair is bounded and truncated content is never repaired.** Unbalanced
-  content is repaired by indent-mode inference with a reported diff, but the
-  scope is deliberately narrow. The default only **completes** content the
-  forced way: appending missing trailing closers. A repair that would close
-  an inner form at a mid-file **dedent** is a placement guessed from
-  indentation alone, so it is refused (exit 3, `dedent-repair`, carrying the
-  candidate and diff); `--repair` opts in. `--strict` refuses **any** repair
-  (exit 3, `repair-refused`). Content from an opening markdown fence with no
-  closing fence is refused outright (exit 1, `truncated-content`) rather
+- **Inference is opt-in and truncated content is never repaired.**
+  Unbalanced content is refused by default (exit 3, `unbalanced-content`,
+  carrying the inferred candidate and its diff, nothing written; the hint
+  points at `--repair` and `clj_draft`). `--repair` enables the indent-mode
+  inference with a reported diff, deliberately narrow in scope: it
+  **completes** missing trailing closers and, at the caller's explicit
+  risk, closes an inner form at a mid-file **dedent** (a placement guessed
+  from indentation alone). `--strict` beats `--repair` (exit 3,
+  `repair-refused`, with the declined diff). Content from an opening
+  markdown fence with no closing fence is refused outright (exit 1,
+  `truncated-content`) rather
   than repaired — a dangling fence means the paste was likely cut off.
   Complete content under a dangling fence is still accepted.
+- **Inference is independent of the reindent and target column (issue 12).**
+  The inference decision runs on the content as submitted (markers/fences
+  stripped only); the base-shift dedent is computed from the submitted
+  content and applied after the decision; the parinfer reindent (§10.3) runs
+  on the balanced prepared content. The repair outcome is therefore
+  identical with or without `--format-content` and at any target column.
 - **Indent mode fixed.** The completer compared an *absolute* byte column
   against a *per-line* indent, so an inner form closed a line early and its
   body escaped it (`(let [y 2])` followed by the body). Now `col` is
