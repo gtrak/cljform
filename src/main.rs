@@ -1038,7 +1038,8 @@ fn dispatch(cli: &Cli) -> Result<Output, Fail> {
 /// `cljform format [file]` (issue 06): parinfer paren-mode reindent.
 /// Candidate-first — mirrors `materialize`'s result shape
 /// (`candidate`, `diff`, `note`) and never writes. The candidate must
-/// re-parse clean and carry the input's token stream; anything less is a
+/// re-parse clean and pass the token gate (whitespace + closer positions
+/// only, `format_preserves_tokens`, §10.5); anything less is a
 /// `format-error` (exit 1) and is never emitted.
 fn run_format(file: &Option<PathBuf>) -> Result<Output, Fail> {
     let (raw, file_path) = match file {
@@ -1086,8 +1087,10 @@ fn run_format(file: &Option<PathBuf>) -> Result<Output, Fail> {
             suggestions: None,
         },
     ))?;
-    // Verification gates: re-parse clean + token stream equality. Only
-    // whitespace and the position of closing delimiters may change.
+    // Verification gates: re-parse clean + the token gate (SPEC §10.5):
+    // only whitespace and closing-delimiter positions may change, and a
+    // lifted closer may reorder against comment bytes (comments are not
+    // tokens) without tripping it.
     if let Err(e) = parser::parse(candidate.as_bytes()) {
         return Err(Fail(
             1,
@@ -1101,14 +1104,14 @@ fn run_format(file: &Option<PathBuf>) -> Result<Output, Fail> {
             },
         ));
     }
-    if format::token_stream(&candidate) != format::token_stream(&raw) {
+    if !format::format_preserves_tokens(&raw, &candidate) {
         return Err(Fail(
             1,
             ErrorBody {
                 code: "format-error",
                 line: None,
                 col: None,
-                message: "candidate's token stream differs from the input; refusing to emit it".into(),
+                message: "candidate's tokens differ from the input (or a closing delimiter moved later); refusing to emit it".into(),
                 hint: Some("report this as a cljform bug".into()),
                 suggestions: None,
             },
@@ -1449,10 +1452,11 @@ fn run_edit(
 
             // 2. Parinfer paren-mode reindent of the prepared content
             // (default on; `--no-format-content` disables it). The same
-            // gates as `format`: the candidate must still parse and keep
-            // the token stream (whitespace and closer positions only). A
+            // gates as `format`: the candidate must still parse and pass
+            // the token gate (whitespace + closer positions only). A
             // refused candidate keeps the prepared content — it never
-            // fails the edit.
+            // fails the edit, but it is never SILENT either: the note
+            // tells the caller its edit was written unformatted (issue 14).
             if format_content {
                 let prepared_text = String::from_utf8_lossy(&prepared.bytes).into_owned();
                 if !prepared_text.trim().is_empty() {
@@ -1460,8 +1464,7 @@ fn run_edit(
                         Ok(cand) if cand == prepared_text => {}
                         Ok(cand)
                             if parser::parse(cand.as_bytes()).is_ok()
-                                && format::token_stream(&cand)
-                                    == format::token_stream(&prepared_text) =>
+                                && format::format_preserves_tokens(&prepared_text, &cand) =>
                         {
                             prepared.bytes = cand.into_bytes();
                             notes.push("reindented content (parinfer paren mode)".to_string());
@@ -1469,13 +1472,15 @@ fn run_edit(
                         Ok(_) => {
                             notes.push(
                                 "content was not reindented (the reindent candidate \
-                                 failed verification; normalized content kept)"
+                                 failed verification; the edit was written with unformatted \
+                                 content — report as a cljform bug)"
                                     .to_string(),
                             );
                         }
                         Err(e) => {
                             notes.push(format!(
-                                "content was not reindented (parinfer paren mode: {})",
+                                "content was not reindented (parinfer paren mode: {} — the \
+                                 edit was written with unformatted content)",
                                 e.message
                             ));
                         }
@@ -1487,8 +1492,18 @@ fn run_edit(
             // re-apply the line structure the splice introduces. Top-level
             // inserts take the seam (insert_at), which owns the line
             // structure and blank-line separation.
-            let text = String::from_utf8_lossy(&prepared.bytes).into_owned();
-            let (out, reind_changed) = match base_shift {
+            //
+            // Seam guarantee (issue 14 R3): the spliced content never ends
+            // on a whitespace-only line, so the parent closers displaced by
+            // the splice land on the LAST line of the inserted/replaced
+            // content (paren-trail semantics at the seam) instead of alone
+            // on their own padded line. The trim is whitespace-only and is
+            // confined to the submitted content — the changed region — so
+            // no untouched form can move.
+            let raw_text = String::from_utf8_lossy(&prepared.bytes).into_owned();
+            let text = trim_trailing_blank_lines(&raw_text);
+            let trimmed = text != raw_text;
+            let (out, shift_changed) = match base_shift {
                 BaseShift::None => (text, false),
                 BaseShift::Column => reindent_to_column(&text, base_col),
                 // The new form lands on its own line at the target
@@ -1506,6 +1521,7 @@ fn run_edit(
                     (format!("{out}\n{}", " ".repeat(base_col)), true)
                 }
             };
+            let reind_changed = shift_changed || trimmed;
             if reind_changed {
                 notes.push(
                     "reindented submitted content to the target column".to_string(),
@@ -1520,7 +1536,7 @@ fn run_edit(
     // the node range for replace/patch/delete, and the insert position for
     // inserts. For a top-level insert-after the position can sit past
     // node.end_byte (a same-line trailing comment stays with the anchor).
-    let (sp, allowed, bound) = if let Some(node) = handle_node.as_ref() {
+    let (sp, allowed, mut bound) = if let Some(node) = handle_node.as_ref() {
         let top_level = node.path.split('.').next().unwrap().parse::<usize>().unwrap();
         // The I3 window depends on depth. Nested edits never change the
         // top-level form count: the containing form may change and nothing
@@ -1682,7 +1698,24 @@ fn run_edit(
         }
     };
 
-    let new_bytes = splice::apply(&bytes, &before_forms, &sp);
+    let mut new_bytes = splice::apply(&bytes, &before_forms, &sp);
+
+    // R3 seam (issue 14, delete): a delete that leaves only the displaced
+    // parent closers on its anchor's line pulls them onto the previous
+    // content line — the paren trail's own semantics at the seam, confined
+    // to the deleted node's line tail. Best-effort: if the pull would break
+    // the parse (closers landing inside a multi-line string), the original
+    // splice is kept.
+    if mode == Mode::Delete && handle_node.is_some() {
+        let (start, end) = bound;
+        if let Some(window) = pull_displaced_closers(&bytes, &mut new_bytes, start, end) {
+            if parser::parse(&new_bytes).is_ok() {
+                bound = window;
+            } else {
+                new_bytes = splice::apply(&bytes, &before_forms, &sp);
+            }
+        }
+    }
 
     // §10.3 boundary check (I2 extension): the splice may only touch its
     // actual window — [start, end) for replace/patch/delete, and the insert
@@ -1983,6 +2016,90 @@ fn reindent_prefix(content: &str, target_col: usize, prefix_first_line: bool) ->
 
 fn is_blank_line(l: &str) -> bool {
     l.bytes().all(|b| b == b' ' || b == b'\t' || b == b'\r')
+}
+
+/// Issue 14 R3 (the delete seam): when a delete leaves only the displaced
+/// parent closers on its tail line (whitespace + a run of closers), the
+/// file would be left unformatted — a closer line the format pass lifts.
+/// The pull is paren-trail semantics at the seam, confined to the deleted
+/// node's line tail: a single-line node whose line is otherwise bare moves
+/// the closers up onto the previous content line; otherwise (content before
+/// the node on the line, or a multi-line node) the closers land at the end
+/// of the node's start line, which is the spliced tail line. Best-effort:
+/// the caller re-parses and reverts on failure (e.g. the closers would
+/// land inside a multi-line string). Returns the changed window (lo, hi) in
+/// original-byte coordinates when it fired.
+fn pull_displaced_closers(bytes: &[u8], new_bytes: &mut Vec<u8>, start: usize, end: usize) -> Option<(usize, usize)> {
+    // All geometry is on the ORIGINAL bytes: the splice deletes
+    // [start, end), so in `new_bytes` everything from `end` on sits shifted
+    // left by `end - start`.
+    let shift = end - start;
+    let end_line_start = bytes[..end].iter().rposition(|&b| b == b'\n').map_or(0, |p| p + 1);
+    let end_line_end = bytes[end..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map(|p| end + p)
+        .unwrap_or(bytes.len());
+    let tail = &bytes[end..end_line_end];
+    let closers: Vec<u8> = tail.iter().copied().filter(|b| matches!(b, b')' | b']' | b'}')).collect();
+    // Only whitespace plus a run of closers — the displaced parent closers
+    // and nothing else on the tail line.
+    if closers.is_empty()
+        || !tail
+            .iter()
+            .all(|b| matches!(b, b' ' | b'\t' | b')' | b']' | b'}'))
+    {
+        return None;
+    }
+    let stop_orig = (end_line_end + 1).min(bytes.len());
+    let start_line_start =
+        bytes[..start].iter().rposition(|&b| b == b'\n').map_or(0, |p| p + 1);
+    if start_line_start == end_line_start {
+        // Single-line node on a bare line (only indent before it): the
+        // spliced tail line would hold the closers alone — lift them onto
+        // the previous content line. The previous line must carry content
+        // and not be a comment: landing the closers in a comment line
+        // would comment them out (and the pull would not be a no-op for
+        // `format`).
+        if start_line_start == 0 {
+            return None; // nothing above the anchor's line to lift onto
+        }
+        let pad = &bytes[start_line_start..start];
+        if pad.iter().all(|b| matches!(b, b' ' | b'\t')) {
+            let prev_nl = start_line_start - 1; // newline ending the previous line
+            let prev_start =
+                bytes[..prev_nl].iter().rposition(|&b| b == b'\n').map_or(0, |p| p + 1);
+            let prev = &bytes[prev_start..prev_nl];
+            let first = prev.iter().find(|b| !matches!(b, b' ' | b'\t'));
+            if !matches!(first, Some(b) if *b != b';') {
+                return None;
+            }
+            new_bytes.splice(prev_nl..stop_orig - shift, closers.iter().copied());
+            return Some((prev_nl, stop_orig));
+        }
+    }
+    // Content before the node on its line (single- or multi-line node):
+    // land the closers at the end of the node's start line — the spliced
+    // tail line — where they follow real content.
+    new_bytes.splice(start..stop_orig - shift, closers.iter().copied());
+    Some((start, stop_orig))
+}
+
+/// Drop trailing whitespace-only lines from `text` (issue 14 R3, the seam
+/// guarantee): the base-shifted content must end on a real content line so
+/// the closers displaced by the splice land on it, not on their own padded
+/// line. Whitespace-only; a file-internal line structure is untouched.
+fn trim_trailing_blank_lines(text: &str) -> String {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut end = lines.len();
+    while end > 0 && is_blank_line(lines[end - 1]) {
+        end -= 1;
+    }
+    if end == lines.len() {
+        text.to_string()
+    } else {
+        lines[..end].join("\n")
+    }
 }
 
 /// Summary of the file-edge insert (append/prepend, the only target-less

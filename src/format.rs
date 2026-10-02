@@ -15,11 +15,17 @@
 //!   as spaces, tabs counted at display width 2;
 //! - leading closing delimiters move up onto the previous content line
 //!   (the paren trail), and whitespace between trailing closers is removed
-//!   so closers become contiguous;
+//!   so closers become contiguous; a line the pull-up empties is deleted,
+//!   not left whitespace-only (SPEC §10.5 — a deliberate extension beyond
+//!   parinfer-rust, which leaves the vacated line as-is);
 //! - comment lines, string interiors, and blank lines are left alone.
 //!
-//! The pass never changes any non-whitespace byte; `token_stream` proves it
-//! before a candidate is reported.
+//! The pass never changes any non-whitespace byte, and closing delimiters
+//! only ever move EARLIER (onto an earlier line). When a comment line sits
+//! between a lifted closer and its destination, the closer reorders against
+//! the comment's bytes — a comment is not a token — so the raw
+//! non-whitespace stream is not the right verification; `format_preserves_tokens`
+//! is (SPEC §10.5, issue 14).
 
 use std::borrow::Cow;
 
@@ -65,17 +71,49 @@ pub fn format_paren(text: &str) -> Result<String, FormatError> {
             message: format!("unclosed open-paren: '{}' is never closed", o.ch),
         });
     }
-    Ok(f.lines.join(f.line_ending))
+    // §10.5 (issue 14): delete the lines our own pull-up emptied. A line
+    // that was blank in the input (or still carries content) is left alone.
+    Ok(f.lines
+        .iter()
+        .enumerate()
+        .filter(|(i, line)| {
+            !(f.lifted[*i] && line.bytes().all(|b| matches!(b, b' ' | b'\t' | b'\r')))
+        })
+        .map(|(_, line)| line.as_str())
+        .collect::<Vec<_>>()
+        .join(f.line_ending))
 }
 
-/// The non-whitespace bytes of `text`, in order — the token stream that
-/// `format` guarantees unchanged. Only whitespace and the position of
-/// closing delimiters may move, so two texts share a token stream exactly
-/// when their non-whitespace bytes are identical.
-pub fn token_stream(text: &str) -> Vec<u8> {
-    text.bytes()
-        .filter(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0C))
-        .collect()
+/// The token stream split for the format verification gate (SPEC §10.5):
+/// (a) the non-whitespace, non-closing-delimiter bytes in order, and (b) for
+/// each closing delimiter, its rank — the number of those bytes that
+/// precede it in the file. A reformat may only move whitespace and closing
+/// delimiters, and closers only ever move earlier (the paren trail lifts
+/// them onto previous lines; a lifted closer can reorder against a comment
+/// line's bytes, which is why the raw non-whitespace stream is not the
+/// gate), so two texts are format-equivalent exactly when (a) is equal, the
+/// closer counts match, and no closer's rank increased.
+pub fn token_stream_split(text: &str) -> (Vec<u8>, Vec<usize>) {
+    let mut tokens = Vec::new();
+    let mut ranks = Vec::new();
+    for b in text.bytes() {
+        match b {
+            b' ' | b'\t' | b'\n' | b'\r' | 0x0C => {}
+            b')' | b']' | b'}' => ranks.push(tokens.len()),
+            _ => tokens.push(b),
+        }
+    }
+    (tokens, ranks)
+}
+
+/// The `format` verification gate (SPEC §10.5): `candidate` carries exactly
+/// the tokens of `input`, with closing delimiters moved only earlier.
+pub fn format_preserves_tokens(input: &str, candidate: &str) -> bool {
+    let (i_tokens, i_ranks) = token_stream_split(input);
+    let (c_tokens, c_ranks) = token_stream_split(candidate);
+    i_tokens == c_tokens
+        && i_ranks.len() == c_ranks.len()
+        && c_ranks.iter().zip(i_ranks.iter()).all(|(c, i)| c <= i)
 }
 
 #[derive(Clone)]
@@ -134,6 +172,9 @@ struct Fmt {
     indent_delta: i64,
     tracking_indent: bool,
     skip_char: bool,
+    /// Per line: a leading closer was lifted off it onto the paren trail
+    /// (the line can end up whitespace-only, and §10.5 deletes such lines).
+    lifted: Vec<bool>,
 }
 
 impl Fmt {
@@ -142,6 +183,7 @@ impl Fmt {
             .split('\n')
             .map(|l| l.strip_suffix('\r').unwrap_or(l).to_string())
             .collect();
+        let n_lines = input_lines.len();
         Fmt {
             input_lines,
             lines: Vec::new(),
@@ -164,9 +206,12 @@ impl Fmt {
             indent_delta: 0,
             tracking_indent: true,
             skip_char: false,
+            lifted: vec![false; n_lines],
         }
     }
 
+    /// `init_line` state machine over one input line, writing into a parallel
+    /// output buffer (the reference mutates `lines` while reading `input_lines`).
     fn process_line(&mut self) -> Result<(), FormatError> {
         // init_line
         self.x = 0;
@@ -226,6 +271,7 @@ impl Fmt {
     fn check_indent(&mut self, ch: &str) -> Result<(), FormatError> {
         if is_close(ch) {
             if valid_close(&self.stack, ch) {
+                self.lifted[self.line_no] = true;
                 self.append_paren_trail();
                 self.skip_char = true;
             } else {
@@ -527,4 +573,47 @@ fn column_byte_index(s: &str, x: usize) -> usize {
         col += UnicodeWidthStr::width(ch);
     }
     s.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pullup_across_comment_keeps_tokens_and_lifts_only_up() {
+        // Issue 14 R1: a closer lifted across a comment line reorders
+        // against the comment's bytes; the gate must still see the same
+        // tokens with the closer moved earlier.
+        let input = "(defn h [x]\n  (bar x)\n  ;; done\n)\n";
+        let cand = format_paren(input).expect("pull-up formats");
+        assert_eq!(cand, "(defn h [x]\n  (bar x))\n  ;; done\n");
+        assert!(
+            format_preserves_tokens(input, &cand),
+            "lifted closer reorders against the comment bytes but moves only earlier"
+        );
+
+        // A closer moved LATER (across a comment, downward) is refused.
+        assert!(!format_preserves_tokens(
+            "(a 1)\n; c\n",
+            "(a\n; c\n  1))"
+        ));
+        // A missing/duplicated closer is refused.
+        assert!(!format_preserves_tokens("(a 1)", "(a 1"));
+        assert!(!format_preserves_tokens("(a 1)", "(a 1))"));
+        // Non-closer bytes must stay in order.
+        assert!(!format_preserves_tokens("(a 1)", "(1 a)"));
+    }
+
+    #[test]
+    fn pullup_deletes_vacated_line_only() {
+        // §10.5 extension: the pull-up's own vacated line goes away...
+        let cand = format_paren("(defn f [x]\n  (inc x)\n  )\n").expect("ok");
+        assert_eq!(cand, "(defn f [x]\n  (inc x))\n");
+        // ...but a blank line the input already had (or a line that still
+        // carries content after the lift) is left alone.
+        let cand = format_paren("(defn f [x]\n\n  (inc x)\n  )\n").expect("ok");
+        assert_eq!(cand, "(defn f [x]\n\n  (inc x))\n");
+        let cand = format_paren("(defn f [x]\n  (inc x)\n  ) ; c\n").expect("ok");
+        assert_eq!(cand, "(defn f [x]\n  (inc x))\n   ; c\n");
+    }
 }

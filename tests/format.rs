@@ -65,22 +65,17 @@ fn corpus() -> Vec<(&'static str, &'static str)> {
             "nested",
             "(defn outer [x]\n  (let [y (inner x)]\n    (process y)\n  (finalize x)))\n",
         ),
-        ("standalone-closer", "(defn f [x]\n  (inc x)\n  )\n"),
+        ("string-with-newline", "(def s\n  \"a\n      b\n  c\")\n"),
+        ("regex", "(def re\n  #\"\\d+\")\n"),
+        ("reader-collections", "#((+ 1 2))\n#{:a [1 2]}\n"),
         (
             "comment-line",
             "(defn f [x]\n   ; deeply indented comment\n  (inc x))\n",
         ),
-        ("string-with-newline", "(def s\n  \"a\n      b\n  c\")\n"),
-        ("regex", "(def re\n  #\"\\d+\")\n"),
-        ("reader-collections", "#((+ 1 2))\n#{:a [1 2]}\n"),
-        ("crlf", "(defn f [x]\r\n  (inc x)\r\n)\r\n"),
-        ("tabs", "(defn f [x]\n\t(inc x)\n)\n"),
         (
             "trailing-closer-whitespace",
             "(defn f\n  (g (a 1) )\n  (b 2))\n",
         ),
-        ("crlf-tabs", "(defn f [x]\r\n\t(inc x)\r\n)\r\n"),
-        ("string-closer-line", "(def s\n  \"abc\n) def\"\n  )\n"),
         (
             "comment-balanced-quotes",
             "(def a 1)\n; \"balanced\"\n(def b 2)\n",
@@ -90,11 +85,77 @@ fn corpus() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
-/// Non-whitespace bytes, in order — the token stream `format` guarantees.
-fn token_stream(text: &str) -> Vec<u8> {
-    text.bytes()
-        .filter(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0C))
-        .collect()
+/// Shapes whose pull-up vacates a line: parinfer-rust leaves the vacated
+/// line whitespace-only, cljform deletes it (SPEC §10.5 — documented
+/// extension, issue 14). Each entry: (name, input, parinfer golden,
+/// cljform golden). The two R1 repros (issue 14) also live here because
+/// their lifted closer vacates the final line; their distinguishing trait —
+/// the closer lifting ACROSS a comment line — is asserted in
+/// `format_pulls_closers_across_comment_lines`.
+fn vacated_corpus() -> Vec<(&'static str, &'static str, &'static str, &'static str)> {
+    vec![
+        (
+            "standalone-closer",
+            "(defn f [x]\n  (inc x)\n  )\n",
+            "(defn f [x]\n  (inc x))\n  \n",
+            "(defn f [x]\n  (inc x))\n",
+        ),
+        (
+            "crlf",
+            "(defn f [x]\r\n  (inc x)\r\n)\r\n",
+            "(defn f [x]\r\n  (inc x))\r\n\r\n",
+            "(defn f [x]\r\n  (inc x))\r\n",
+        ),
+        (
+            "tabs",
+            "(defn f [x]\n\t(inc x)\n)\n",
+            "(defn f [x]\n  (inc x))\n\n",
+            "(defn f [x]\n  (inc x))\n",
+        ),
+        (
+            "crlf-tabs",
+            "(defn f [x]\r\n\t(inc x)\r\n)\r\n",
+            "(defn f [x]\r\n  (inc x))\r\n\r\n",
+            "(defn f [x]\r\n  (inc x))\r\n",
+        ),
+        (
+            "string-closer-line",
+            "(def s\n  \"abc\n) def\"\n  )\n",
+            "(def s\n  \"abc\n) def\")\n  \n",
+            "(def s\n  \"abc\n) def\")\n",
+        ),
+        // R1 repro 1 (issue 14): the final closer lifts ACROSS the comment
+        // line; the comment stays put, the vacated closer line is deleted.
+        (
+            "pull-up-across-comment-line",
+            "(defn h [x]\n  (bar x)\n  ;; done\n)\n",
+            "(defn h [x]\n  (bar x))\n  ;; done\n\n",
+            "(defn h [x]\n  (bar x))\n  ;; done\n",
+        ),
+        // R1 repro 2 (issue 14): a trailing comment on the content line and
+        // the lifted closer landing before it.
+        (
+            "pull-up-across-trailing-comment",
+            "(defn h [x]\n  (bar x) ;; c\n)\n",
+            "(defn h [x]\n  (bar x)) ;; c\n\n",
+            "(defn h [x]\n  (bar x)) ;; c\n",
+        ),
+    ]
+}
+
+/// The §10.5 token gate in test-local terms: the non-whitespace, non-closer
+/// bytes in order, plus each closer's rank (non-closer bytes before it).
+fn token_split(text: &str) -> (Vec<u8>, Vec<usize>) {
+    let mut tokens = Vec::new();
+    let mut ranks = Vec::new();
+    for b in text.bytes() {
+        match b {
+            b' ' | b'\t' | b'\n' | b'\r' | 0x0C => {}
+            b')' | b']' | b'}' => ranks.push(tokens.len()),
+            _ => tokens.push(b),
+        }
+    }
+    (tokens, ranks)
 }
 
 /// Locate the installed parinfer-rust binary (~/.cargo/bin, or
@@ -142,6 +203,19 @@ fn parinfer_paren(bin: &std::path::Path, input: &str) -> Result<String, String> 
     String::from_utf8(out.stdout).map_err(|e| format!("non-utf8 output: {e}"))
 }
 
+/// Non-whitespace, non-closer bytes must stay in order; closers may only
+/// move EARLIER (ranks never increase). This is the §10.5 token gate:
+/// a closer lifted across a comment line legitimately reorders against the
+/// comment's bytes (a comment is not a token), so the raw non-whitespace
+/// stream is not the gate.
+fn token_gate_holds(input: &str, candidate: &str) -> bool {
+    let (i_tokens, i_ranks) = token_split(input);
+    let (c_tokens, c_ranks) = token_split(candidate);
+    i_tokens == c_tokens
+        && i_ranks.len() == c_ranks.len()
+        && c_ranks.iter().zip(i_ranks.iter()).all(|(c, i)| c <= i)
+}
+
 #[test]
 fn format_matches_parinfer_rust() {
     let bin = match parinfer_rust_bin() {
@@ -165,6 +239,65 @@ fn format_matches_parinfer_rust() {
         n += 1;
     }
     eprintln!("differential corpus: {n} fixtures, all byte-equal");
+}
+
+#[test]
+fn format_vacated_lines_documented_divergence() {
+    // The documented §10.5 extension (issue 14 R4): when our own pull-up
+    // empties a line, we delete it where parinfer-rust leaves it
+    // whitespace-only. Asserted on EXACTLY these shapes: parinfer-rust
+    // emits the whitespace-only line, cljform emits the same candidate
+    // minus that line.
+    let bin = match parinfer_rust_bin() {
+        Some(p) => p,
+        None => {
+            eprintln!("SKIP: parinfer-rust not installed; vacated-line divergence gate not run in this environment");
+            return;
+        }
+    };
+    for (name, input, parinfer_golden, ours_golden) in vacated_corpus() {
+        let expected = parinfer_paren(&bin, input)
+            .unwrap_or_else(|e| panic!("{name}: parinfer-rust failed: {e}"));
+        assert_eq!(
+            expected, parinfer_golden,
+            "{name}: reference no longer leaves the vacated line (update the documented divergence)"
+        );
+        let (code, d, err) = format_stdin(input);
+        assert_eq!(code, 0, "{name}: {d} {err}");
+        let candidate = d["result"]["candidate"].as_str().unwrap().to_string();
+        assert_eq!(
+            candidate, ours_golden,
+            "{name}: vacated-line extension not applied as documented"
+        );
+    }
+}
+
+#[test]
+fn format_pulls_closers_across_comment_lines() {
+    // Issue 14 R1 goldens: a pull-up whose lifted closer crosses a comment
+    // line was refused (format-error: token stream differs) because the
+    // closer reorders against the comment's bytes. Comments are not tokens:
+    // the candidate is the reference's, and the §10.5 gate accepts it.
+    for (name, input, candidate) in [
+        (
+            "comment line between",
+            "(defn h [x]\n  (bar x)\n  ;; done\n)\n",
+            "(defn h [x]\n  (bar x))\n  ;; done\n",
+        ),
+        (
+            "trailing comment on the line",
+            "(defn h [x]\n  (bar x) ;; c\n)\n",
+            "(defn h [x]\n  (bar x)) ;; c\n",
+        ),
+    ] {
+        let (code, d, err) = format_stdin(input);
+        assert_eq!(code, 0, "{name}: {d} {err}");
+        assert_eq!(d["result"]["candidate"], candidate, "{name}");
+        assert!(
+            token_gate_holds(input, candidate),
+            "{name}: candidate passes its own gate"
+        );
+    }
 }
 
 #[test]
@@ -203,10 +336,11 @@ fn format_preserves_over_indent_below_max() {
 #[test]
 fn format_moves_standalone_closers() {
     // A line leading with a close delimiter moves it up onto the previous
-    // content line (the paren trail); the line is left blank.
+    // content line (the paren trail). §10.5 extension (issue 14 R4): the
+    // line the pull-up empties is deleted, not left whitespace-only.
     let (code, d, err) = format_stdin("(defn f [x]\n  (inc x)\n  )\n");
     assert_eq!(code, 0, "{d} {err}");
-    assert_eq!(d["result"]["candidate"], "(defn f [x]\n  (inc x))\n  \n");
+    assert_eq!(d["result"]["candidate"], "(defn f [x]\n  (inc x))\n");
 }
 
 #[test]
@@ -226,9 +360,10 @@ fn format_leaves_comment_lines() {
 fn format_skips_string_interiors() {
     // Lines inside an unterminated string are untouched; a standalone
     // closer after the string moves up onto the string's closing line.
+    // §10.5 extension (issue 14 R4): the vacated closer line is deleted.
     let (code, d, err) = format_stdin("(def s\n  \"a\n      b\"\n  )\n");
     assert_eq!(code, 0, "{d} {err}");
-    assert_eq!(d["result"]["candidate"], "(def s\n  \"a\n      b\")\n  \n");
+    assert_eq!(d["result"]["candidate"], "(def s\n  \"a\n      b\")\n");
 }
 
 #[test]
@@ -293,16 +428,20 @@ fn format_is_candidate_only() {
 
 #[test]
 fn format_token_stream_unchanged() {
-    // Every fixture: the candidate's non-whitespace bytes equal the
-    // input's, and the candidate re-parses clean.
-    for (name, input) in corpus() {
+    // Every fixture (equal-corpus and documented-divergence shapes alike):
+    // the candidate passes the §10.5 token gate — non-closer bytes stay in
+    // order, closers only move earlier — and the candidate re-parses clean.
+    let all: Vec<(&str, &str)> = corpus()
+        .into_iter()
+        .chain(vacated_corpus().into_iter().map(|(n, i, _, _)| (n, i)))
+        .collect();
+    for (name, input) in all {
         let (code, d, err) = format_stdin(input);
         assert_eq!(code, 0, "{name}: {d} {err}");
         let candidate = d["result"]["candidate"].as_str().unwrap();
-        assert_eq!(
-            token_stream(candidate),
-            token_stream(input),
-            "{name}: token stream changed"
+        assert!(
+            token_gate_holds(input, candidate),
+            "{name}: token gate failed (tokens changed or a closer moved later)"
         );
         let (code, d, err) = run_json(&["check"], Some(candidate.as_bytes()));
         assert_eq!(code, 0, "{name}: candidate does not parse: {d} {err}");
