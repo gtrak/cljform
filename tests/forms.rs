@@ -91,7 +91,7 @@ fn get_by_handle_prints_bytes_and_metadata() {
     let h = handle_of(&f, "helper");
     let (code, d, err) = run_json(&["get", &f, "--handle", &h, "--json"], None);
     assert_eq!(code, 0, "{d} {err}");
-    assert_eq!(d["result"]["path"], "3");
+    assert_eq!(d["result"]["depth"], 1);
     assert_eq!(d["result"]["name"], "helper");
     assert_eq!(d["result"]["line"], json!([5, 6]));
     assert_eq!(d["result"]["handle"], h);

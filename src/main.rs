@@ -706,24 +706,34 @@ fn resolve_handle(bytes: &[u8], h: &str, file: &Path) -> Result<handle::Node, Fa
             },
         )),
         1 => Ok(hits[0].clone()),
-        n => {
-            let paths: Vec<&str> = hits.iter().map(|x| x.path.as_str()).collect();
+        _n => {
             Err(Fail(
                 3,
                 ErrorBody {
                     code: "ambiguous-handle",
                     line: None,
                     col: None,
-                    message: format!(
-                        "handle {h:?} matches {n} forms (paths: {}) — extend the prefix to disambiguate",
-                        paths.join(", ")
-                    ),
+                    message: ambiguous_handle_message(h, &hits),
                     hint: Some("re-run tree and copy a longer prefix".into()),
                     suggestions: None,
                 },
             ))
         }
     }
+}
+
+/// The `ambiguous-handle` message: the candidate handles (with their line
+/// ranges), never the internal structural paths — those are not addressable.
+fn ambiguous_handle_message(h: &str, candidates: &[&handle::Node]) -> String {
+    let list: Vec<String> = candidates
+        .iter()
+        .map(|x| format!("{} lines {}–{}", x.handle, x.line[0], x.line[1]))
+        .collect();
+    format!(
+        "handle {h:?} matches {} forms (handles: {list}) — extend the prefix to disambiguate",
+        candidates.len(),
+        list = list.join(", ")
+    )
 }
 
 fn mode_name(m: &Mode) -> &'static str {
@@ -766,7 +776,6 @@ fn dispatch(cli: &Cli) -> Result<Output, Fail> {
                     file_hash: Some(hashutil::tagged(&hashutil::file_hash(&bytes))),
                     forms: Some(parsed.forms),
                     result: Some(serde_json::json!({
-                        "path": node.path,
                         "kind": node.kind,
                         "head": node.head,
                         "name": node.name,
@@ -2021,9 +2030,9 @@ fn build_handle_summary(
             let line = at_path.map(|n| n.line).unwrap_or(node.line);
             let mut summary = serde_json::json!({
                 "action": if mode == Mode::Replace { "replaced" } else { "patched" },
-                "path": node.path,
                 "kind": node.kind,
                 "name": node.name,
+                "head": node.head,
                 "line": line,
                 "wasKind": node.kind,
                 "wasLine": node.line,
@@ -2047,9 +2056,9 @@ fn build_handle_summary(
         Mode::Delete => (
             serde_json::json!({
                 "action": "deleted",
-                "path": node.path,
                 "wasKind": node.kind,
                 "name": node.name,
+                "head": node.head,
                 "lineBefore": node.line,
                 "wasHandle": node.handle,
             }),
@@ -2063,16 +2072,25 @@ fn build_handle_summary(
             // both files.
             let anchor = bound.0;
             let content_len = new_bytes.len() - anchor - (bytes.len() - bound.1);
-            let handles: Vec<String> = new_nodes
+            let inserted: Vec<&handle::Node> = new_nodes
                 .iter()
                 .filter(|n| n.start_byte >= anchor && n.start_byte < anchor + content_len)
-                .map(|n| n.handle.clone())
                 .collect();
+            let handles: Vec<String> = inserted.iter().map(|n| n.handle.clone()).collect();
+            // Line span of the inserted content (min start .. max end over the
+            // inserted nodes); internal to the human/JSON view, not a path.
+            let line: [usize; 2] = if inserted.is_empty() {
+                node.line
+            } else {
+                let lo = inserted.iter().map(|n| n.line[0]).min().unwrap();
+                let hi = inserted.iter().map(|n| n.line[1]).max().unwrap();
+                [lo, hi]
+            };
             let mut summary = serde_json::json!({
                 "action": "inserted",
-                "path": node.path,
                 "side": if mode == Mode::InsertBefore { "before" } else { "after" },
                 "wasHandle": node.handle,
+                "line": line,
             });
             if handles.is_empty() {
                 notes.push("could not compute handles for the inserted form(s)".to_string());
@@ -2111,26 +2129,41 @@ fn find_all(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
 }
 
 fn human_summary(summary: &serde_json::Value, shape: &invariants::ShapeCheck) -> String {
-    // The --handle path carries the node's path; render it separately.
-    if let Some(path) = summary.get("path").and_then(|v| v.as_str()) {
+    // The --handle summaries carry the target's handle, never a path — a path
+    // is not addressable (there is no `--path`/`--addr`), so it stays internal.
+    // Render the handle plus a semantic label instead.
+    if summary.get("wasHandle").is_some() {
         return match summary["action"].as_str().unwrap_or("") {
-            "replaced" | "patched" => format!(
-                "{} form at {path} (lines {}–{}) — {} changed, {} untouched",
-                summary["action"].as_str().unwrap_or(""),
-                summary["line"][0],
-                summary["line"][1],
-                shape.changed,
-                shape.untouched
-            ),
+            "replaced" | "patched" => {
+                let handle = summary["handle"]
+                    .as_str()
+                    .unwrap_or_else(|| summary["wasHandle"].as_str().unwrap_or(""));
+                let kind = summary["kind"].as_str().unwrap_or("form");
+                format!(
+                    "{} form \u{27E6}{}\u{27E7} {} (lines {}–{}) — {} changed, {} untouched",
+                    summary["action"].as_str().unwrap_or(""),
+                    handle,
+                    handle_label(summary, kind),
+                    summary["line"][0],
+                    summary["line"][1],
+                    shape.changed,
+                    shape.untouched
+                )
+            }
             "deleted" => format!(
-                "deleted form at {path} (was lines {}–{}) — {} untouched",
+                "deleted form \u{27E6}{}\u{27E7} {} (was lines {}–{}) — {} untouched",
+                summary["wasHandle"].as_str().unwrap_or(""),
+                handle_label(summary, "form"),
                 summary["lineBefore"][0],
                 summary["lineBefore"][1],
                 shape.untouched
             ),
             "inserted" => format!(
-                "inserted form(s) {} the form at {path} — {} untouched",
+                "inserted form(s) {} the form \u{27E6}{}\u{27E7} (lines {}–{}) — {} untouched",
                 summary["side"].as_str().unwrap_or(""),
+                summary["wasHandle"].as_str().unwrap_or(""),
+                summary["line"][0],
+                summary["line"][1],
                 shape.untouched
             ),
             _ => String::new(),
@@ -2191,6 +2224,20 @@ fn label(summary: &serde_json::Value) -> String {
     }
 }
 
+/// The semantic label for a `--handle` summary: the node's name, else its
+/// head (the leading symbol of a list form), else the mode's kind fallback —
+/// the node's kind for replace/patch, or "form" for delete, whose summary
+/// carries no `kind` key.
+fn handle_label(summary: &serde_json::Value, kind_fallback: &str) -> String {
+    if let Some(n) = summary["name"].as_str() {
+        return n.to_string();
+    }
+    if let Some(h) = summary["head"].as_str() {
+        return h.to_string();
+    }
+    kind_fallback.to_string()
+}
+
 fn forms_output(
     op: &'static str,
     file: &Path,
@@ -2208,5 +2255,36 @@ fn forms_output(
         warnings: Some(warnings),
         notes: None,
         error: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ambiguous_handle_message_lists_handles_not_paths() {
+        // The dotted structural path is internal; the message must name the
+        // candidate handles (with line ranges), never the paths.
+        let mk = |handle: &str, line: (usize, usize)| handle::Node {
+            path: "9.2.2.5".into(),
+            kind: "list_lit".into(),
+            head: Some("def".into()),
+            name: Some("x".into()),
+            line: [line.0, line.1],
+            handle: handle.into(),
+            raw: "0".repeat(64),
+            start_byte: 0,
+            end_byte: 0,
+            depth: 1,
+        };
+        let a = mk("a3f9c1", (4, 4));
+        let b = mk("a3f9d2", (8, 8));
+        let msg = ambiguous_handle_message("a3f9", &[&a, &b]);
+        assert!(msg.contains("a3f9c1 lines 4\u{2013}4"), "lists first handle + range: {msg}");
+        assert!(msg.contains("a3f9d2 lines 8\u{2013}8"), "lists second handle + range: {msg}");
+        assert!(msg.contains("handles:"), "labels the candidate handles: {msg}");
+        assert!(!msg.contains("9.2.2.5"), "no internal dotted path leaks: {msg}");
+        assert!(!msg.contains("paths:"), "no path list: {msg}");
     }
 }

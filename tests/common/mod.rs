@@ -99,15 +99,33 @@ pub fn tree_nodes(file: &str) -> Vec<Value> {
         .clone()
 }
 
-/// A node's handle, found by def name (top-level) or node path.
-pub fn handle_of(file: &str, name_or_path: &str) -> String {
+/// A node's handle, found by def name, or — for a top-level form — by its
+/// 1-based top-level address. The structural `path` coordinate is internal and
+/// no longer serialized, so it cannot key a lookup here.
+pub fn handle_of(file: &str, name_or_addr: &str) -> String {
+    let nodes = tree_nodes(file);
+    // By def name (top-level named forms).
+    if let Some(n) = nodes.iter().find(|n| n["name"].as_str() == Some(name_or_addr)) {
+        return n["handle"].as_str().unwrap().to_string();
+    }
+    // By 1-based top-level form address.
+    if let Ok(addr) = name_or_addr.parse::<usize>() {
+        let top_level: Vec<&Value> = nodes.iter().filter(|n| n["depth"] == 1).collect();
+        if let Some(n) = top_level.get(addr - 1) {
+            return n["handle"].as_str().unwrap().to_string();
+        }
+    }
+    panic!("no node named/addressed {name_or_addr:?}")
+}
+
+/// A node's handle at a given (start line, depth) in the `tree --json` table.
+/// The structural position is now carried as `line` + `depth` — the `path`
+/// coordinate is internal and no longer serialized.
+pub fn handle_at(file: &str, line: usize, depth: usize) -> String {
     tree_nodes(file)
         .iter()
-        .find(|n| {
-            n["name"].as_str() == Some(name_or_path)
-                || n["path"].as_str() == Some(name_or_path)
-        })
-        .unwrap_or_else(|| panic!("no node named/pathed {name_or_path:?}"))
+        .find(|n| n["line"][0] == line && n["depth"] == depth)
+        .unwrap_or_else(|| panic!("no node at line {line} depth {depth}"))
         ["handle"]
         .as_str()
         .unwrap()

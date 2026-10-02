@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::{fixture, handle_of, run_json};
+use common::{fixture, handle_at, handle_of, run_json};
 use serde_json::Value;
 use std::process::Command;
 
@@ -73,7 +73,7 @@ fn inference_independent_of_reindent() {
     for (name, bytes) in fixtures {
         for no_format in [false, true] {
             let p = fixture(name, bytes);
-            let h = handle_of(&p, "1.2");
+            let h = handle_at(&p, 1, 2);
             let extra: Vec<&str> = if no_format { vec!["--no-format-content"] } else { vec![] };
             let (code, d) = edit_content_extra(&p, &h, content, &extra);
             assert_eq!(code, 3, "case {name} no_format={no_format}: {d}");
@@ -90,7 +90,7 @@ fn inference_independent_of_reindent() {
     for (name, bytes) in fixtures {
         for no_format in [false, true] {
             let p = fixture(name, bytes);
-            let h = handle_of(&p, "1.2");
+            let h = handle_at(&p, 1, 2);
             let mut extra = vec!["--repair"];
             if no_format {
                 extra.push("--no-format-content");

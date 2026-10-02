@@ -167,30 +167,33 @@ fn tree_full_nodes(file: &str) -> Vec<Value> {
         .expect("tree --json carries result.nodes")
 }
 
-fn node_by_path<'a>(nodes: &'a [Value], path: &str) -> &'a Value {
+/// The node at a given (start line, depth). The structural position now lives
+/// in the JSON as `line` + `depth` — the `path` coordinate is internal and no
+/// longer serialized, so it cannot key the lookup.
+fn node_at(nodes: &[Value], line: usize, depth: usize) -> &Value {
     nodes
         .iter()
-        .find(|n| n["path"] == path)
-        .unwrap_or_else(|| panic!("no node at path {path}: {nodes:?}"))
+        .find(|n| n["line"][0] == line && n["depth"] == depth)
+        .unwrap_or_else(|| panic!("no node at line {line} depth {depth}: {nodes:?}"))
 }
 
-fn handle_at(file: &str, path: &str) -> String {
+fn handle_at(file: &str, line: usize, depth: usize) -> String {
     let nodes = tree_full_nodes(file);
-    node_by_path(&nodes, path)["handle"].as_str().unwrap().to_string()
+    node_at(&nodes, line, depth)["handle"].as_str().unwrap().to_string()
 }
 
 #[test]
 fn edit_handle_replaces_nested_form() {
     let f = fixture("he-replace.clj", HEDIT_FIXTURE);
     let nodes = tree_full_nodes(&f);
-    let h = node_by_path(&nodes, "3.3.2")["handle"].as_str().unwrap();
+    let h = node_at(&nodes, 7, 3)["handle"].as_str().unwrap();
 
     let (code, d, stderr) =
         run_json(&["edit", &f, "--handle", h, "--content", "(if x y 0)", "--json"], None);
     assert_eq!(code, 0, "{d} {stderr}");
     assert_eq!(d["result"]["summary"]["action"], "replaced");
-    assert_eq!(d["result"]["summary"]["path"], "3.3.2");
-    // The node now at the same path reports its new handle.
+    assert_eq!(d["result"]["summary"]["wasHandle"], h);
+    // The node now at the same position reports its new handle.
     assert!(d["result"]["summary"]["handle"].is_string(), "{d}");
     // Only the target range changed: the file is the fixture with just the
     // when-form swapped (the splice is exact — no whitespace re-flow).
@@ -201,7 +204,7 @@ fn edit_handle_replaces_nested_form() {
 #[test]
 fn edit_handle_patch_delete_insert() {
     let f = fixture("he-modes.clj", HEDIT_FIXTURE);
-    let h = handle_at(&f, "3.3.1.1"); // [1 2]
+    let h = handle_at(&f, 6, 4); // [1 2]
 
     // Patch scoped to the node's bytes.
     let (code, d, stderr) = run_json(&[
@@ -214,7 +217,7 @@ fn edit_handle_patch_delete_insert() {
     assert!(text.contains("[1 9]"), "{text}");
 
     // Re-fetch: the patched node got a new handle.
-    let h2 = handle_at(&f, "3.3.1.1");
+    let h2 = handle_at(&f, 6, 4);
     assert_ne!(h2, h);
 
     // Insert-after: the new form lands as a sibling on its own line, at the
@@ -232,7 +235,7 @@ fn edit_handle_patch_delete_insert() {
     );
 
     // Delete the node's byte range (re-fetched: the insert-after changed it).
-    let h3 = handle_at(&f, "3.3.1.1");
+    let h3 = handle_at(&f, 6, 4);
     let (code, d, stderr) =
         run_json(&["edit", &f, "--handle", &h3, "--mode", "delete", "--json"], None);
     assert_eq!(code, 0, "{d} {stderr}");
@@ -245,7 +248,7 @@ fn edit_handle_patch_delete_insert() {
     assert!(text.contains("(inc 0)"), "sibling kept: {text}");
 
     // Insert before a different node: the def's map.
-    let hmap = handle_at(&f, "2.2");
+    let hmap = handle_at(&f, 3, 2);
     let (code, d, stderr) = run_json(&[
         "edit", &f, "--handle", &hmap, "--mode", "insert-before", "--content", "(def marker :ok)", "--json",
     ], None);
@@ -271,7 +274,7 @@ fn edit_handle_nested_inserts_own_lines() {
     // Nested insert-after, single-line content: the new form lands on its
     // own line at the anchor's start column (4), after the anchor's last
     // child; the following closers stay put.
-    let h = handle_at(&f, "2.3.2"); // (when x ...)
+    let h = handle_at(&f, 5, 3); // (when x ...)
     let (code, d, stderr) = run_json(&[
         "edit", &f, "--handle", &h, "--mode", "insert-after", "--content", "(log x)", "--json",
     ], None);
@@ -286,7 +289,7 @@ fn edit_handle_nested_inserts_own_lines() {
     // anchor's start column (line 0 at 4, the body line at 4 + its relative
     // 2-space indent).
     std::fs::write(&f, src.as_bytes()).unwrap();
-    let h = handle_at(&f, "2.3.2");
+    let h = handle_at(&f, 5, 3);
     let (code, d, stderr) = run_json(&[
         "edit", &f, "--handle", &h, "--mode", "insert-after",
         "--content", "(defn g [a]\n  a)", "--json",
@@ -301,7 +304,7 @@ fn edit_handle_nested_inserts_own_lines() {
     // the line above at the anchor's column and the anchor drops to its own
     // line at the same column.
     std::fs::write(&f, src.as_bytes()).unwrap();
-    let h = handle_at(&f, "2.3.2.2"); // (inner x)
+    let h = handle_at(&f, 6, 4); // (inner x)
     let (code, d, stderr) = run_json(&[
         "edit", &f, "--handle", &h, "--mode", "insert-before", "--content", "(log x)", "--json",
     ], None);
@@ -324,10 +327,10 @@ fn edit_handle_stale_is_refused() {
         "he-stale.clj",
         b"(def a 1)\n\n(defn f [x]\n  (let [q 5]\n    q))\n",
     );
-    let h = handle_at(&f, "2.3.1");
+    let h = handle_at(&f, 4, 3);
     // Out-of-band: form 2 is replaced entirely, so the target node's content
     // changes (or disappears).
-    let h2 = handle_at(&f, "2");
+    let h2 = handle_at(&f, 3, 1);
     let (code, _, stderr) = run_json(&[
         "edit", &f, "--handle", &h2, "--content", "(defn f [x] (inc x))", "--json",
     ], None);
@@ -348,7 +351,7 @@ fn edit_handle_stale_is_refused() {
 #[test]
 fn edit_handle_reaims_moved_form() {
     let f = fixture("he-reaim.clj", HEDIT_FIXTURE);
-    let h = handle_at(&f, "2");
+    let h = handle_at(&f, 3, 1);
     // An earlier top-level insert moves the form from addr 2 to addr 3
     // (the seam inserts a blank-line-separated sibling before it).
     let (code, _, stderr) = run_json(&[
@@ -362,7 +365,7 @@ fn edit_handle_reaims_moved_form() {
     ], None);
     assert_eq!(code, 0, "{d} {stderr}");
     assert_eq!(d["result"]["summary"]["action"], "replaced");
-    assert_eq!(d["result"]["summary"]["path"], "3");
+    assert_eq!(d["result"]["summary"]["wasHandle"], h);
     let text = std::fs::read_to_string(&f).unwrap();
     assert!(text.contains("(def config {:a 2})"), "{text}");
     assert!(text.contains("(def first :x)"), "earlier insert intact: {text}");
@@ -388,7 +391,7 @@ fn handle_survives_form_moves_and_edits_elsewhere() {
         None,
     );
     assert_eq!(code, 0, "{d} {err}");
-    assert_eq!(d["result"]["summary"]["path"], "4");
+    assert_eq!(d["result"]["summary"]["wasHandle"], h);
     assert!(std::fs::read_to_string(&f).unwrap().contains("(* x 4)"));
 
     // A changed form no longer resolves: its handle is stale.
@@ -403,7 +406,7 @@ fn handle_survives_form_moves_and_edits_elsewhere() {
 #[test]
 fn edit_strips_view_markers_from_content() {
     let f = fixture("he-markers.clj", HEDIT_FIXTURE);
-    let h = handle_at(&f, "2");
+    let h = handle_at(&f, 3, 1);
     // A form lifted straight from the human tree view, markers and all.
     let (code, out, stderr) = run_bytes(&["tree", &f, "--depth", "1", "--human"], None);
     assert_eq!(code, 0, "{stderr}");
@@ -440,7 +443,7 @@ fn edit_strips_view_markers_from_content() {
 #[test]
 fn edit_reindents_isolated_content() {
     let f = fixture("he-reindent.clj", b"(def x {:a 1})\n");
-    let h = handle_at(&f, "1.2");
+    let h = handle_at(&f, 1, 2);
     // Isolated form at column 0; the target node sits at column 7.
     let (code, d, stderr) =
         run_json(&["edit", &f, "--handle", &h, "--content", "(defn f [a]\n  a)\n", "--json"], None);
@@ -469,7 +472,7 @@ fn get_and_edit_accept_decorated_handles() {
     // A handle lifted from the annotated tree view carries the ⟦…⟧ markers;
     // both resolvers must resolve it exactly like the bare handle.
     let f = fixture("he-decorated-handle.clj", HEDIT_FIXTURE);
-    let h = handle_at(&f, "2"); // def config
+    let h = handle_at(&f, 3, 1); // def config
     let decorated = format!("\u{27E6}{h}\u{27E7}");
 
     // get: the decorated handle resolves identically to the bare one.
@@ -491,7 +494,7 @@ fn get_and_edit_accept_decorated_handles() {
     );
     assert_eq!(code, 0, "{d} {stderr}");
     assert_eq!(d["result"]["summary"]["action"], "replaced");
-    assert_eq!(d["result"]["summary"]["path"], "2");
+    assert_eq!(d["result"]["summary"]["wasHandle"], h);
     let notes = d["notes"].as_array().expect("notes");
     assert!(
         notes
@@ -505,13 +508,13 @@ fn get_and_edit_accept_decorated_handles() {
     );
 
     // A bare handle still works, with no strip note.
-    let h2 = handle_at(&f, "2");
+    let h2 = handle_at(&f, 3, 1);
     let (code, d, stderr) = run_json(
         &["edit", &f, "--handle", &h2, "--content", "(def config {:a 8})", "--json"],
         None,
     );
     assert_eq!(code, 0, "{d} {stderr}");
-    assert_eq!(d["result"]["summary"]["path"], "2");
+    assert_eq!(d["result"]["summary"]["wasHandle"], h2);
     let notes = d["notes"].as_array().expect("notes");
     assert!(
         !notes
@@ -521,13 +524,13 @@ fn get_and_edit_accept_decorated_handles() {
     );
 
     // A bare handle with surrounding spaces resolves too (trim only, no note).
-    let h3 = handle_at(&f, "2");
+    let h3 = handle_at(&f, 3, 1);
     let (code, d, stderr) = run_json(
         &["edit", &f, "--handle", &format!(" {h3} "), "--content", "(def config {:a 7})", "--json"],
         None,
     );
     assert_eq!(code, 0, "{d} {stderr}");
-    assert_eq!(d["result"]["summary"]["path"], "2");
+    assert_eq!(d["result"]["summary"]["wasHandle"], h3);
     let notes = d["notes"].as_array().expect("notes");
     assert!(
         !notes
@@ -543,4 +546,135 @@ fn get_and_edit_accept_decorated_handles() {
         run_json(&["get", &f, "--handle", &stray, "--json"], None);
     assert_eq!(code, 3, "{d}");
     assert_eq!(d["error"]["code"], "stale-handle");
+}
+
+// ==============================================================
+// issue 13: the structural path stays internal (SPEC \u{a7}5, \u{a7}10.2, \u{a7}10.6)
+// ==============================================================
+
+/// True if `s` contains a dotted structural path: a digit, a dot, a digit
+/// (`N.N`). Handles are hex (no dots) and line ranges use an en dash, so this
+/// only matches a coordinate like `3.3.1.1`.
+fn has_dotted_path(s: &str) -> bool {
+    let b = s.as_bytes();
+    (0..b.len().saturating_sub(2)).any(|i| {
+        b[i].is_ascii_digit() && b[i + 1] == b'.' && b[i + 2].is_ascii_digit()
+    })
+}
+
+#[test]
+fn tree_json_has_no_path() {
+    let f = fixture("no-path.clj", HEDIT_FIXTURE);
+    let (code, d, stderr) = run_json(&["tree", &f, "--full", "--json"], None);
+    assert_eq!(code, 0, "{stderr}");
+    let nodes = d["result"]["nodes"].as_array().expect("result.nodes");
+    assert!(!nodes.is_empty(), "node table is non-empty");
+    for n in nodes {
+        assert!(n.get("path").is_none(), "node must not expose a path: {n}");
+    }
+}
+
+#[test]
+fn human_summary_has_no_path() {
+    let f = fixture("human-no-path.clj", HEDIT_FIXTURE);
+    let h = handle_at(&f, 6, 4); // the nested [1 2]
+    let (code, d, stderr) = run_json(
+        &[
+            "edit",
+            &f,
+            "--handle",
+            &h,
+            "--mode",
+            "patch",
+            "--old-text",
+            "2",
+            "--new-text",
+            "9",
+            "--json",
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "{d} {stderr}");
+    // `result.text` is the human summary.
+    let text = d["result"]["text"].as_str().expect("result.text");
+    // It names the (post-patch) handle the JSON reports, and no dotted path.
+    let reported = d["result"]["summary"]["handle"]
+        .as_str()
+        .expect("summary reports the new handle");
+    assert!(text.contains(reported), "human summary names the handle: {text}");
+    assert!(!has_dotted_path(text), "no dotted path in the human summary: {text}");
+}
+
+// A nested list form whose head is a bare symbol and which has no def name,
+// so the human summary label must fall back to the head, not the kind.
+const HINNER_FIXTURE: &[u8] =
+    b"(ns t)\n\n(def config {:a 1})\n\n(defn helper [x]\n  (inner x\n    [1 2]))\n\n(def after :ok)\n";
+
+/// The nested `(inner …)` list form's (start line, depth).
+const INNER_POS: (usize, usize) = (6, 2);
+
+#[test]
+fn human_summary_label_uses_head_not_kind() {
+    // Patch: exact text replacement inside the form. The label must be the
+    // head symbol `inner`, not the kind `list_lit`, and no dotted path.
+    let f = fixture("human-inner.clj", HINNER_FIXTURE);
+    let h = handle_at(&f, INNER_POS.0, INNER_POS.1);
+    let (code, d, stderr) = run_json(
+        &[
+            "edit",
+            &f,
+            "--handle",
+            &h,
+            "--mode",
+            "patch",
+            "--old-text",
+            "x",
+            "--new-text",
+            "y",
+            "--json",
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "{d} {stderr}");
+    let text = d["result"]["text"].as_str().expect("result.text");
+    assert!(
+        text.contains("inner"),
+        "label is the head symbol, not the kind: {text}"
+    );
+    assert!(!text.contains("list_lit"), "kind must not leak into the label: {text}");
+    assert!(!has_dotted_path(text), "no dotted path in the human summary: {text}");
+    // The JSON carries the head so the label is computable; it has no name.
+    assert_eq!(d["result"]["summary"]["head"], "inner");
+    assert!(d["result"]["summary"]["name"].is_null());
+    // The (post-patch) handle is still named in the human summary.
+    let reported = d["result"]["summary"]["handle"].as_str().expect("new handle");
+    assert!(text.contains(reported), "human summary names the handle: {text}");
+
+    // Replace: whole-form swap. The label is the ORIGINAL node's head, still
+    // `inner`, and still no dotted path.
+    let f2 = fixture("human-inner-rep.clj", HINNER_FIXTURE);
+    let h2 = handle_at(&f2, INNER_POS.0, INNER_POS.1);
+    let (code, d, stderr) =
+        run_json(&["edit", &f2, "--handle", &h2, "--content", "(inner z [9 9])", "--json"], None);
+    assert_eq!(code, 0, "{d} {stderr}");
+    let text = d["result"]["text"].as_str().expect("result.text");
+    assert!(text.contains("inner"), "replace label is the head: {text}");
+    assert!(!text.contains("list_lit"), "kind must not leak into the label: {text}");
+    assert!(!has_dotted_path(text), "no dotted path in the human summary: {text}");
+    assert_eq!(d["result"]["summary"]["head"], "inner");
+
+    // Delete: the label falls back through name -> head -> "form", so `inner`
+    // (the head) wins over the plain "form" fallback.
+    let f3 = fixture("human-inner-del.clj", HINNER_FIXTURE);
+    let h3 = handle_at(&f3, INNER_POS.0, INNER_POS.1);
+    let (code, d, stderr) =
+        run_json(&["edit", &f3, "--handle", &h3, "--mode", "delete", "--json"], None);
+    assert_eq!(code, 0, "{d} {stderr}");
+    let text = d["result"]["text"].as_str().expect("result.text");
+    assert!(
+        text.contains("\u{27E7} inner (was lines"),
+        "delete label is the head, not 'form': {text}"
+    );
+    assert!(!has_dotted_path(text), "no dotted path in the human summary: {text}");
+    assert_eq!(d["result"]["summary"]["head"], "inner");
 }

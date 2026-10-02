@@ -25,16 +25,18 @@ const MULTI_FIXTURE: &[u8] =
 const HEDIT_FIXTURE: &[u8] =
     b"(ns t)\n\n(def config {:a 1})\n\n(defn helper [x]\n  (let [y [1 2]]\n    (when x\n      (+ y 1))))\n\n(def after :ok)\n";
 
-/// A nested node's handle, by node path (needs the full node table).
-fn handle_at_path(file: &str, path: &str) -> String {
+/// A nested node's handle, by (start line, depth). The structural position is
+/// carried in the JSON as `line` + `depth`; the `path` coordinate is internal
+/// and no longer serialized, so it cannot key the lookup (needs the full table).
+fn handle_at_path(file: &str, line: usize, depth: usize) -> String {
     let (code, d, err) = run_json(&["tree", file, "--full", "--json"], None);
     assert_eq!(code, 0, "{d} {err}");
     d["result"]["nodes"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|n| n["path"] == path)
-        .unwrap_or_else(|| panic!("no node at path {path}"))
+        .find(|n| n["line"][0] == line && n["depth"] == depth)
+        .unwrap_or_else(|| panic!("no node at line {line} depth {depth}"))
         ["handle"]
         .as_str()
         .unwrap()
@@ -51,7 +53,7 @@ fn replace_by_handle() {
     );
     assert_eq!(code, 0, "{err}");
     assert_eq!(d["result"]["summary"]["action"], "replaced");
-    assert_eq!(d["result"]["summary"]["path"], "3");
+    assert_eq!(d["result"]["summary"]["wasHandle"], h);
     assert_eq!(d["result"]["changed"], 1);
     assert_eq!(d["result"]["untouched"], 4);
     assert_eq!(d["forms"].as_array().unwrap().len(), 5);
@@ -389,7 +391,7 @@ fn edit_format_content_reindents() {
     // it in parinfer paren mode (the flat body raises to the opener's
     // column + 1) and then base-shifts the result to the target column.
     let f = fixture("fmt-reindent.clj", b"(def x {:a 1})\n");
-    let h = handle_at_path(&f, "1.2"); // the map, at column 7
+    let h = handle_at_path(&f, 1, 2); // the map, at column 7
     let (code, d, stderr) = run_json(
         &[
             "edit",
@@ -422,7 +424,7 @@ fn edit_format_content_reindents() {
     // --no-format-content: the relative shape is preserved verbatim —
     // base-shift only, no parinfer raise.
     std::fs::write(&f, b"(def x {:a 1})\n").unwrap();
-    let h = handle_at_path(&f, "1.2");
+    let h = handle_at_path(&f, 1, 2);
     let (code, d, stderr) = run_json(
         &[
             "edit",
@@ -459,7 +461,7 @@ fn edit_format_content_skips_unbalanced() {
     // first, then the parindent of the REPAIRED candidate — no format-error,
     // the edit still succeeds and lands base-shifted.
     let f = fixture("fmt-unbalanced.clj", b"(def x {:a 1})\n");
-    let h = handle_at_path(&f, "1.2");
+    let h = handle_at_path(&f, 1, 2);
     let (code, d, stderr) = run_json(
         &[
             "edit",
@@ -556,12 +558,17 @@ fn mutations_leave_untouched_forms_identical() {
     // The byte-identity battery: every mutation must leave all other forms
     // byte-identical (content hash), with line spans stable where the
     // replacement does not change the file's line count.
+    enum Target {
+        /// Named/addr lookup via `handle_of` (top-level forms).
+        Named(&'static str),
+        /// Nested node by (start line, depth) via the full node table.
+        Node(usize, usize),
+    }
     struct Case {
         name: &'static str,
         file: &'static str,
         src: &'static [u8],
-        /// (is_node_path, name-or-path target).
-        target: (bool, &'static str),
+        target: Target,
         content: &'static str,
         allowed: &'static [u32],
         lines_stable: bool,
@@ -573,7 +580,7 @@ fn mutations_leave_untouched_forms_identical() {
             name: "top-level replace",
             file: "bytes-top.clj",
             src: MULTI_FIXTURE,
-            target: (false, "helper"),
+            target: Target::Named("helper"),
             content: "(defn helper [x]\n  (* x 10))",
             allowed: &[3],
             lines_stable: true,
@@ -584,7 +591,7 @@ fn mutations_leave_untouched_forms_identical() {
             name: "nested replace",
             file: "bytes-nested.clj",
             src: HEDIT_FIXTURE,
-            target: (true, "3.3.2"),
+            target: Target::Node(7, 3),
             content: "(if x [7 8] 0)",
             allowed: &[3],
             lines_stable: false,
@@ -594,10 +601,9 @@ fn mutations_leave_untouched_forms_identical() {
         let name = c.name;
         let f = fixture(c.file, c.src);
         let before = forms(&f);
-        let h = if c.target.0 {
-            handle_at_path(&f, c.target.1)
-        } else {
-            handle_of(&f, c.target.1)
+        let h = match c.target {
+            Target::Named(s) => handle_of(&f, s),
+            Target::Node(line, depth) => handle_at_path(&f, line, depth),
         };
         let (code, d, err) = run_json(
             &["edit", &f, "--handle", &h, "--content", c.content, "--json"],

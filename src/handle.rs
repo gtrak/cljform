@@ -42,7 +42,11 @@ pub enum AnnotateError {
 /// One collection node, in document order.
 #[derive(Debug, Clone, Serialize)]
 pub struct Node {
-    /// "2", "2.1", "2.1.3" — informational.
+    /// "2", "2.1", "2.1.3" — the structural position. Internal only: it is
+    /// the duplicate-folding input and the post-edit lookup key, but it is
+    /// never serialized — a path is not addressable (there is no `--path`
+    /// /`--addr`), so it must not appear in human/agent/JSON output.
+    #[serde(skip)]
     pub path: String,
     /// list_lit | vec_lit | map_lit | set_lit | anon_fn_lit | …
     pub kind: String,

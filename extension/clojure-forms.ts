@@ -32,7 +32,6 @@ interface FormRow {
 
 /** One collection node from `cljform tree --json` (SPEC §10.2). */
 interface TreeNode {
-	path: string;
 	kind: string;
 	head?: string;
 	name?: string;
@@ -290,7 +289,7 @@ export default function ClojureForms(pi: ExtensionAPI) {
 					`${params.path}: ${nodes.length} nodes · ${out.file_hash?.slice(0, 19)}…`,
 					...nodes.map(
 						(n) =>
-							`${"  ".repeat(Math.max(0, n.depth - 1))}⟦${n.handle}⟧ ${n.kind}${n.name ? ` ${n.name}` : ""} · lines ${n.line[0]}–${n.line[1]} · path ${n.path}`,
+							`${"  ".repeat(Math.max(0, n.depth - 1))}⟦${n.handle}⟧ ${n.kind}${n.name ? ` ${n.name}` : ""} · lines ${n.line[0]}–${n.line[1]}`,
 					),
 				];
 				return { content: [{ type: "text", text: lines.join("\n") }], details: { nodes } };
