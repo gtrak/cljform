@@ -72,3 +72,9 @@ Sequence (one worker subagent per issue):
   repair decision must not depend on `--format-content` or the target column
   (drop the dedent-before-prepare coupling). Migrate the repair tests.
   Depends on 11.
+- **13 — keep the structural path internal** (`issue-13-internal-path.md`):
+  the dotted `path` (`9.2.2.5`) is shown in output but is not addressable (no
+  `--path`/`--addr`), so drop it from the human summary, the `tree --json`
+  node table, the summary JSON, and the `ambiguous-handle` message; show the
+  handle + a semantic label instead. `Node.path` stays internal (duplicate
+  folding + post-edit lookup). Depends on 12.

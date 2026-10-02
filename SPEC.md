@@ -137,8 +137,9 @@ cljform [--json|--human] <op> [args]
 ```
 
 The `forms` array is the **top-level listing**. The **nested view** is the
-`tree --json` node table (§10.2): `path`, `kind`, `head`, `name`, `line`,
-`depth`, `handle` per collection node.
+`tree --json` node table (§10.2): `kind`, `head`, `name`, `line`,
+`depth`, `handle` per collection node (the structural `path` is internal and
+not serialized — it is not addressable).
 
 - `addr` — 1-based top-level form index.
 - `kind` — head symbol of the form (`defn`, `defn-`, `def`, `deftest`, `ns`,
@@ -536,10 +537,11 @@ collection delimiter:
   refuse to annotate (`annotate-conflict`, exit 1) and fall back to `--json`.
 - Markers go only at AST delimiter positions, never inside strings, regexes,
   comments, or char literals.
-- `tree --json` emits the flat node table (`path`, `kind`, `head`, `name`,
-  `line`, `depth`, `handle`; null `head`/`name` omitted, internal hash and
-  byte offsets not serialized) derived from the same tree. Annotated source
-  is the canonical read view; JSON is derived.
+- `tree --json` emits the flat node table (`kind`, `head`, `name`,
+  `line`, `depth`, `handle`; null `head`/`name` omitted; the structural
+  `path`, the hash, and the byte offsets are internal and not serialized)
+  derived from the same tree. Annotated source is the canonical read view;
+  JSON is derived.
 
 ### 10.3 Edit contract
 
