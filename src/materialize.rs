@@ -4,8 +4,18 @@
 //! Rules: a line that dedents below an open bracket's column closes that
 //! bracket at the end of the previous content line (inserted before any
 //! trailing comment); EOF closes everything still open. Strings, regex
-//! literals, char literals and comments never participate. Balanced input
-//! passes through unchanged, so repair is a no-op on well-formed content.
+//! literals, char literals and comments never participate — including across
+//! line boundaries: a multi-line string stays open from its opening quote to
+//! its closing quote on a later line, and its interior bytes (any `)`, `(`,
+//! `;`, or `"`) are never treated as code. Balanced input passes through
+//! unchanged, so repair is a no-op on well-formed content.
+//!
+//! The single lexical state machine ([`lex_step`]) underlies all three scan
+//! sites in this module (the indent scanner, the closer-attach point, and the
+//! splicer's trailing-comment guard); [`first_comment`] is the shared
+//! "where does the line's code end" primitive. (format.rs carries a separate
+//! scanner by design: it rewrites bytes and enforces its own failure rules,
+//! so its contract does not match this inference-only scanner.)
 
 pub struct MaterializeError {
     pub line: usize,
@@ -20,6 +30,85 @@ struct OpenParen {
     col: usize,
 }
 
+/// Lexical context of a byte within a Clojure source stream.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Lx {
+    Code,
+    String,
+    Regex,
+    Comment,
+}
+
+/// Advance the lexical state machine over the next unit of `bytes` and return
+/// the `(index, context)` of that unit's leading byte, or `None` once the line
+/// is done. A unit may be two bytes (an escape, a char literal, or the `#"`
+/// regex opener); `i` is advanced past it. A `Comment` unit swallows the rest
+/// of the line, so a subsequent call returns `None`.
+///
+/// `state` is owned by the caller and persists across calls — that is what
+/// keeps a multi-line string open across line boundaries. A `Comment` never
+/// spans lines, so callers pass a line at a time and reset `Comment` to
+/// `Code` between lines.
+fn lex_step(bytes: &[u8], i: &mut usize, state: &mut Lx) -> Option<(usize, Lx)> {
+    if *i >= bytes.len() || matches!(*state, Lx::Comment) {
+        return None; // comment runs to end of line
+    }
+    let idx = *i;
+    let b = bytes[idx];
+    match *state {
+        Lx::String | Lx::Regex => {
+            let ctx = *state;
+            if b == b'\\' {
+                *i = idx + 2; // escaped char: backslash + char
+            } else {
+                *i = idx + 1;
+                if b == b'"' {
+                    *state = Lx::Code;
+                }
+            }
+            Some((idx, ctx))
+        }
+        _ => {
+            // Code: a delimiter may open a string, comment, or regex. Report
+            // the context the byte establishes so callers (e.g. first_comment)
+            // see the comment on its opening ';', not one step late.
+            let ctx = if b == b'"' {
+                *state = Lx::String;
+                Lx::String
+            } else if b == b';' {
+                *state = Lx::Comment;
+                Lx::Comment
+            } else if b == b'#' && bytes.get(idx + 1) == Some(&b'"') {
+                *state = Lx::Regex;
+                Lx::Regex
+            } else {
+                Lx::Code
+            };
+            *i = if b == b'\\' || (b == b'#' && bytes.get(idx + 1) == Some(&b'"')) {
+                idx + 2 // char literal, or the `#"` regex opener
+            } else {
+                idx + 1
+            };
+            Some((idx, ctx))
+        }
+    }
+}
+
+/// Byte index of the first line-comment (`;`) that appears in code context —
+/// i.e. not inside a string, regex, or char literal — or `None` if the line
+/// has no such comment. Shared by the closer-attach point (`insert_closers`)
+/// and the splicer's trailing-comment guard (`ends_in_comment`).
+fn first_comment(bytes: &[u8]) -> Option<usize> {
+    let mut i = 0usize;
+    let mut state = Lx::Code;
+    while let Some((idx, ctx)) = lex_step(bytes, &mut i, &mut state) {
+        if ctx == Lx::Comment {
+            return Some(idx);
+        }
+    }
+    None
+}
+
 /// Infer brackets from indentation. Returns the candidate text. The
 /// `edit` repair path calls this same inference; the `materialize` op
 /// wraps it with its candidate/diff envelope.
@@ -31,106 +120,90 @@ pub fn indent_mode(draft: &str) -> Result<String, MaterializeError> {
     }
 
     let mut stack: Vec<OpenParen> = Vec::new();
+    let mut lex = Lx::Code; // persists across lines (multi-line strings/regex)
 
     for li in 0..lines.len() {
-        let trimmed = lines[li].trim_start();
-        // Blank and comment-only lines never close parens.
-        if trimmed.is_empty() || trimmed.starts_with(';') {
-            continue;
+        // A comment never spans lines: a line that ended in a comment has
+        // returned to code by the start of the next line.
+        if lex == Lx::Comment {
+            lex = Lx::Code;
         }
-        let line = lines[li].clone();
-        let indent = line.len() - trimmed.len();
-
-        // Dedent: close every open bracket whose column >= this indent,
-        // appending closers to the previous content line.
-        let mut to_close = Vec::new();
-        while let Some(open) = stack.last() {
-            if open.col >= indent {
-                to_close.push(stack.pop().expect("just peeked"));
-            } else {
-                break;
+        // Only a line that BEGINS in code carries indentation or a leading
+        // comment; a line opened inside a (multi-line) string or regex is data
+        // up to its closing quote, so its indentation must not close brackets.
+        if lex == Lx::Code {
+            let trimmed = lines[li].trim_start();
+            // Blank and comment-only lines never close parens.
+            if trimmed.is_empty() || trimmed.starts_with(';') {
+                continue;
             }
-        }
-        if !to_close.is_empty() {
-            if let Some(prev) = last_content_line(&lines, li) {
-                insert_closers(&mut lines, prev, &to_close);
-            }
-        }
+            let line = lines[li].clone();
+            let indent = line.len() - trimmed.len();
 
-        // Scan this line's characters.
-        let bytes = line.as_bytes();
-        let mut i = 0usize;
-        let mut state = 0u8; // 0=code 1=string 2=regex 3=comment
-        while i < bytes.len() {
-            let b = bytes[i];
-            match state {
-                3 => break, // comment runs to end of line
-                1 | 2 => {
-                    if b == b'\\' {
-                        i += 2;
-                        continue;
-                    }
-                    if b == b'"' {
-                        state = 0;
-                    }
-                    i += 1;
+            // Dedent: close every open bracket whose column >= this indent,
+            // appending closers to the previous content line.
+            let mut to_close = Vec::new();
+            while let Some(open) = stack.last() {
+                if open.col >= indent {
+                    to_close.push(stack.pop().expect("just peeked"));
+                } else {
+                    break;
                 }
-                _ => match b {
-                    b'"' => {
-                        state = 1;
-                        i += 1;
-                    }
-                    b';' => {
-                        state = 3;
-                        i += 1;
-                    }
-                    b'\\' => {
-                        // char literal: skip the escape + char
-                        i += 2;
-                    }
-                    b'#' if bytes.get(i + 1) == Some(&b'"') => {
-                        state = 2;
-                        i += 2;
-                    }
-                    b'(' | b'[' | b'{' => {
-                        stack.push(OpenParen { ch: b, col: i });
-                        i += 1;
-                    }
-                    b')' | b']' | b'}' => {
-                        let expected = match b {
-                            b')' => b'(',
-                            b']' => b'[',
-                            _ => b'{',
-                        };
-                        match stack.pop() {
-                            Some(open) if open.ch == expected => {}
-                            Some(open) => {
-                                return Err(MaterializeError {
-                                    line: li + 1,
-                                    col: i + 1,
-                                    message: format!(
-                                        "mismatched close: found '{}' but '{}' (opened col {}) is still open",
-                                        b as char,
-                                        open.ch as char,
-                                        open.col
-                                    ),
-                                });
-                            }
-                            None => {
-                                return Err(MaterializeError {
-                                    line: li + 1,
-                                    col: i + 1,
-                                    message: format!(
-                                        "unmatched '{}' — indentation closes every form before this point",
-                                        b as char
-                                    ),
-                                });
-                            }
+            }
+            if !to_close.is_empty() {
+                if let Some(prev) = last_content_line(&lines, li) {
+                    insert_closers(&mut lines, prev, &to_close);
+                }
+            }
+        }
+
+        // Scan this line's characters, tracking the lexical context so parens
+        // and comments inside strings/regex/char-literals never count. `lex`
+        // carries over to the next line (a multi-line string stays open).
+        let bytes = lines[li].as_bytes();
+        let mut i = 0usize;
+        while let Some((idx, ctx)) = lex_step(bytes, &mut i, &mut lex) {
+            if ctx != Lx::Code {
+                continue;
+            }
+            match bytes[idx] {
+                b'(' | b'[' | b'{' => {
+                    stack.push(OpenParen { ch: bytes[idx], col: idx });
+                }
+                b')' | b']' | b'}' => {
+                    let b = bytes[idx];
+                    let expected = match b {
+                        b')' => b'(',
+                        b']' => b'[',
+                        _ => b'{',
+                    };
+                    match stack.pop() {
+                        Some(open) if open.ch == expected => {}
+                        Some(open) => {
+                            return Err(MaterializeError {
+                                line: li + 1,
+                                col: idx + 1,
+                                message: format!(
+                                    "mismatched close: found '{}' but '{}' (opened col {}) is still open",
+                                    b as char,
+                                    open.ch as char,
+                                    open.col
+                                ),
+                            });
                         }
-                        i += 1;
+                        None => {
+                            return Err(MaterializeError {
+                                line: li + 1,
+                                col: idx + 1,
+                                message: format!(
+                                    "unmatched '{}' — indentation closes every form before this point",
+                                    b as char
+                                ),
+                            });
+                        }
                     }
-                    _ => i += 1,
-                },
+                }
+                _ => {}
             }
         }
     }
@@ -162,45 +235,9 @@ fn last_content_line(lines: &[String], end: usize) -> Option<usize> {
 fn insert_closers(lines: &mut [String], idx: usize, opens: &[OpenParen]) {
     let line = &lines[idx];
     let bytes = line.as_bytes();
-    // Find where code ends: first ';' outside a string/regex, else after
-    // trailing whitespace trim.
-    let mut code_end = bytes.len();
-    let mut state = 0u8;
-    let mut i = 0usize;
-    while i < bytes.len() {
-        let b = bytes[i];
-        match state {
-            1 | 2 => {
-                if b == b'\\' {
-                    i += 2;
-                    continue;
-                }
-                if b == b'"' {
-                    state = 0;
-                }
-                i += 1;
-            }
-            3 => {
-                code_end = i;
-                break;
-            }
-            _ => match b {
-                b'"' => {
-                    state = 1;
-                    i += 1;
-                }
-                b'#' if bytes.get(i + 1) == Some(&b'"') => {
-                    state = 2;
-                    i += 2;
-                }
-                b';' => {
-                    code_end = i;
-                    break;
-                }
-                _ => i += 1,
-            },
-        }
-    }
+    // Find where code ends: the first code-context ';' (a trailing comment),
+    // else the end of the line.
+    let mut code_end = first_comment(bytes).unwrap_or(bytes.len());
     // Trim back to the last code byte: closers attach to the paren trail,
     // never float after trailing whitespace and never land inside a comment.
     while code_end > 0 && (bytes[code_end - 1] == b' ' || bytes[code_end - 1] == b'\t') {
@@ -220,43 +257,11 @@ fn insert_closers(lines: &mut [String], idx: usize, opens: &[OpenParen]) {
     line.push_str(&tail);
 }
 
-/// Line-based LCS diff in unified format (2 context lines).
 /// True when `bytes` end inside a line comment (an unterminated `;` run).
 /// Used by the splicer: trailing-comment content followed by a same-line
 /// neighbor would otherwise comment that neighbor out.
 pub fn ends_in_comment(bytes: &[u8]) -> bool {
-    let mut state = 0u8; // 0=code 1=string 2=regex 3=comment
-    let mut i = 0usize;
-    while i < bytes.len() {
-        let b = bytes[i];
-        match state {
-            3 => return true,
-            1 | 2 => {
-                if b == b'\\' {
-                    i += 2;
-                    continue;
-                }
-                if b == b'"' {
-                    state = 0;
-                }
-                i += 1;
-            }
-            _ => match b {
-                b'"' => {
-                    state = 1;
-                    i += 1;
-                }
-                b'#' if bytes.get(i + 1) == Some(&b'"') => {
-                    state = 2;
-                    i += 2;
-                }
-                b';' => return true,
-                b'\\' => i += 2,
-                _ => i += 1,
-            },
-        }
-    }
-    false
+    first_comment(bytes).is_some()
 }
 
 /// Line-based LCS diff in unified format (2 context lines).
@@ -422,3 +427,4 @@ fn lcs_ops(a: &[&str], b: &[&str]) -> Vec<Op> {
     }
     ops
 }
+

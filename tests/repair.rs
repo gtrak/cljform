@@ -396,6 +396,76 @@ fn materialize_flags_unterminated_fence() {
     );
 }
 
+/// Issue 20 (F-2): the indent scanner used to reset string state per line, so
+/// a bracket on a continuation line *inside* a multi-line string was treated
+/// as code and refused with a lying "unmatched ')'" error. These cases are
+/// balanced: the brackets live in a string/regex, so materialize must pass
+/// them through unchanged (empty diff) rather than refuse.
+#[test]
+fn materialize_multiline_string_interior_is_not_code() {
+    let cases: [(&str, &str); 5] = [
+        // ")" on a continuation line, inside the string
+        (
+            "(def a \"x\n) y\nz\"\n  (b 1))\n",
+            "(def a \"x\n) y\nz\"\n  (b 1))",
+        ),
+        // "(" on a continuation line, inside the string
+        (
+            "(def a \"x\n( y\nz\"\n  (b 1))\n",
+            "(def a \"x\n( y\nz\"\n  (b 1))",
+        ),
+        // a `;`-leading continuation line, inside the string (not a comment)
+        (
+            "(def a \"x\n; y\nz\"\n  (b 1))\n",
+            "(def a \"x\n; y\nz\"\n  (b 1))",
+        ),
+        // an escaped \" that keeps the string open across the line break, so
+        // the real closer lands on the next line (not the escaped quote)
+        (
+            "(def a \"x \\\"\n) y\"\n  (b 1))\n",
+            "(def a \"x \\\"\n) y\"\n  (b 1))",
+        ),
+        // a regex literal carrying a ")"
+        (
+            "(def a #\")\"\n  (b 1))\n",
+            "(def a #\")\"\n  (b 1))",
+        ),
+    ];
+    for (draft, cand) in cases {
+        let (_code, d, _) = run_json(&["materialize", "--json"], Some(draft.as_bytes()));
+        assert_eq!(d["ok"], true, "case {draft:?}: {d}");
+        assert_eq!(
+            d["result"]["candidate"].as_str().unwrap(),
+            cand,
+            "balanced content passes through: {draft:?}"
+        );
+        assert_eq!(
+            d["result"]["diff"].as_str().unwrap(),
+            "--- draft\n+++ candidate\n",
+            "unchanged content has an empty diff: {draft:?}"
+        );
+    }
+}
+
+/// The same string-interior `)` must still be refused when a *real* `)` in
+/// code is genuinely unmatched — and diagnosed at its true position, not at
+/// the string's interior closer.
+#[test]
+fn materialize_still_refuses_genuinely_unbalanced_content() {
+    // A stray `)` in code after the balanced form: line 5.
+    let (_code, d, _) = run_json(
+        &["materialize", "--json"],
+        Some(b"(def a \"x\n) y\nz\"\n  (b 1))\n)\n"),
+    );
+    assert_eq!(d["ok"], false, "{d}");
+    assert_eq!(d["error"]["code"], "materialize-error");
+    assert_eq!(d["error"]["line"], 5, "the real closer, not the string's: {d}");
+    assert!(
+        d["error"]["message"].as_str().unwrap().contains("unmatched ')"),
+        "{d}"
+    );
+}
+
 #[test]
 fn human_materialize_shows_candidate() {
     let out = Command::new(env!("CARGO_BIN_EXE_cljform"))
