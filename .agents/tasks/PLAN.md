@@ -92,3 +92,8 @@ Sequence (one worker subagent per issue):
   successful clj_edit appends `next handle: ⟦H⟧` so sequential patches chase
   the returned handle instead of re-fetching (the sound replacement for the
   requested valid-until-own-next-patch semantics). Depends on 14.
+- **16 — patch-not-found escape hint + newline guidance**
+  (`issue-16-escape-hint.md`, micro, from T8 dogfood): a possibility-phrased
+  hint on `patch-not-found` when oldText contains literal backslash-n/t
+  sequences (refusal stands — Clojure strings/regex can legitimately contain
+  them); one guidance sentence on exact-text/real newlines. Depends on 15.
