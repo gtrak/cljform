@@ -6,8 +6,10 @@
  * Clojure/EDN files with a structural shape report.
  *
  * Philosophy: the agent should never have to bracket-count. clj_edit does
- * what it means, repairs unbalanced content when the fix is unambiguous,
- * never writes a file that doesn't parse, and reports exactly what changed.
+ * what it means, infers unbalanced brackets from indentation when
+ * repair: true (reported, never silent — the default refuses unbalanced
+ * content with the candidate), never writes a file that doesn't parse,
+ * and reports exactly what changed.
  * cljform edit itself reindents the submitted content (parinfer paren mode,
  * default on, `--no-format-content` to disable; `autoFormat: false` maps to
  * that flag) before base-shifting it to the target column;
@@ -431,7 +433,8 @@ export default function ClojureForms(pi: ExtensionAPI) {
 			"verified with the full pipeline (file must still parse, every other form byte-identical). No bracket " +
 			"repair in patch mode — fetch exact bytes with clj_get if unsure.\n" +
 			"(2) REPLACE (or insert/delete via mode): pass content — the full replacement form; content may be " +
-			"unbalanced (brackets repaired from indentation when unambiguous) and markdown fences are stripped. " +
+			"unbalanced (refused by default with the inferred candidate; pass repair: true to apply it) and " +
+			"markdown fences are stripped. " +
 			"The file is written only if the result parses and every untouched form is byte-identical. " +
 			"Submitted content is reindented in parinfer paren mode (default on; content the reindent " +
 			"refuses is sent verbatim with a note) and base-shifted to the target's column; patch " +
@@ -445,8 +448,8 @@ export default function ClojureForms(pi: ExtensionAPI) {
 			"mode: replace (default) | patch (needs oldText/newText) | insert-after (anchor: handle) | insert-before (anchor: handle) | append | prepend (file ends, no handle) | delete (needs handle).",
 			"Address WARNING D1/D2 lines in the result — they mean a form is nested inside another defn/let.",
 			"dryRun: true validates and shows the outcome without writing.",
-			"strict: true (CI mode) refuses detector warnings and content repairs instead of applying them.",
-			"repair: true allows a guessed mid-file (dedent) closure; by default only missing trailing closers are completed — a dedent-repair refusal shows the candidate.",
+			"strict: true (CI mode) refuses detector warnings; together with repair it refuses the repair instead of applying it (repair-refused).",
+			"repair: true enables bracket inference from indentation (missing trailing closers + a mid-file dedent closure); without it, unbalanced content is refused (unbalanced-content) with the inferred candidate.",
 			"autoFormat (default true): cljform edit reindents content in parinfer paren mode before base-shifting it; set it false to pass --no-format-content (content stays verbatim). Patch oldText/newText are never reindented.",
 		],
 		parameters: Type.Object({
@@ -487,13 +490,13 @@ export default function ClojureForms(pi: ExtensionAPI) {
 			strict: Type.Optional(
 				Type.Boolean({
 					description:
-						"Refuse detector warnings and content repairs instead of applying them (CI mode)",
+						"Refuse detector warnings (CI mode); together with repair, refuses the repair instead of applying it (repair-refused)",
 				}),
 			),
 			repair: Type.Optional(
 				Type.Boolean({
 					description:
-						"Allow repair to close an inner form at a mid-file dedent (guessed placement). By default only missing trailing closers are completed",
+						"Enable bracket inference from indentation: missing trailing closers + a mid-file dedent closure (guessed placement). Without it, unbalanced content is refused with the inferred candidate (unbalanced-content)",
 				}),
 			),
 			autoFormat: Type.Optional(
@@ -687,8 +690,8 @@ export default function ClojureForms(pi: ExtensionAPI) {
 For Clojure/EDN files (*.clj, *.cljs, *.cljc, *.edn) prefer the clj_tree/clj_get/clj_edit tools over raw text
 edits: clj_tree annotates the source with ⟦handles⟧ — the only edit targets (content-addressed, stable
 across edits elsewhere); clj_edit replaces, patches (oldText/newText), inserts, or deletes whole forms by
-handle, reindents submitted content to the target, repairs unbalanced content by indentation when
-unambiguous, and never writes a file that does not parse. A stale-handle refusal means the form changed —
+handle, reindents submitted content to the target, infers unbalanced brackets by indentation when
+repair is requested (unbalanced content is otherwise refused with the candidate), and never writes a file that does not parse. A stale-handle refusal means the form changed —
 re-run clj_tree. clj_draft recovers brackets from an indentation-only draft (candidate + diff, never
 writes). Shape reports in tool results are binding: a "BLOCKING: the file no longer parses" line, lost forms
 in the guard report, or D1–D3 nesting warnings must be fixed or explicitly justified in your next action.

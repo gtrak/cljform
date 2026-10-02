@@ -1,6 +1,6 @@
 //! Repair pipeline and `materialize`: fence stripping, blank-edge trimming,
-//! indent-mode bracket inference, clean failure when repair is impossible,
-//! and candidate-only materialization.
+//! indent-mode bracket inference (opt-in via `--repair`), clean failure when
+//! repair is impossible, and candidate-only materialization.
 
 mod common;
 
@@ -33,9 +33,137 @@ fn get_form(file: &str, name: &str) -> String {
 }
 
 #[test]
+fn repair_is_opt_in() {
+    // Unbalanced content is refused by default: exit 3, `unbalanced-content`,
+    // nothing written, the inferred candidate (and its diff) attached, with
+    // the --repair hint. `--repair` applies it.
+    let content = "(defn target [x]\n  (dec x";
+    let p = f("r13.clj");
+    let before = std::fs::read_to_string(&p).unwrap();
+    let (code, d) = edit_content(&p, &handle_of(&p, "target"), content);
+    assert_eq!(code, 3, "{d}");
+    assert_eq!(d["error"]["code"], "unbalanced-content");
+    // The refusal carries the repaired candidate and its diff.
+    let msg = d["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("candidate:"), "{d}");
+    assert!(msg.contains("(dec x))"), "{d}");
+    assert!(msg.contains("+++ repaired"), "{d}");
+    assert!(d["error"]["hint"].as_str().unwrap().contains("--repair"), "{d}");
+    assert_eq!(std::fs::read_to_string(&p).unwrap(), before, "nothing written");
+
+    let (code, d) = edit_content_extra(&p, &handle_of(&p, "target"), content, &["--repair"]);
+    assert_eq!(code, 0, "{d}");
+    assert_eq!(d["result"]["repaired"], true);
+    assert_eq!(get_form(&p, "target").trim(), "(defn target [x]\n  (dec x))");
+}
+
+#[test]
+fn inference_independent_of_reindent() {
+    // Issue 12: the inference decision/outcome is identical with or without
+    // `--format-content` and at any target column. The same unbalanced
+    // content spliced at two different target columns (two fixtures) with
+    // and without the parinfer reindent lands byte-identical; and without
+    // `--repair` the refusal is identical in all four combinations.
+    let content = "(defn target [x]\n  (let [y 2]\n    (+ x y)";
+    let fixtures: [(&str, &[u8]); 2] = [
+        ("i2a.clj", b"(def aaaa (defn target [x]\n  x))\n"),
+        ("i2b.clj", b"(def a (defn target [x]\n  x))\n"),
+    ];
+    // Refusal: identical code and candidate in every combination.
+    for (name, bytes) in fixtures {
+        for no_format in [false, true] {
+            let p = fixture(name, bytes);
+            let h = handle_of(&p, "1.2");
+            let extra: Vec<&str> = if no_format { vec!["--no-format-content"] } else { vec![] };
+            let (code, d) = edit_content_extra(&p, &h, content, &extra);
+            assert_eq!(code, 3, "case {name} no_format={no_format}: {d}");
+            assert_eq!(d["error"]["code"], "unbalanced-content");
+            let msg = d["error"]["message"].as_str().unwrap();
+            assert!(
+                msg.contains("(defn target [x]\n  (let [y 2]\n    (+ x y))"),
+                "identical candidate: {d}"
+            );
+        }
+    }
+    // Application: byte-identical spliced form in every combination.
+    let mut spliced = Vec::new();
+    for (name, bytes) in fixtures {
+        for no_format in [false, true] {
+            let p = fixture(name, bytes);
+            let h = handle_of(&p, "1.2");
+            let mut extra = vec!["--repair"];
+            if no_format {
+                extra.push("--no-format-content");
+            }
+            let (code, d) = edit_content_extra(&p, &h, content, &extra);
+            assert_eq!(code, 0, "case {name} no_format={no_format}: {d}");
+            assert_eq!(d["result"]["repaired"], true);
+            // The spliced form's exact bytes: the file is the outer def
+            // (unchanged) around the replaced nested defn, so strip the
+            // known prefix and the final closing paren + newline.
+            let file = std::fs::read_to_string(&p).unwrap();
+            let prefix = if name == "i2a.clj" { "(def aaaa " } else { "(def a " };
+            assert!(file.starts_with(prefix), "{file:?}");
+            assert!(file.ends_with(")\n"), "{file:?}");
+            spliced.push(file[prefix.len()..file.len() - 2].to_string());
+        }
+    }
+    // Reindent on vs off must splice byte-identically at the same column
+    // (the reindent runs on the already-balanced prepared content and can
+    // never change the repair outcome), and each column must carry the same
+    // repaired form base-shifted to it.
+    let [a, b, c, d_] = spliced.as_slice() else { unreachable!() };
+    assert_eq!(b, a, "same column: reindent off must equal reindent on");
+    assert_eq!(d_, c, "same column: reindent off must equal reindent on");
+    let col_a = "(def aaaa (".len() - 1; // target column in fixture A
+    let col_b = "(def a (".len() - 1; // target column in fixture B
+    let repaired = "(defn target [x]\n  (let [y 2]\n    (+ x y)))";
+    let shifted = |col: usize, form: &str| {
+        form
+            .lines()
+            .enumerate()
+            .map(|(i, l)| {
+                if i == 0 {
+                    l.to_string()
+                } else {
+                    format!("{}{l}", " ".repeat(col))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert_eq!(a.as_str(), shifted(col_a, repaired), "fixture A: repaired form at its target column");
+    assert_eq!(c.as_str(), shifted(col_b, repaired), "fixture B: same repaired form at the other column");
+}
+
+#[test]
+fn strict_beats_repair() {
+    // `--repair --strict`: the repair is refused (exit 3, repair-refused,
+    // with the declined diff); --strict wins.
+    let p = f("r10.clj");
+    let before = std::fs::read_to_string(&p).unwrap();
+    let (code, d) = edit_content_extra(
+        &p,
+        &handle_of(&p, "target"),
+        "(defn target [x]\n  (* x 2)",
+        &["--strict", "--repair"],
+    );
+    assert_eq!(code, 3, "{d}");
+    assert_eq!(d["error"]["code"], "repair-refused");
+    // The refusal shows the repair it declined to apply.
+    assert!(d["error"]["message"].as_str().unwrap().contains("+++ repaired"), "{d}");
+    assert_eq!(std::fs::read_to_string(&p).unwrap(), before, "strict must not write");
+}
+
+#[test]
 fn missing_closers_inferred_from_indentation() {
     let p = f("r1.clj");
-    let (code, d) = edit_content(&p, &handle_of(&p, "target"), "(defn target [x]\n  (* x 2)");
+    let (code, d) = edit_content_extra(
+        &p,
+        &handle_of(&p, "target"),
+        "(defn target [x]\n  (* x 2)",
+        &["--repair"],
+    );
     assert_eq!(code, 0, "{d}");
     assert_eq!(d["result"]["repaired"], true);
     assert!(d["result"]["repairDiff"].as_str().unwrap().contains("(defn target [x]"));
@@ -128,10 +256,11 @@ fn empty_and_comment_only_content_rejected() {
 fn repair_handles_trailing_comment_lines() {
     // Closers must land before a trailing comment, not inside it.
     let p = f("r7.clj");
-    let (code, d) = edit_content(
+    let (code, d) = edit_content_extra(
         &p,
         &handle_of(&p, "target"),
         "(defn target [x]\n  (* x 3) ; multiply\n",
+        &["--repair"],
     );
     assert_eq!(code, 0, "{d}");
     // The comment lives outside the form node (gap bytes); check the file.
@@ -147,10 +276,11 @@ fn repair_handles_trailing_comment_lines() {
 #[test]
 fn repair_multiple_missing_closers_across_levels() {
     let p = f("r8.clj");
-    let (code, d) = edit_content(
+    let (code, d) = edit_content_extra(
         &p,
         &handle_of(&p, "target"),
         "(defn target [x]\n  (let [y 2]\n    (+ x y)",
+        &["--repair"],
     );
     assert_eq!(code, 0, "{d}");
     assert_eq!(d["result"]["repaired"], true);
@@ -167,10 +297,11 @@ fn repair_keeps_bare_body_inside_inner_form() {
     // body escaped it. A bare atom body makes the wrong nesting unambiguous
     // (balance-only assertions passed the buggy output).
     let p = f("r9.clj");
-    let (code, d) = edit_content(
+    let (code, d) = edit_content_extra(
         &p,
         &handle_of(&p, "target"),
         "(defn target [x]\n  (let [y 2]\n    y",
+        &["--repair"],
     );
     assert_eq!(code, 0, "{d}");
     assert_eq!(d["result"]["repaired"], true);
@@ -183,14 +314,16 @@ fn repair_keeps_bare_body_inside_inner_form() {
 #[test]
 fn mid_file_dedent_repair_requires_opt_in() {
     // Closing an inner form at a dedent is a guess from indentation alone.
-    // Default refuses it (with the candidate); --repair applies it.
+    // Default refuses all unbalanced content (with the candidate);
+    // --repair applies it.
     let content = "(defn target [x]\n  (let [y 2]\n    (+ x y)\n  (inc x)";
     let p = f("r12.clj");
     let before = std::fs::read_to_string(&p).unwrap();
     let (code, d) = edit_content(&p, &handle_of(&p, "target"), content);
     assert_eq!(code, 3, "{d}");
-    assert_eq!(d["error"]["code"], "dedent-repair");
-    assert!(d["error"]["message"].as_str().unwrap().contains("candidate:"));
+    assert_eq!(d["error"]["code"], "unbalanced-content");
+    assert!(d["error"]["message"].as_str().unwrap().contains("candidate:"), "{d}");
+    assert!(d["error"]["hint"].as_str().unwrap().contains("--repair"), "{d}");
     assert_eq!(std::fs::read_to_string(&p).unwrap(), before, "nothing written");
 
     let (code, d) = edit_content_extra(&p, &handle_of(&p, "target"), content, &["--repair"]);
@@ -203,8 +336,10 @@ fn mid_file_dedent_repair_requires_opt_in() {
 }
 
 #[test]
-fn strict_refuses_repair() {
-    let p = f("r10.clj");
+fn strict_without_repair_still_refuses_as_unbalanced() {
+    // `--strict` alone: inference is off (opt-in), so unbalanced content is
+    // the same unbalanced-content refusal as the plain default.
+    let p = f("r14.clj");
     let before = std::fs::read_to_string(&p).unwrap();
     let (code, d) = edit_content_extra(
         &p,
@@ -213,10 +348,8 @@ fn strict_refuses_repair() {
         &["--strict"],
     );
     assert_eq!(code, 3, "{d}");
-    assert_eq!(d["error"]["code"], "repair-refused");
-    // The refusal shows the repair it declined to apply.
-    assert!(d["error"]["message"].as_str().unwrap().contains("+++ repaired"), "{d}");
-    assert_eq!(std::fs::read_to_string(&p).unwrap(), before, "strict must not write");
+    assert_eq!(d["error"]["code"], "unbalanced-content");
+    assert_eq!(std::fs::read_to_string(&p).unwrap(), before, "nothing written");
 }
 
 // ─── materialize ────────────────────────────────────────────────────────────

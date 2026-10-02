@@ -1,10 +1,13 @@
 //! Content normalization and repair: turn whatever the caller produced into
-//! something that parses, when that is unambiguous.
+//! something that parses, when the caller opts in.
 //!
-//! Pipeline: strip markdown fences → trim blank edges → try as-is → try
-//! indent-mode repair → fail with a precise error. Repair is reported, never
-//! silent. Comments-only or empty content is rejected (almost always an
-//! interpolation accident), except for `delete`.
+//! Pipeline: strip markdown fences → trim blank edges → try as-is → unbalanced
+//! content is REFUSED by default (`Unbalanced`, carrying the inferred
+//! candidate + diff); `--repair` enables the indent-mode inference, and
+//! `--strict` beats it. Repair is reported, never silent, and inference
+//! runs on the content as submitted — never on a dedented or reindented
+//! variant (issue 12). Comments-only or empty content is rejected (almost
+//! always an interpolation accident), except for `delete`.
 
 use crate::materialize;
 use crate::parser::{self, ParseError};
@@ -32,13 +35,14 @@ pub enum PrepareError {
     /// Content came from an opening markdown fence that was never closed:
     /// almost certainly a truncated paste, so no repair is attempted.
     TruncatedFence,
-    /// `--strict`: content is unbalanced and would have been repaired;
-    /// refusal instead, carrying the repair diff that was not applied.
+    /// `--strict` beats `--repair`: content is unbalanced and the inference
+    /// would have repaired it; refusal instead, carrying the repair diff
+    /// that was not applied.
     RepairRefused { diff: String },
-    /// Repair would have to close an inner form at a mid-file dedent. That
-    /// placement is a guess from indentation alone, so it is refused unless
-    /// the caller explicitly opts in (`--repair`).
-    DedentRepairRefused { candidate: String, diff: String },
+    /// Default (inference off): content is unbalanced. Carries the inferred
+    /// candidate and its diff so the caller can review it or apply it with
+    /// `--repair`.
+    Unbalanced { candidate: String, diff: String },
 }
 
 impl PrepareError {
@@ -57,15 +61,14 @@ impl PrepareError {
                 "content structure is ambiguous for bracket repair — line {} col {}: {}",
                 e.line, e.col, e.message
             ),
-            PrepareError::RepairRefused { .. } => "--strict: submitted content is unbalanced and would \
-                 have been repaired by indentation — refused instead"
+            PrepareError::RepairRefused { .. } => "--strict beats --repair: submitted content is \
+                 unbalanced and would have been repaired by indentation — refused instead"
                 .to_string(),
             PrepareError::TruncatedFence => "content starts with a markdown fence that is never \
                  closed — the paste looks truncated, so it was not repaired"
                 .to_string(),
-            PrepareError::DedentRepairRefused { .. } => "content is unbalanced and can only be \
-                 completed by closing an inner form at a dedent — that placement is a guess, so \
-                 it was refused"
+            PrepareError::Unbalanced { .. } => "content is unbalanced and bracket inference is \
+                 off by default — the inferred candidate is attached; pass --repair to apply it"
                 .to_string(),
         }
     }
@@ -77,7 +80,7 @@ impl PrepareError {
             PrepareError::Empty
             | PrepareError::TruncatedFence
             | PrepareError::RepairRefused { .. }
-            | PrepareError::DedentRepairRefused { .. } => None,
+            | PrepareError::Unbalanced { .. } => None,
         }
     }
 }
@@ -97,11 +100,19 @@ pub fn normalize_draft(raw: &str) -> (String, Vec<String>, bool) {
 }
 
 /// Normalize raw content into spliceable, parseable bytes.
+///
+/// Inference is opt-in (issue 12): balanced content passes through. On
+/// unbalanced content the indent-mode inference runs on the content AS
+/// SUBMITTED (fences stripped, edges trimmed — never a dedented or
+/// reindented variant): with `repair` the candidate is applied (forced
+/// trailing closers and mid-file dedent closures alike); `strict` +
+/// `repair` refuses (`RepairRefused`, strict wins); without `repair` the
+/// candidate + diff are attached to an `Unbalanced` refusal.
 pub fn prepare(
     raw: &str,
     allow_empty: bool,
     strict: bool,
-    allow_dedent: bool,
+    repair: bool,
 ) -> Result<Prepared, PrepareError> {
     // 1. Strip fences and trim edges.
     let (text, mut notes, truncated_fence) = normalize_draft(raw);
@@ -130,34 +141,35 @@ pub fn prepare(
         return Err(PrepareError::TruncatedFence);
     }
 
-    // 3. Unbalanced: indent-mode repair. Forced completion (appending missing
-    //    trailing closers) is applied; closing an inner form at a mid-file
-    //    dedent is a guess from indentation alone, so it needs explicit opt-in
-    //    (`--repair`). `--strict` refuses any repair.
+    // 3. Unbalanced: the inference decision runs on the content as
+    //    submitted — the base-shift dedent and the parinfer reindent are
+    //    applied by the caller AFTER this decision and never fed back into
+    //    it (issue 12). `strict` + `repair` refuses (strict wins); with
+    //    `repair` the candidate is applied; without it the refusal carries
+    //    the candidate + diff it would have applied.
     match materialize::indent_mode_full(&text) {
         Err(e) => Err(PrepareError::Materialize(e)),
-        Ok(r) if r.text == text => Err(PrepareError::Unparseable(
+        Ok(cand) if cand == text => Err(PrepareError::Unparseable(
             parser::parse(text.as_bytes()).expect_err("parse failed above"),
         )),
-        Ok(r) => {
-            let diff = materialize::unified_diff(&text, &r.text, "submitted", "repaired");
-            if strict {
+        Ok(cand) => {
+            let diff = materialize::unified_diff(&text, &cand, "submitted", "repaired");
+            if strict && repair {
                 return Err(PrepareError::RepairRefused { diff });
             }
-            if r.dedent_closures && !allow_dedent {
-                return Err(PrepareError::DedentRepairRefused {
-                    candidate: r.text,
-                    diff,
-                });
+            // The candidate is only attachable/appliable when it actually
+            // parses; otherwise surface the direct parse error (more
+            // precise).
+            let parsed = parser::parse(cand.as_bytes()).map_err(|_| {
+                PrepareError::Unparseable(
+                    parser::parse(text.as_bytes()).expect_err("parse failed above"),
+                )
+            })?;
+            if !repair {
+                return Err(PrepareError::Unbalanced { candidate: cand, diff });
             }
             notes.push("content unbalanced; brackets repaired by indentation".to_string());
-            match parser::parse(r.text.as_bytes()) {
-                Ok(parsed) => finish(&r.text, parsed.forms.len(), true, diff, notes),
-                // Repair didn't take: surface the direct parse error (more precise).
-                Err(_) => Err(PrepareError::Unparseable(
-                    parser::parse(text.as_bytes()).expect_err("parse failed above"),
-                )),
-            }
+            finish(&cand, parsed.forms.len(), true, diff, notes)
         }
     }
 }

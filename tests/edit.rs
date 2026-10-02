@@ -455,9 +455,9 @@ fn edit_format_content_reindents() {
 
 #[test]
 fn edit_format_content_skips_unbalanced() {
-    // Unbalanced content: prepare's bracket repair runs first, then the
-    // parindent of the REPAIRED candidate — no format-error, the edit
-    // still succeeds and lands base-shifted.
+    // Unbalanced content: with `--repair`, prepare's bracket inference runs
+    // first, then the parindent of the REPAIRED candidate — no format-error,
+    // the edit still succeeds and lands base-shifted.
     let f = fixture("fmt-unbalanced.clj", b"(def x {:a 1})\n");
     let h = handle_at_path(&f, "1.2");
     let (code, d, stderr) = run_json(
@@ -468,6 +468,7 @@ fn edit_format_content_skips_unbalanced() {
             &h,
             "--content",
             "(defn f [a]\n  (inc a",
+            "--repair",
             "--json",
         ],
         None,

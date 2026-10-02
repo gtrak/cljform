@@ -20,24 +20,15 @@ struct OpenParen {
     col: usize,
 }
 
-/// Result of indent-mode inference.
-pub struct IndentResult {
-    pub text: String,
-    /// True when a closer was inserted anywhere other than the final EOF
-    /// pass — i.e. an inner form was closed because a later line dedented
-    /// past it. That placement is inferred from indentation alone and can be
-    /// wrong, so callers may want to require explicit opt-in.
-    pub dedent_closures: bool,
+/// Infer brackets from indentation. Returns the candidate text. The
+/// `edit` repair path calls this same inference; the `materialize` op
+/// wraps it with its candidate/diff envelope.
+pub fn indent_mode_full(draft: &str) -> Result<String, MaterializeError> {
+    indent_mode(draft)
 }
 
 /// Infer brackets from indentation. Returns the candidate text.
 pub fn indent_mode(draft: &str) -> Result<String, MaterializeError> {
-    indent_mode_full(draft).map(|r| r.text)
-}
-
-/// Infer brackets from indentation, reporting whether any closer was placed
-/// by a mid-file dedent (as opposed to the forced EOF completion).
-pub fn indent_mode_full(draft: &str) -> Result<IndentResult, MaterializeError> {
     let mut lines: Vec<String> = draft.split('\n').map(str::to_string).collect();
     let trailing_newline = draft.ends_with('\n');
     if trailing_newline {
@@ -45,7 +36,6 @@ pub fn indent_mode_full(draft: &str) -> Result<IndentResult, MaterializeError> {
     }
 
     let mut stack: Vec<OpenParen> = Vec::new();
-    let mut dedent_closures = false;
 
     for li in 0..lines.len() {
         let trimmed = lines[li].trim_start();
@@ -67,7 +57,6 @@ pub fn indent_mode_full(draft: &str) -> Result<IndentResult, MaterializeError> {
             }
         }
         if !to_close.is_empty() {
-            dedent_closures = true;
             if let Some(prev) = last_content_line(&lines, li) {
                 insert_closers(&mut lines, prev, &to_close);
             }
@@ -163,10 +152,7 @@ pub fn indent_mode_full(draft: &str) -> Result<IndentResult, MaterializeError> {
     if trailing_newline {
         out.push('\n');
     }
-    Ok(IndentResult {
-        text: out,
-        dedent_closures,
-    })
+    Ok(out)
 }
 
 /// Index of the last content (non-blank, non-comment-only) line before `end`.

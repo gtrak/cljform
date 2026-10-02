@@ -114,12 +114,14 @@ enum Op {
         /// Validate only; write nothing.
         #[arg(long)]
         dry_run: bool,
-        /// Hard-fail on detector warnings and refuse content repairs.
+        /// Hard-fail on detector warnings; together with `--repair`, refuse
+        /// the content repair (`repair-refused` — `--strict` wins).
         #[arg(long)]
         strict: bool,
-        /// Allow repair to close an inner form at a mid-file dedent. That
-        /// placement is inferred from indentation alone; by default only
-        /// missing trailing closers are completed.
+        /// Enable bracket inference from indentation (issue 12): missing
+        /// trailing closers and a mid-file dedent closure (guessed
+        /// placement). By default unbalanced content is refused
+        /// (`unbalanced-content`, exit 3) with the inferred candidate.
         #[arg(long)]
         repair: bool,
         /// Reindent submitted content in parinfer paren mode before the
@@ -127,8 +129,9 @@ enum Op {
         /// reformatted). On by default; explicit opt-in accepted.
         #[arg(long, action = clap::ArgAction::SetTrue, conflicts_with = "no_format_content")]
         format_content: bool,
-        /// Disable the content reindent: content is still normalized,
-        /// repaired, and base-shifted, but never parinfer-reindented.
+        /// Disable the content reindent: content is still normalized and
+        /// base-shifted (bracket inference still requires `--repair`), but
+        /// never parinfer-reindented.
         #[arg(long, action = clap::ArgAction::SetTrue, conflicts_with = "format_content")]
         no_format_content: bool,
     },
@@ -1134,10 +1137,26 @@ fn prepare_fail(p: content::PrepareError) -> Fail {
                 line: None,
                 col: None,
                 message: format!(
-                    "--strict: submitted content is unbalanced; refusing rather than repairing it by indentation\n{diff}"
+                    "--strict beats --repair: submitted content is unbalanced and would have been repaired by indentation — refusing rather than applying it\n{diff}"
                 ),
                 hint: Some(
-                    "submit balanced content, or drop --strict to allow the reported, verified repair"
+                    "submit balanced content, or drop --strict to let --repair apply the reported, verified repair"
+                        .into(),
+                ),
+                suggestions: None,
+            },
+        ),
+        content::PrepareError::Unbalanced { candidate, diff } => Fail(
+            3,
+            ErrorBody {
+                code: "unbalanced-content",
+                line: None,
+                col: None,
+                message: format!(
+                    "content is unbalanced and bracket inference is off (opt-in)\n{diff}\ncandidate:\n{candidate}"
+                ),
+                hint: Some(
+                    "pass --repair to apply the inferred brackets, or submit balanced content (clj_draft can help)"
                         .into(),
                 ),
                 suggestions: None,
@@ -1157,22 +1176,6 @@ fn prepare_fail(p: content::PrepareError) -> Fail {
                 suggestions: None,
             },
         ),
-        content::PrepareError::DedentRepairRefused { candidate, diff } => Fail(
-            3,
-            ErrorBody {
-                code: "dedent-repair",
-                line: None,
-                col: None,
-                message: format!(
-                    "content can only be balanced by closing an inner form at a dedent — that placement is a guess, so it was refused\n{diff}\ncandidate:\n{candidate}"
-                ),
-                hint: Some(
-                    "submit balanced content, run clj_draft, or pass --repair to apply the guessed repair"
-                        .into(),
-                ),
-                suggestions: None,
-            },
-        ),
         other => Fail(
             1,
             ErrorBody {
@@ -1181,7 +1184,7 @@ fn prepare_fail(p: content::PrepareError) -> Fail {
                 col: other.line_col().map(|(_, c)| c),
                 message: other.message(),
                 hint: Some(
-                    "repair happens automatically when the fix is unambiguous; this content needs a human eye"
+                    "submit balanced content, or run clj_draft to see the inferred candidate; this content needs a human eye"
                         .into(),
                 ),
                 suggestions: None,
@@ -1374,9 +1377,10 @@ fn run_edit(
             // splice itself introduces a line break — a nested
             // insert-after, or a nested insert-before whose anchor starts
             // its line — the final lines must carry the target column end
-            // to end (reindent_block). The base-shift dedent stage runs
-            // before prepare, which trims blank edges and would mask the
-            // caller's indentation; the prefix stage runs after the
+            // to end (reindent_block). The base-shift dedent is computed
+            // from the submitted content and applied AFTER the inference
+            // has decided (issue 12 — inference must not depend on the
+            // dedent or the target column); the prefix stage runs after the
             // parinfer reindent so it owns the final columns. A top-level
             // target takes the seam, so v1 behavior is unchanged there.
             #[derive(Clone, Copy)]
@@ -1420,16 +1424,19 @@ fn run_edit(
                 }
                 None => (0, BaseShift::None),
             };
-            // 1. Normalize + repair. The base-shift dedent runs on the raw
-            // text: prepare's blank-edge trim swallows line 0's pad and
-            // leading newlines, so the dedent stage must run first.
-            let prepared_in = if matches!(base_shift, BaseShift::None) {
-                stripped.clone()
-            } else {
-                reindent_dedent(&stripped)
-            };
+            // 1. Normalize + repair on the content AS SUBMITTED (view
+            //    markers stripped only): the inference decision/outcome is
+            //    identical with or without the base-shift dedent and the
+            //    parinfer reindent, and at any target column (issue 12).
+            //    The base-shift dedent is computed from the submitted
+            //    content and applied after inference has decided — never
+            //    fed back into it.
             let mut prepared =
-                content::prepare(&prepared_in, false, strict, repair).map_err(prepare_fail)?;
+                content::prepare(&stripped, false, strict, repair).map_err(prepare_fail)?;
+            if !matches!(base_shift, BaseShift::None) {
+                let t = String::from_utf8_lossy(&prepared.bytes).into_owned();
+                prepared.bytes = reindent_dedent_by(&stripped, &t).into_bytes();
+            }
 
             // 2. Parinfer paren-mode reindent of the prepared content
             // (default on; `--no-format-content` disables it). The same
@@ -1849,65 +1856,88 @@ fn reindent_to_column(content: &str, target_col: usize) -> (String, bool) {
 /// prefixed with `target_col` spaces after the same common-whitespace
 /// dedent as `reindent_to_column`, whose line-0 continuation is only right
 /// while no line break is inserted.
-/// NOTE: on the `--handle` path the dedent stage runs BEFORE
-/// `content::prepare` (its blank-edge trim would remove line 0's pad) and
-/// this prefix stage runs AFTER prepare (and after the parinfer reindent):
-/// insert-after gets the leading newline prepended, insert-before rides
-/// line 0 on the anchor's existing line prefix and gets only the trailing
-/// newline + pad appended, so the final lines equal this result.
+/// NOTE: on the `--handle` path the dedent is applied AFTER
+/// `content::prepare` (inference must not depend on the dedent — issue
+/// 12) and this prefix stage runs AFTER prepare (and after the parinfer
+/// reindent): insert-after gets the leading newline prepended,
+/// insert-before rides line 0 on the anchor's existing line prefix and
+/// gets only the trailing newline + pad appended, so the final lines
+/// equal this result (the internal dedent is a no-op on already-dedented
+/// content).
 fn reindent_block(content: &str, target_col: usize) -> (String, bool) {
     let out = reindent_prefix(&reindent_dedent(content), target_col, true);
     let changed = out != content;
     (out, changed)
 }
 
-/// Base-shift dedent stage: strip the common leading whitespace across
-/// non-blank lines (line 0 included). Whitespace-only and deterministic;
-/// both a caller-indented and a flat block normalize to the same result.
-/// Runs on the raw submitted text, before `content::prepare`, whose
-/// blank-edge trim would swallow line 0's pad and mask the caller's
-/// common indent.
+/// Base-shift dedent applied to `content` itself: strip the common
+/// leading whitespace across non-blank lines (line 0 included).
 fn reindent_dedent(content: &str) -> String {
-    let mut lines: Vec<&str> = content.split('\n').collect();
+    reindent_dedent_by(content, content)
+}
+
+/// Base-shift dedent applied AFTER inference (issue 12): the common
+/// leading whitespace is computed from the submitted content and shed from
+/// each prepared line. Line 0 may already have lost its pad to prepare's
+/// edge trim (and the repair never adds leading whitespace), and blank
+/// lines shorter than the common indent are kept verbatim — so each line
+/// sheds at most what it still carries. Whitespace-only and deterministic;
+/// both a caller-indented and a flat block normalize to the same result.
+fn reindent_dedent_by(submitted: &str, prepared: &str) -> String {
+    let common = common_indent(submitted);
+    if common.is_empty() {
+        return prepared.to_string();
+    }
+    let mut lines: Vec<&str> = prepared.split('\n').collect();
     // A trailing newline does not create a phantom final line.
     let trailing_nl = lines.last().copied().unwrap_or("").is_empty();
     if trailing_nl {
         lines.pop();
     }
-    let out = if lines.is_empty() || lines.iter().all(|l| is_blank_line(l)) {
-        content.to_string()
-    } else {
-        // Common leading whitespace across non-blank lines.
-        let mut common: Option<String> = None;
-        for l in &lines {
-            if is_blank_line(l) {
-                continue;
-            }
-            let indent: String = l.bytes().take_while(|&b| b == b' ' || b == b'\t').map(char::from).collect();
-            common = Some(match common {
-                None => indent,
-                Some(c) => {
-                    let n = c.bytes().zip(indent.bytes()).take_while(|(a, b)| a == b).count();
-                    c[..n].to_string()
-                }
-            });
-        }
-        let common = common.unwrap_or_default();
-        let mut out_lines = Vec::with_capacity(lines.len());
-        for l in &lines {
-            out_lines.push(if l.len() >= common.len() {
+    let out_lines: Vec<String> = lines
+        .iter()
+        .map(|l| {
+            let ws = l.bytes().take_while(|&b| b == b' ' || b == b'\t').count();
+            if ws >= common.len() {
                 l[common.len()..].to_string()
             } else {
                 l.to_string()
-            });
-        }
-        let mut out = out_lines.join("\n");
-        if trailing_nl {
-            out.push('\n');
-        }
-        out
-    };
+            }
+        })
+        .collect();
+    let mut out = out_lines.join("\n");
+    if trailing_nl {
+        out.push('\n');
+    }
     out
+}
+
+/// The common leading whitespace across the non-blank lines of `content`
+/// (a trailing newline does not create a phantom final line).
+fn common_indent(content: &str) -> String {
+    let mut lines: Vec<&str> = content.split('\n').collect();
+    let trailing_nl = lines.last().copied().unwrap_or("").is_empty();
+    if trailing_nl {
+        lines.pop();
+    }
+    if lines.is_empty() || lines.iter().all(|l| is_blank_line(l)) {
+        return String::new();
+    }
+    let mut common: Option<String> = None;
+    for l in &lines {
+        if is_blank_line(l) {
+            continue;
+        }
+        let indent: String = l.bytes().take_while(|&b| b == b' ' || b == b'\t').map(char::from).collect();
+        common = Some(match common {
+            None => indent,
+            Some(c) => {
+                let n = c.bytes().zip(indent.bytes()).take_while(|(a, b)| a == b).count();
+                c[..n].to_string()
+            }
+        });
+    }
+    common.unwrap_or_default()
 }
 
 /// Base-shift prefix stage: prefix every line — or every line after line 0,

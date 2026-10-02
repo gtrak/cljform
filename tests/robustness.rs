@@ -269,16 +269,21 @@ fn truncated_edits_fail_cleanly() {
     ];
     for (i, content) in cases.iter().enumerate() {
         let good = fixture(&format!("good-{i}.clj"), b"(ns t)\n\n(def a 1)\n");
-        // Re-fetch per case: a successful repair rewrites the form's bytes
-        // (and thus its handle).
+        // Re-fetch per case: keeps the handle fresh in case a case is ever
+        // allowed to write (with the default opt-in inference none is).
         let h = handle_of(&good, "a");
         let (code, d, _) = run_json(
             &["edit", &good, "--handle", &h, "--content", content, "--json"],
             None,
         );
-        // Either the repair succeeds (ok) or a clean structured error; never panic.
-        assert!(code == 0 || code == 1, "case {i:?} exit {code}");
-        if code == 1 {
+        // Unbalanced content is refused by default (exit 3,
+        // unbalanced-content); unrepairable content is a parse error
+        // (exit 1); never panic.
+        assert!(
+            code == 0 || code == 1 || code == 3,
+            "case {i:?} exit {code}"
+        );
+        if code != 0 {
             assert_eq!(d["ok"], false, "case {i:?}");
             // File must remain untouched on failure.
             assert_eq!(std::fs::read(&good).unwrap(), b"(ns t)\n\n(def a 1)\n");
