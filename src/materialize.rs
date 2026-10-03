@@ -3,7 +3,10 @@
 //!
 //! Rules: a line that dedents below an open bracket's column closes that
 //! bracket at the end of the previous content line (inserted before any
-//! trailing comment); EOF closes everything still open. Strings, regex
+//! trailing comment); EOF closes everything still open. A line whose first
+//! code byte is a closer at or inside the innermost open bracket's column
+//! is that form's own closer — it stays on its line instead of being
+//! synthetically re-closed by the dedent. Strings, regex
 //! literals, char literals and comments never participate — including across
 //! line boundaries: a multi-line string stays open from its opening quote to
 //! its closing quote on a later line, and its interior bytes (any `)`, `(`,
@@ -141,13 +144,42 @@ pub fn indent_mode(draft: &str) -> Result<String, MaterializeError> {
             let indent = line.len() - trimmed.len();
 
             // Dedent: close every open bracket whose column >= this indent,
-            // appending closers to the previous content line.
+            // appending closers to the previous content line. Exception:
+            // when this line's first code byte is a closer at or inside the
+            // innermost open bracket's column, that closer IS the innermost
+            // form's closer. Pre-closing it here would leave the explicit
+            // closer unmatched, so the dedent stands down entirely — the
+            // scan below consumes exactly one bracket for the closer, and
+            // any outer forms close at a later dedent or at EOF.
+            let closer_is_the_match = {
+                let bytes = line.as_bytes();
+                let mut i = 0usize;
+                let mut s = Lx::Code; // `lex` is Code in this branch
+                // First non-space unit: the line's first code byte (the line
+                // is known non-blank and not comment-only above).
+                let mut hit = None;
+                while let Some((idx, ctx)) = lex_step(bytes, &mut i, &mut s) {
+                    let b = bytes[idx];
+                    if ctx != Lx::Code || (b != b' ' && b != b'\t') {
+                        hit = Some((idx, ctx));
+                        break;
+                    }
+                }
+                matches!(
+                    hit,
+                    Some((idx, Lx::Code))
+                        if matches!(bytes[idx], b')' | b']' | b'}')
+                            && stack.last().is_some_and(|open| idx <= open.col)
+                )
+            };
             let mut to_close = Vec::new();
-            while let Some(open) = stack.last() {
-                if open.col >= indent {
-                    to_close.push(stack.pop().expect("just peeked"));
-                } else {
-                    break;
+            if !closer_is_the_match {
+                while let Some(open) = stack.last() {
+                    if open.col >= indent {
+                        to_close.push(stack.pop().expect("just peeked"));
+                    } else {
+                        break;
+                    }
                 }
             }
             if !to_close.is_empty() {

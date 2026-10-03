@@ -466,6 +466,116 @@ fn materialize_still_refuses_genuinely_unbalanced_content() {
     );
 }
 
+/// Issue 24 (M1): a closer on its own line at or inside the opener's column
+/// is the form's own closer, not a dedent trigger. These drafts are balanced
+/// (`check` accepts each as 1 form), so materialize must pass them through
+/// unchanged — the old code pre-closed the paren via the dedent rule and
+/// refused the real `)` as unmatched.
+#[test]
+fn materialize_closer_on_own_line_at_opener_col() {
+    let cases: [&str; 6] = [
+        // the minimal repro: closer at col 0, opener at col 0
+        "(a\n  b\n)\n",
+        // closer at EXACTLY the opener's column, with the opener off col 0
+        "(o\n  (a\n    b\n  )\n)\n",
+        // closer indented less than the body but more than the opener —
+        // never an exemption (the closer is deeper than the innermost
+        // opener); plain match, unchanged
+        "(a\n    b\n  )\n",
+        // two closers on the closer line: both stay on the line
+        "(a\n  (b\n))\n",
+        "(a\n  (b\n) )\n",
+        // trailing comment after the closer
+        "(a\n  b\n) ; done\n",
+    ];
+    for draft in cases {
+        let (_code, d, _) = run_json(&["materialize", "--json"], Some(draft.as_bytes()));
+        assert_eq!(d["ok"], true, "case {draft:?}: {d}");
+        assert_eq!(
+            d["result"]["candidate"].as_str().unwrap(),
+            draft.trim_end_matches('\n'),
+            "balanced content passes through: {draft:?}"
+        );
+        assert_eq!(
+            d["result"]["diff"].as_str().unwrap(),
+            "--- draft\n+++ candidate\n",
+            "unchanged content has an empty diff: {draft:?}"
+        );
+    }
+}
+
+/// The M1 exemption must not swallow genuinely unbalanced input: extra
+/// closers are still refused, diagnosed at their TRUE position (the first
+/// closer on the line is now legitimately consumed, so an extra one is
+/// reported where it actually sits).
+#[test]
+fn materialize_closer_line_extra_closer_still_refused() {
+    // Extra `)` after the form's own closer, same line: line 3, col 3.
+    let (_code, d, _) = run_json(
+        &["materialize", "--json"],
+        Some(b"(a\n  b\n) )\n"),
+    );
+    assert_eq!(d["ok"], false, "{d}");
+    assert_eq!(d["error"]["code"], "materialize-error");
+    assert_eq!(d["error"]["line"], 3, "{d}");
+    assert_eq!(d["error"]["col"], 3, "{d}");
+    assert!(
+        d["error"]["message"].as_str().unwrap().contains("unmatched ')"),
+        "{d}"
+    );
+
+    // Extra `)` on a later line: line 4, col 1.
+    let (_code, d, _) = run_json(&["materialize", "--json"], Some(b"(a\n  b\n)\n)\n"));
+    assert_eq!(d["ok"], false, "{d}");
+    assert_eq!(d["error"]["line"], 4, "{d}");
+    assert_eq!(d["error"]["col"], 1, "{d}");
+    assert!(
+        d["error"]["message"].as_str().unwrap().contains("unmatched ')"),
+        "{d}"
+    );
+
+    // Missing closer is still inferred (EOF close), unaffected by the fix.
+    let (_code, d, _) = run_json(&["materialize", "--json"], Some(b"(a\n  b\n"));
+    assert_eq!(d["ok"], true, "{d}");
+    assert_eq!(d["result"]["candidate"], "(a\n  b)");
+
+    // A mismatched closer type on the closer line is diagnosed as a
+    // mismatch, at the closer's true position.
+    let (_code, d, _) = run_json(&["materialize", "--json"], Some(b"(a\n  [b\n)\n"));
+    assert_eq!(d["ok"], false, "{d}");
+    assert_eq!(d["error"]["line"], 3, "{d}");
+    assert!(
+        d["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("mismatched close: found ')' but '['"),
+        "{d}"
+    );
+}
+
+/// Issue 24 (M1) context guard: a closer-shaped byte that is INSIDE a
+/// multi-line string is not a code closer — no exemption, no dedent, the
+/// string stays open and the draft (balanced) passes through unchanged.
+#[test]
+fn materialize_closer_line_inside_string_is_not_code() {
+    let cases: [&str; 2] = [
+        // ")" on its own line, inside the string (col 0)
+        "(def a \"x\n)\ny\")\n",
+        // an escaped quote keeps the string open to the next line, so the
+        // closer-shaped byte on line 2 is still string interior
+        "(def a \"x \\\"\n) y\")\n",
+    ];
+    for draft in cases {
+        let (_code, d, _) = run_json(&["materialize", "--json"], Some(draft.as_bytes()));
+        assert_eq!(d["ok"], true, "case {draft:?}: {d}");
+        assert_eq!(
+            d["result"]["candidate"].as_str().unwrap(),
+            draft.trim_end_matches('\n'),
+            "balanced content passes through: {draft:?}"
+        );
+    }
+}
+
 #[test]
 fn human_materialize_shows_candidate() {
     let out = Command::new(env!("CARGO_BIN_EXE_cljform"))
