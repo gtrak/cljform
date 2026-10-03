@@ -42,12 +42,29 @@ pub enum AnnotateError {
 /// One collection node, in document order.
 #[derive(Debug, Clone, Serialize)]
 pub struct Node {
-    /// "2", "2.1", "2.1.3" — the structural position. Internal only: it is
-    /// the duplicate-folding input and the post-edit lookup key, but it is
-    /// never serialized — a path is not addressable (there is no `--path`
-    /// /`--addr`), so it must not appear in human/agent/JSON output.
+    /// Index of the nearest collection ancestor in the node table (None
+    /// for top-level forms). Internal only. Replaces the old per-node
+    /// positional `path` string, which was O(depth^2) bytes on deep files
+    /// (issue 22): the path string is now derived on demand from this
+    /// chain — the duplicate-folding input and the post-edit lookup key
+    /// — and it is never serialized (a path is not addressable: there is
+    /// no `--path`/`--addr`, so it must not appear in output).
     #[serde(skip)]
-    pub path: String,
+    pub parent: Option<usize>,
+    /// Position among the parent's NAMED children (for top-level forms:
+    /// the 1-based top-level form index, matching `parser::Form.addr`).
+    #[serde(skip)]
+    pub child_idx: u32,
+    /// This node's top-level form index (its own if depth 1, else
+    /// inherited from the top-level ancestor) — the splice-window key.
+    #[serde(skip)]
+    pub top_level: u32,
+    /// The full position chain (top-level form index first, this node's
+    /// component last). Empty in the collected table (a table of full
+    /// chains would be O(depth^2) again); filled only on the handle-
+    /// resolved edit target (see [`chain_of`]).
+    #[serde(skip)]
+    pub path_chain: Vec<u32>,
     /// list_lit | vec_lit | map_lit | set_lit | anon_fn_lit | …
     pub kind: String,
     /// Leading sym for list forms, else None.
@@ -199,8 +216,9 @@ fn collect_inner(bytes: &[u8]) -> Vec<Node> {
         record_subtree(
             child,
             bytes,
-            &form_idx.to_string(),
-            1,
+            None,
+            form_idx,
+            form_idx,
             name,
             &mut nodes,
         );
@@ -211,8 +229,9 @@ fn collect_inner(bytes: &[u8]) -> Vec<Node> {
 fn record_subtree(
     node: TsNode,
     bytes: &[u8],
-    path: &str,
-    depth: usize,
+    parent: Option<usize>,
+    child_idx: u32,
+    top_level: u32,
     name: Option<String>,
     nodes: &mut Vec<Node>,
 ) {
@@ -223,8 +242,12 @@ fn record_subtree(
     } else {
         None
     };
+    let idx = nodes.len();
     nodes.push(Node {
-        path: path.to_string(),
+        parent,
+        child_idx,
+        top_level,
+        path_chain: Vec::new(), // filled only on a resolved edit target
         kind: node.kind().to_string(),
         head: head.clone(),
         name,
@@ -236,7 +259,7 @@ fn record_subtree(
         raw: String::new(),    // assigned by `assign_hashes`
         start_byte: node.start_byte(),
         end_byte: node.end_byte(),
-        depth,
+        depth: parent.map_or(1, |p| nodes[p].depth + 1),
     });
     let mut cursor = node.walk();
     for (i, child) in node.named_children(&mut cursor).enumerate() {
@@ -245,9 +268,69 @@ fn record_subtree(
             continue;
         }
         if COLLECTION_KINDS.contains(&child.kind()) {
-            record_subtree(child, bytes, &format!("{path}.{i}"), depth + 1, None, nodes);
+            record_subtree(
+                child,
+                bytes,
+                Some(idx),
+                i as u32,
+                top_level,
+                None,
+                nodes,
+            );
         }
     }
+}
+
+/// The structural position chain of node `i` (top-level form index first,
+/// `i`'s own component last): [1] -> [1], [3,1,1] -> "3.1.1". O(depth).
+pub fn chain_of(nodes: &[Node], i: usize) -> Vec<u32> {
+    let mut chain = Vec::new();
+    let mut cur = i;
+    loop {
+        chain.push(nodes[cur].child_idx);
+        match nodes[cur].parent {
+            Some(p) => cur = p,
+            None => break,
+        }
+    }
+    chain.reverse();
+    chain
+}
+
+/// The dotted positional path string ("1", "2.1", "2.1.3") for node `i`,
+/// built on demand. Only the rare consumers need the string form —
+/// duplicate-folding in `assign_hashes` and the tests; everything else
+/// compares parent chains (issue 22).
+pub fn path_of(nodes: &[Node], i: usize) -> String {
+    chain_of(nodes, i)
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// True if node `i` of `nodes` sits at the structural position named by
+/// `chain` (top-level form index first). Replaces the old full-path-string
+/// equality checks with a parent-chain walk of the CANDIDATE only —
+/// O(depth) per candidate, never a per-node allocation.
+pub fn at_chain(nodes: &[Node], i: usize, chain: &[u32]) -> bool {
+    if chain.is_empty() {
+        return false;
+    }
+    let mut cur = i;
+    for (k, component) in chain.iter().rev().enumerate() {
+        if nodes[cur].child_idx != *component {
+            return false;
+        }
+        if k + 1 == chain.len() {
+            return nodes[cur].parent.is_none();
+        }
+        match nodes[cur].parent {
+            Some(p) => cur = p,
+            None => return false,
+        }
+    }
+    false
 }
 
 /// Handle algorithm (SPEC §10.1):
@@ -272,16 +355,20 @@ fn assign_hashes(nodes: &mut [Node], bytes: &[u8]) {
     for c in &content {
         *counts.entry(c.as_str()).or_insert(0) += 1;
     }
-    for (node, ch) in nodes.iter_mut().zip(&content) {
-        node.raw = if counts.get(ch.as_str()) == Some(&1) {
-            ch.clone()
-        } else {
-            // Identical content elsewhere: fold the position path in so the
-            // copies stay distinguishable.
-            let mut h = blake3::Hasher::new();
-            h.update(node.path.as_bytes());
-            h.update(&bytes[node.start_byte..node.end_byte]);
-            h.finalize().to_hex().to_string()
+    for i in 0..nodes.len() {
+        // Identical content elsewhere: fold the (lazily built) position
+        // path in so the copies stay distinguishable.
+        let dup_path = (counts.get(content[i].as_str()) != Some(&1))
+            .then(|| path_of(nodes, i));
+        let node = &mut nodes[i];
+        node.raw = match dup_path {
+            Some(path) => {
+                let mut h = blake3::Hasher::new();
+                h.update(path.as_bytes());
+                h.update(&bytes[node.start_byte..node.end_byte]);
+                h.finalize().to_hex().to_string()
+            }
+            None => content[i].clone(),
         };
     }
     // Git-style shortest unique prefix: in a sorted list a string's closest
@@ -322,26 +409,24 @@ fn common_prefix_len(a: &str, b: &str) -> usize {
 /// spans >= 2 lines has all collection ancestors spanning >= 2 lines.
 fn heuristic_marks(nodes: &[Node]) -> Vec<bool> {
     let mut marked: Vec<bool> = Vec::with_capacity(nodes.len());
-    let mut stack: Vec<usize> = Vec::new(); // nearest collection ancestors, document order
-    for (i, node) in nodes.iter().enumerate() {
-        while let Some(&top) = stack.last() {
-            let p = &nodes[top].path;
-            let is_ancestor = node.path.len() > p.len()
-                && node.path.starts_with(p)
-                && node.path.as_bytes().get(p.len()) == Some(&b'.');
-            if is_ancestor {
-                break;
-            }
-            stack.pop();
-        }
+    for node in nodes {
+        // A nested collection is marked iff it spans >= 2 lines AND its
+        // nearest collection ancestor is marked. That ancestor is exactly
+        // the node's `parent` (the table holds only collection nodes, and
+        // a parent precedes its children in document order). A single-line
+        // form cannot contain a multi-line descendant, so the ancestor
+        // rule alone reproduces the "descend only into marked
+        // collections" descent.
         let is_marked = if node.depth == 1 {
             true
         } else {
             node.line[1] > node.line[0]
-                && (stack.is_empty() || marked[stack[stack.len() - 1]])
+                && match node.parent {
+                    Some(p) => marked[p],
+                    None => true,
+                }
         };
         marked.push(is_marked);
-        stack.push(i);
     }
     marked
 }
@@ -434,7 +519,7 @@ mod tests {
     fn paths_and_depths_follow_named_children() {
         let src = b"(ns x)\n\n(def f (fn [a] [b c]))\n";
         let nodes = collect(src);
-        let paths: Vec<&str> = nodes.iter().map(|n| n.path.as_str()).collect();
+        let paths: Vec<String> = (0..nodes.len()).map(|i| path_of(&nodes, i)).collect();
         // Named children of the def list: 0=`def`, 1=`f`, 2=(fn …).
         assert_eq!(paths, vec!["1", "2", "2.2", "2.2.1", "2.2.2"]);
         let depths: Vec<usize> = nodes.iter().map(|n| n.depth).collect();
@@ -443,6 +528,35 @@ mod tests {
         assert_eq!(nodes[1].name.as_deref(), Some("f"));
         assert_eq!(nodes[2].head.as_deref(), Some("fn"));
         assert!(nodes[2].name.is_none());
+    }
+
+    #[test]
+    fn duplicate_folding_and_chain_lookup_at_depth() {
+        // Issue 22 regression: the position-folded raw must be keyed on
+        // the same dotted path string as before, at any depth, and the
+        // post-edit same-position lookup must match by parent chain.
+        let src = b"(def a [1 1])\n(def b [1 1])\n(def c (f (g [1 1])))\n";
+        let nodes = collect(src);
+        // Nodes: 0=(def a ..) 1=[1 1] 2=(def b ..) 3=[1 1] 4=(def c ..)
+        // 5=(f ..) 6=(g ..) 7=[1 1]; the vectors' named-child indices are
+        // 2 (after the head + name syms), so paths 1.2, 2.2, 3.2.1.1.
+        assert_eq!(
+            [1, 3, 7]
+                .iter()
+                .map(|&i| path_of(&nodes, i))
+                .collect::<Vec<_>>(),
+            vec!["1.2", "2.2", "3.2.1.1"]
+        );
+        for i in [1, 3, 7] {
+            let mut h = blake3::Hasher::new();
+            h.update(path_of(&nodes, i).as_bytes());
+            h.update(&src[nodes[i].start_byte..nodes[i].end_byte]);
+            assert_eq!(nodes[i].raw, h.finalize().to_hex().to_string());
+        }
+        assert!(at_chain(&nodes, 7, &[3, 2, 1, 1]), "deepest node at 3.2.1.1");
+        assert!(!at_chain(&nodes, 5, &[3, 2, 1]), "wrong depth must not match");
+        assert!(!at_chain(&nodes, 7, &[1]), "top-level chain must not match a nested node");
+        assert!(!at_chain(&nodes, 1, &[]), "empty chain matches nothing");
     }
 
     #[test]

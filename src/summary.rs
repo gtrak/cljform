@@ -48,7 +48,13 @@ pub(crate) fn build_handle_summary(
 ) -> (serde_json::Value, Vec<String>) {
     let mut notes: Vec<String> = Vec::new();
     let new_nodes = handle::collect(new_bytes);
-    let at_path = new_nodes.iter().find(|n| n.path == node.path);
+    // Same-position lookup by parent chain (issue 22): the pre-edit
+    // target's chain was filled at resolution (resolve_at).
+    let at_path = new_nodes
+        .iter()
+        .enumerate()
+        .find(|(i, _)| handle::at_chain(&new_nodes, *i, &node.path_chain))
+        .map(|(_, n)| n);
     match mode {
         Mode::Replace | Mode::Patch => {
             // Head/name/kind/line describe what now sits at the target — the

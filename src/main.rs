@@ -685,7 +685,6 @@ fn levenshtein(a: &str, b: &str) -> usize {
 }
 
 struct Target {
-    addr: usize,
     form: Form,
 }
 
@@ -715,7 +714,6 @@ fn resolve_target(forms: &[Form], name: &str) -> Result<Target, Fail> {
         .collect();
     match matches.len() {
         1 => Ok(Target {
-            addr: matches[0].addr as usize,
             form: matches[0].clone(),
         }),
         0 => {
@@ -769,8 +767,11 @@ fn resolve_handle(bytes: &[u8], h: &str, file: &Path) -> Result<handle::Node, Fa
         ));
     }
     let nodes = handle::collect(bytes);
-    let hits: Vec<&handle::Node> =
-        nodes.iter().filter(|n| n.raw.starts_with(h)).collect();
+    let hits: Vec<usize> = nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, n)| n.raw.starts_with(h).then_some(i))
+        .collect();
     match hits.len() {
         0 => {
             // No assigned handle matches. A hand-computed pure content hash —
@@ -780,13 +781,15 @@ fn resolve_handle(bytes: &[u8], h: &str, file: &Path) -> Result<handle::Node, Fa
             // *content* hash: a form the user named by its content resolves to
             // the form(s) carrying that exact content. More than one such form
             // is ambiguous, never a lying "changed or is gone".
-            let content_hits: Vec<&handle::Node> = nodes
+            let content_hits: Vec<usize> = nodes
                 .iter()
-                .filter(|n| {
+                .enumerate()
+                .filter_map(|(i, n)| {
                     blake3::hash(&bytes[n.start_byte..n.end_byte])
                         .to_hex()
                         .to_string()
                         .starts_with(h)
+                        .then_some(i)
                 })
                 .collect();
             match content_hits.len() {
@@ -801,23 +804,45 @@ fn resolve_handle(bytes: &[u8], h: &str, file: &Path) -> Result<handle::Node, Fa
                     )
                     .with_hint("re-run tree to get current handles"),
                 )),
-                1 => Ok(content_hits[0].clone()),
+                1 => resolve_at(&nodes, content_hits[0]),
                 _n => Err(Fail(
                     exit::TARGET,
-                    ErrorBody::new("ambiguous-handle", ambiguous_handle_message(h, &content_hits))
-                        .with_hint("re-run tree and copy a longer prefix"),
+                    ErrorBody::new(
+                        "ambiguous-handle",
+                        ambiguous_handle_message(
+                            h,
+                            &content_hits.iter().map(|&i| &nodes[i]).collect::<Vec<_>>()
+                        )
+                    )
+                    .with_hint("re-run tree and copy a longer prefix"),
                 )),
             }
         }
-        1 => Ok(hits[0].clone()),
+        1 => resolve_at(&nodes, hits[0]),
         _n => {
             Err(Fail(
                 exit::TARGET,
-                ErrorBody::new("ambiguous-handle", ambiguous_handle_message(h, &hits))
-                    .with_hint("re-run tree and copy a longer prefix"),
+                ErrorBody::new(
+                    "ambiguous-handle",
+                    ambiguous_handle_message(
+                        h,
+                        &hits.iter().map(|&i| &nodes[i]).collect::<Vec<_>>()
+                    )
+                )
+                .with_hint("re-run tree and copy a longer prefix"),
             ))
         }
     }
+}
+
+/// Clone the node at `idx` and fill its position chain (issue 22: the
+/// collected table stores parent indices, not path strings; only the
+/// resolved edit target carries the full chain, for the post-edit
+/// same-position lookup).
+fn resolve_at(nodes: &[handle::Node], idx: usize) -> Result<handle::Node, Fail> {
+    let mut node = nodes[idx].clone();
+    node.path_chain = handle::chain_of(nodes, idx);
+    Ok(node)
 }
 
 /// The `ambiguous-handle` message: the candidate handles (with their line
@@ -926,8 +951,10 @@ fn run_get(file: &Path, name: &Option<String>, handle: &Option<String>) -> Resul
     // The read lookup carries the form's handle for use in an edit
     // (SPEC §5); null for non-collection forms.
     let nodes = handle::collect(&bytes);
-    let addr = target.addr.to_string();
-    let form_handle = nodes.iter().find(|n| n.path == addr).map(|n| n.handle.clone());
+    let form_handle = nodes
+        .iter()
+        .find(|n| n.depth == 1 && n.child_idx == f.addr)
+        .map(|n| n.handle.clone());
     Ok(
         Output::ok("get")
             .file(Some(file.display().to_string()))
@@ -1402,7 +1429,7 @@ fn build_prepared_payload(
                 .rposition(|&b| b == b'\n')
                 .map_or(0, |p| p + 1);
             let target_col = start - line_start;
-            let nested = node.path.contains('.');
+            let nested = node.depth > 1;
             let anchor_starts_line = bytes[line_start..start]
                 .iter()
                 .all(|&b| b == b' ' || b == b'\t');
@@ -1539,7 +1566,7 @@ fn plan_splice(
     payload: &Option<Payload>,
 ) -> (splice::Splice, invariants::Allowed, (usize, usize)) {
     if let Some(node) = handle_node {
-        let top_level = node.path.split('.').next().unwrap().parse::<usize>().unwrap();
+        let top_level = node.top_level as usize;
         // The I3 window depends on depth. Nested edits never change the
         // top-level form count: the containing form may change and nothing
         // else. Top-level edits DO move the count: a replace spans the N
@@ -1977,7 +2004,10 @@ mod tests {
         // The dotted structural path is internal; the message must name the
         // candidate handles (with line ranges), never the paths.
         let mk = |handle: &str, line: (usize, usize)| handle::Node {
-            path: "9.2.2.5".into(),
+            parent: Some(0),
+            child_idx: 5,
+            top_level: 9,
+            path_chain: vec![9, 2, 2, 5],
             kind: "list_lit".into(),
             head: Some("def".into()),
             name: Some("x".into()),
