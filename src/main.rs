@@ -72,7 +72,7 @@ fn dispatch(cli: &Cli) -> Result<Output, Fail> {
             file, *mode, content, content_file, old_text, new_text, handle, *dry_run, *strict,
             *repair, *format_content || !*no_format_content,
         ),
-        cli::Op::Tree { file, depth, full } => ops::run_tree(cli, file, depth, full),
+        cli::Op::Tree { file, depth, full, name } => ops::run_tree(cli, file, depth, full, name),
         cli::Op::Strip { .. } => unreachable!("strip is handled in main() before the envelope"),
     }
 }

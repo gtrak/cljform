@@ -29,7 +29,7 @@ cljform [--json|--human] <op> …
 | Op | Purpose |
 |----|---------|
 | `forms <file>` | Top-level form table: addr, kind, name, lines, blake3, `contains` shape summary, D-warnings |
-| `tree <file> [--depth N\|all \| --full] [--json]` | Annotated view: the source with `⟦handle⟧` after each marked collection's opening delimiter (default: top-level + multi-line forms). Handles are the only edit targets; every emitted handle resolves. `--json` emits the flat node table. Refuses sources that already contain the marker glyphs (`annotate-conflict`, exit 1) |
+| `tree <file> [--depth N\|all \| --full] [--json] [--name SYM]` | Annotated view: the source with `⟦handle⟧` after each marked collection's opening delimiter (default: top-level + multi-line forms). Handles are the only edit targets; every emitted handle resolves. `--json` emits the flat node table. Refuses sources that already contain the marker glyphs (`annotate-conflict`, exit 1). `--name SYM` selects only the forms that define `SYM` (exact def-like name, any nesting depth): a count header, then each matched source block at full depth with its handles inline, sorted by line; zero matches is an ok empty result |
 | `strip [file]` | Delete every `⟦…⟧` marker span → recovers the exact original bytes (BOM/CRLF preserved). Pure filter on stdout, no envelope; file or stdin |
 | `get <file> [--name sym\|--handle H]` | One form's exact bytes + metadata, including its `⟦handle⟧` (pass it to `edit`). `--name` is a top-level read lookup — names are extracted for var-defining `def…` heads (`defn`, `defapifn`, …; not `defmethod`, which extends an existing multimethod); `--handle` reads any collection node |
 | `check [file]` | Parse + table + nesting warnings (file or stdin) |

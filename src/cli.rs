@@ -143,6 +143,11 @@ pub enum Op {
         /// Mark every collection (alias for --depth all).
         #[arg(long)]
         full: bool,
+        /// Exact def-like name (any nesting depth): list only the forms that
+        /// define it, each matched subtree rendered at full depth (SPEC
+        /// §10.2). Zero matches is an ok empty result, not an error.
+        #[arg(long, value_name = "SYM")]
+        name: Option<String>,
     },
     /// Delete every `⟦...⟧` marker span; the stripped bytes go to stdout
     /// raw (a pure filter, no envelope).

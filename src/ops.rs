@@ -417,11 +417,26 @@ pub fn run_materialize(
 }
 
 /// `cljform tree`: the annotated form view (raw `⟦handle⟧` text) or the node
-/// table with --json.
-pub fn run_tree(cli: &Cli, file: &Path, depth: &Option<String>, full: &bool) -> Result<Output, Fail> {
+/// table with --json; `--name X` lists only the forms that define `X`
+/// (SPEC §10.2).
+pub fn run_tree(
+    cli: &Cli,
+    file: &Path,
+    depth: &Option<String>,
+    full: &bool,
+    name: &Option<String>,
+) -> Result<Output, Fail> {
     let (bytes, had_bom) = read_file(file)?;
     // Same parse the resolver uses: unparseable files get no view.
     require_parse(&bytes)?;
+    if let Some(n) = name {
+        return run_tree_named(
+            file,
+            &bytes,
+            n,
+            cli.human || (!cli.json && cli::atty_stdout()),
+        );
+    }
     let nodes = handle::collect(&bytes);
     let d = if *full {
         handle::Depth::All
@@ -478,6 +493,93 @@ pub fn run_tree(cli: &Cli, file: &Path, depth: &Option<String>, full: &bool) -> 
             .file(Some(file.display().to_string()))
             .file_hash(hashutil::tagged(&hashutil::file_hash(&bytes)))
             .result(serde_json::json!({ "nodes": nodes })),
+    )
+}
+
+/// `tree --name X` (SPEC §10.2): exact def-like name equality at any nesting
+/// depth (no substring matching). The matched subtrees are the whole result —
+/// human: a count header, then each match's full-depth annotated source block
+/// (handles inline), sorted by line; JSON: the filtered node table. Zero
+/// matches is an ok empty result, never an error. `--depth`/`--full` are view
+/// concerns the selector overrides: matched blocks are always full depth.
+fn run_tree_named(
+    file: &Path,
+    bytes: &[u8],
+    name: &str,
+    human: bool,
+) -> Result<Output, Fail> {
+    let nodes = handle::collect(bytes);
+    // Exact name equality against the node table's def-like names. Document
+    // order is line order (the table is preorder), so the stable sort by line
+    // is the spec's "sorted by line" enumeration.
+    let mut matches: Vec<usize> = nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| n.def_name.as_deref() == Some(name))
+        .map(|(i, _)| i)
+        .collect();
+    matches.sort_by_key(|&i| nodes[i].line[0]);
+    let header = if matches.len() == 1 {
+        format!("1 match for name {name:?} in {}", file.display())
+    } else {
+        format!("{} matches for name {name:?} in {}", matches.len(), file.display())
+    };
+    if human {
+        // Each match: its line range, then the full-depth annotated source
+        // block with its handles inline (SPEC §10.2).
+        let mut blocks: Vec<String> = Vec::with_capacity(matches.len());
+        for &i in &matches {
+            let node = &nodes[i];
+            let block = handle::annotate_subtree(bytes, i).map_err(|_| {
+                Fail(
+                    errors::exit::PARSE,
+                    ErrorBody::new(
+                        "annotate-conflict",
+                        format!(
+                            "the source already contains marker glyphs ({}/{}) and the view cannot be stripped losslessly",
+                            handle::MARKER_OPEN, handle::MARKER_CLOSE
+                        ),
+                    )
+                    .with_hint("use --json to list the nodes without markers"),
+                )
+            })?;
+            let mut b = format!("lines {}–{}\n", node.line[0], node.line[1]);
+            b.push_str(&block);
+            if !b.ends_with('\n') {
+                b.push('\n');
+            }
+            blocks.push(b);
+        }
+        let text = if blocks.is_empty() {
+            format!("{header}\n")
+        } else {
+            format!("{header}\n\n{}", blocks.join("\n"))
+        };
+        return Ok(
+            Output::ok("tree")
+                .file(Some(file.display().to_string()))
+                .file_hash(hashutil::tagged(&hashutil::file_hash(bytes)))
+                .result(serde_json::json!({ "text": text })),
+        );
+    }
+    let out_nodes: Vec<serde_json::Value> = matches
+        .iter()
+        .map(|&i| {
+            let mut n = nodes[i].clone();
+            // Echo the queried name on the matched node: the full table's
+            // serialized `name` is top-level-only, so a nested match would
+            // otherwise render without the name it was selected by.
+            if n.name.is_none() {
+                n.name = Some(name.to_string());
+            }
+            serde_json::to_value(&n).expect("Node serializes")
+        })
+        .collect();
+    Ok(
+        Output::ok("tree")
+            .file(Some(file.display().to_string()))
+            .file_hash(hashutil::tagged(&hashutil::file_hash(bytes)))
+            .result(serde_json::json!({ "count": matches.len(), "nodes": out_nodes })),
     )
 }
 
@@ -608,6 +710,7 @@ mod tests {
             kind: "list_lit".into(),
             head: Some("def".into()),
             name: Some("x".into()),
+            def_name: Some("x".into()),
             line: [line.0, line.1],
             handle: handle.into(),
             raw: "0".repeat(64),

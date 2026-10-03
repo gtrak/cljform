@@ -159,7 +159,7 @@ not serialized — it is not addressable).
 | Op | Purpose | Mutates | Key args |
 |----|---------|---------|----------|
 | `forms <file>` | top-level form table (§4.2) | no | — |
-| `tree <file>` | annotated view: source with `⟦handle⟧` after each marked collection's opening delimiter (§10.2) | no | `--depth N\|all`, `--full`, `--json` (flat node table) |
+| `tree <file>` | annotated view: source with `⟦handle⟧` after each marked collection's opening delimiter (§10.2) | no | `--depth N\|all`, `--full`, `--json` (flat node table), `--name SYM` (selector, §10.2) |
 | `strip [file]` | delete every `⟦…⟧` marker → the exact original bytes; pure stdout filter, no envelope (§10.2) | no | file or stdin |
 | `get <file>` | one form's exact bytes + metadata, including its handle | no | `--name sym` \| `--handle H` |
 | `check [file]` | parse + form table + nesting warnings | no | file or stdin |
@@ -401,7 +401,7 @@ session.
 | Tool | Params | Maps to |
 |------|--------|---------|
 | `clj_forms` | `{path}` | `cljform forms --json`; refreshes the fingerprint cache |
-| `clj_tree` | `{path, depth?, json?}` | `cljform tree` — the primary handle-discovery view (`--depth N\|all`); `json` returns the structured node list. **Human path (default, `--human`) is a pass-through:** the annotated source is not a JSON envelope, so on exit 0 the wrapper returns `stdout` directly (BOM-stripped, `trimEnd`) with no `isError` — a successful default `clj_tree` is never an error and is never prefixed `cljform failed:`. Only a nonzero exit (or, in `json` mode, an unparseable/`ok:false` envelope) yields `isError`, using `errorText` when the output parses as an error envelope, else the `cljform failed: ${stderr \|\| stdout}` fallback |
+| `clj_tree` | `{path, name?, depth?, json?}` | `cljform tree` — the primary handle-discovery view (`--depth N\|all`); `name` maps to `--name SYM` (the §10.2 selector: matched subtrees at full depth, zero matches is an ok empty result); `json` returns the structured node list. **Human path (default, `--human`) is a pass-through:** the annotated source is not a JSON envelope, so on exit 0 the wrapper returns `stdout` directly (BOM-stripped, `trimEnd`) with no `isError` — a successful default `clj_tree` is never an error and is never prefixed `cljform failed:`. Only a nonzero exit (or, in `json` mode, an unparseable/`ok:false` envelope) yields `isError`, using `errorText` when the output parses as an error envelope, else the `cljform failed: ${stderr \|\| stdout}` fallback |
 | `clj_get` | `{path, name? / handle?}` | `cljform get --json` — exact bytes + the form's `⟦handle⟧` |
 | `clj_edit` | `{path, handle?, mode?, content? / oldText? + newText?, dryRun?, strict?, repair?, autoFormat?}` | `cljform edit --handle …` — mode auto-selects `patch` when `oldText` is present; append/prepend take no handle; `dryRun` ⇒ `--dry-run`, `strict` ⇒ `--strict`, `repair` ⇒ `--repair`; `autoFormat` (default true) maps to the in-edit content reindent: `false` passes `--no-format-content`, `true` (the default) passes nothing and lets `cljform edit` reindent the content itself in parinfer paren mode (§10.3/§10.5; a refused reindent is reported by the CLI as a note, the edit never fails for it); the wrapper no longer runs a separate `cljform format` call; `oldText`/`newText` are exact patch text and are never reformatted. **Next-handle affordance:** on every successful (non-dry-run) edit the wrapper appends a final line sourced from the JSON envelope (`result.summary`), never from re-parsing the human text — `replace`/`patch` append `next handle: ⟦H⟧ — use it for the next edit to this form` (from `summary.handle`; falls back to `summary.wasHandle` only when `handle` is absent) so the agent chases the returned handle instead of re-fetching; `insert-after`/`insert-before` append `inserted handles: ⟦…⟧, ⟦…⟧ (anchor ⟦…⟧) — use these for the next edit` (from `summary.handles`, plus `summary.wasHandle` when present); `delete` appends nothing (the form is gone — no stale handle) |
 | `clj_draft` | `{content}` | `cljform materialize --content-file …` — returns candidate + diff; never writes |
@@ -543,6 +543,22 @@ collection delimiter:
   `path`, the hash, and the byte offsets are internal and not serialized)
   derived from the same tree. Annotated source is the canonical read view;
   JSON is derived.
+- **`--name SYM` selector (issue 26)** — discovery for nested *named* forms.
+  `SYM` is matched by exact equality against the def-like name of every
+  collection (top-level and nested; no substring matching; `defmethod` never
+  names a form — it extends a `defmulti` var). The result contains only the
+  matches: the human view is a count header, then each match's annotated source
+  block with its line range, sorted by line; each block is annotated **at full
+  depth** (the matched form and every descendant carry a `⟦handle⟧`, so the
+  inner handles are directly copyable) — `--depth`/`--full` are view concerns
+  the selector overrides. `--json` returns the filtered node table (same node
+  shape as `tree --json`, plus a `count`); a nested match echoes the queried
+  name in `name` (the full table's serialized `name` stays top-level-only). Zero
+  matches is `ok:true` with a zero count and empty node list — not an error.
+  Discovery-only: handles remain the ONLY edit address. Two-case rule for
+  callers (worker guidance): a named nested form → `tree --name X`, copy the
+  handle, edit; anonymous nested content → patch within the enclosing form's
+  handle.
 
 ### 10.3 Edit contract
 

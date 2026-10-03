@@ -73,6 +73,13 @@ pub struct Node {
     /// Def var name for top-level def forms, else None.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Def var name for def-like list forms at ANY nesting depth. The
+    /// serialized `name` field stays top-level-only so the default views
+    /// (annotated source and the node table) are byte-identical; the
+    /// `tree --name` selector (SPEC §10.2) matches this field, which is how
+    /// nested named forms (a defn inside a let) stay discoverable.
+    #[serde(skip)]
+    pub def_name: Option<String>,
     /// [first, last] 1-based inclusive.
     pub line: [usize; 2],
     /// Shortest unique prefix of `raw`, >= 6 hex chars.
@@ -113,10 +120,46 @@ pub fn annotate(bytes: &[u8], depth: Depth) -> Result<String, AnnotateError> {
             .collect::<Vec<bool>>(),
         Depth::Heuristic => heuristic_marks(&nodes),
     };
+    Ok(annotate_marked(&nodes, bytes, &marked, 0, bytes.len()))
+}
+
+/// Annotate one matched node and its whole subtree at full depth — the
+/// `tree --name` selector (SPEC §10.2): the block is the matched form's exact
+/// source range with `⟦handle⟧` after every collection's opening delimiter in
+/// it, so the inner handles are directly visible.
+pub fn annotate_subtree(bytes: &[u8], idx: usize) -> Result<String, AnnotateError> {
+    let nodes = collect(bytes);
+    let node = &nodes[idx];
+    if contains_marker(&bytes[node.start_byte..node.end_byte]) {
+        return Err(AnnotateError::MarkerConflict);
+    }
+    let mut marked = vec![false; nodes.len()];
+    for m in marked.iter_mut().skip(idx).take(subtree_end(&nodes, idx) - idx) {
+        *m = true;
+    }
+    Ok(annotate_marked(
+        &nodes,
+        bytes,
+        &marked,
+        node.start_byte,
+        node.end_byte,
+    ))
+}
+
+/// The marker insertion itself: copy `bytes[start..end]`, inserting
+/// `⟦handle⟧` after the opening delimiter of each marked node. The marked
+/// set is a view concern only (depth flags, subtree selectors).
+fn annotate_marked(
+    nodes: &[Node],
+    bytes: &[u8],
+    marked: &[bool],
+    start: usize,
+    end: usize,
+) -> String {
     let mut out = String::new();
-    let mut cursor = 0usize; // next byte to copy from the original
+    let mut cursor = start; // next byte to copy from the original
     for (i, node) in nodes.iter().enumerate() {
-        if !marked[i] {
+        if !marked[i] || node.start_byte < start || node.start_byte >= end {
             continue;
         }
         let after_delim = opening_delimiter_end(bytes, node.start_byte);
@@ -126,8 +169,22 @@ pub fn annotate(bytes: &[u8], depth: Depth) -> Result<String, AnnotateError> {
         out.push_str(MARKER_CLOSE);
         cursor = after_delim;
     }
-    out.push_str(&String::from_utf8_lossy(&bytes[cursor..]));
-    Ok(out)
+    out.push_str(&String::from_utf8_lossy(&bytes[cursor..end]));
+    out
+}
+
+/// Exclusive end of node `idx`'s subtree in the document-order table: nodes
+/// are recorded in preorder, so a subtree is a contiguous range. One reverse
+/// pass folds each child's end into its parent — O(n), never per-node chain
+/// walks (issue 22).
+fn subtree_end(nodes: &[Node], idx: usize) -> usize {
+    let mut end: Vec<usize> = (0..nodes.len()).map(|i| i + 1).collect();
+    for i in (0..nodes.len()).rev() {
+        if let Some(p) = nodes[i].parent {
+            end[p] = end[p].max(end[i]);
+        }
+    }
+    end[idx]
 }
 
 /// Delete every `⟦...⟧` span. A `⟦` without a closing `⟧` is left as-is.
@@ -238,6 +295,10 @@ fn record_subtree(
     } else {
         None
     };
+    // Def var name at any depth (SPEC §10.2 `--name` selector); the top-level
+    // `name` argument always carries the same value when it is Some, so the
+    // serialized field and the internal one never disagree.
+    let def_name = head.as_deref().and_then(|h| parser::def_name(node, h, bytes));
     let idx = nodes.len();
     nodes.push(Node {
         parent,
@@ -247,6 +308,7 @@ fn record_subtree(
         kind: node.kind().to_string(),
         head: head.clone(),
         name,
+        def_name,
         line: [
             node.start_position().row + 1,
             node.end_position().row + 1,

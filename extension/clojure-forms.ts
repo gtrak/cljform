@@ -292,15 +292,24 @@ export default function ClojureForms(pi: ExtensionAPI) {
 			"Read-only annotated view of a Clojure/EDN file: the source with a ⟦handle⟧ after each marked " +
 			"collection's opening delimiter. This is the PRIMARY way an agent discovers handles — the only " +
 			"edit targets for clj_edit. Handles are content-addressed: they survive edits elsewhere in the " +
-			"file and refuse (stale-handle) when their own form changed.",
+			"file and refuse (stale-handle) when their own form changed. Pass name to select only the forms " +
+			"that define it (exact def-like name, any nesting depth): each matched subtree renders at full " +
+			"depth with its handles inline; zero matches is an ok empty result, not an error.",
 		promptSnippet: "Read a Clojure file annotated with ⟦handle⟧ markers (the only edit targets).",
 		promptGuidelines: [
 			"Run clj_tree before any clj_edit; copy the ⟦handle⟧ you want to edit and pass it as handle.",
+			"Two cases for nested content: a NAMED nested form (defn/def/deftest… inside another form) → call with name: <that name> and copy the handle from the full-depth block; ANONYMOUS nested content (let/when bodies, vectors, maps) → patch within the enclosing form's handle (oldText/newText).",
 			"Single-line forms usually have no handle: address them by text (oldText/newText patch) inside their parent form.",
 			"A stale-handle error means the form changed — re-run clj_tree, never retry the old handle.",
 		],
 		parameters: Type.Object({
 			path: Type.String({ description: "Path to the .clj/.cljs/.cljc/.edn file" }),
+			name: Type.Optional(
+				Type.String({
+					description:
+						"Def-like name to select (exact match, any nesting depth): only the forms that define it are listed, each subtree rendered at full depth with handles inline; zero matches is an ok empty result",
+				}),
+			),
 			depth: Type.Optional(
 				Type.Union([Type.Number(), Type.Literal("all")], {
 					description:
@@ -317,6 +326,9 @@ export default function ClojureForms(pi: ExtensionAPI) {
 
 		async execute(_toolCallId, params, _signal, _onUpdate) {
 			const args = ["tree", params.path, params.json ? "--json" : "--human"];
+			if (params.name !== undefined) {
+				args.push("--name", params.name);
+			}
 			if (params.depth !== undefined) {
 				args.push("--depth", params.depth === "all" ? "all" : String(params.depth));
 			}

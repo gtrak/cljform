@@ -767,3 +767,174 @@ fn pure_content_hash_unique_resolves_unknown_is_stale() {
     assert_eq!(code, 3, "{d} {stderr}");
     assert_eq!(d["error"]["code"], "stale-handle");
 }
+
+// ==============================================================
+// --name selector (issue 26, SPEC §10.2): discovery for nested
+// named forms. Exact name equality; matched subtrees render at
+// full depth with handles inline; zero matches is ok, not an
+// error. Handles remain the only edit address.
+//
+// Fixture line map (1-based):
+//   1 (ns ex)
+//   3 (defn outer [x]
+//   4   (let [cfg (defn make-cfg [k]        <- nested match #1 (lines 4–5)
+//   5               {:k k :x x})]
+//   6     (cfg x)))
+//   8 (defn other []
+//   9   (defn make-cfg []                  <- nested match #2 (lines 9–10)
+//  10     :again)
+//  11   :done)
+//  13 (def tail 1)
+//
+const NAME_SEL_FIXTURE: &[u8] = b"(ns ex)\n\n(defn outer [x]\n  (let [cfg (defn make-cfg [k]\n              {:k k :x x})]\n    (cfg x)))\n\n(defn other []\n  (defn make-cfg []\n    :again)\n  :done)\n\n(def tail 1)\n";
+
+#[test]
+fn tree_name_single_match_full_depth_block() {
+    let f = fixture("name-sel-single.clj", NAME_SEL_FIXTURE);
+    let (code, out, stderr) = run_bytes(&["tree", &f, "--name", "outer", "--human"], None);
+    assert_eq!(code, 0, "{stderr}");
+    let out = String::from_utf8(out).unwrap();
+    assert!(
+        out.starts_with(&format!("1 match for name \"outer\" in {}\n\nlines 3–6\n", f)),
+        "count header + line range: {out}"
+    );
+    // Full depth: every collection in the subtree is marked — outer, [x],
+    // let, [cfg …], make-cfg, [k], the map, (cfg x) — 8 markers, with the
+    // inner handles inline (the point of the selector).
+    assert_eq!(out.matches('\u{27E6}').count(), 8, "{out}");
+    assert!(out.contains("[\u{27E6}"), "single-line vector marked at full depth: {out}");
+    // The block's top-level handle is the full-table handle of line 3 depth 1.
+    let h = handle_at_full(&f, 3, 1);
+    assert!(out.contains(&format!("(\u{27E6}{h}\u{27E7}defn outer")), "matched handle inline: {out}");
+    // Only the matched subtree renders: the other defn is not in the block.
+    assert!(!out.contains("defn other"), "{out}");
+}
+
+#[test]
+fn tree_name_multiple_matches_count_and_order() {
+    let f = fixture("name-sel-multi.clj", NAME_SEL_FIXTURE);
+    let (code, out, stderr) = run_bytes(&["tree", &f, "--name", "make-cfg", "--human"], None);
+    assert_eq!(code, 0, "{stderr}");
+    let out = String::from_utf8(out).unwrap();
+    assert!(
+        out.starts_with(&format!("2 matches for name \"make-cfg\" in {}\n\n", f)),
+        "count header: {out}"
+    );
+    // Both matches, sorted by line: the let-bound one (line 4) before the
+    // other-defn one (line 9).
+    let first = out.find("lines 4–5").expect("first block header: {out}");
+    let second = out.find("lines 9–10").expect("second block header: {out}");
+    assert!(first < second, "matches sorted by line: {out}");
+    // The headline case: a nested defn found by name, handle inline.
+    // Depth 4: outer(1) → let-list(2) → binding vector(3) → defn(4).
+    let h = handle_at_full(&f, 4, 4);
+    assert!(out.contains(&format!("(\u{27E6}{h}\u{27E7}defn make-cfg")), "nested defn handle: {out}");
+}
+
+#[test]
+fn tree_name_zero_matches_is_ok_empty() {
+    let f = fixture("name-sel-zero.clj", NAME_SEL_FIXTURE);
+    // Human: the zero-count header, exit 0, no blocks.
+    let (code, out, stderr) = run_bytes(&["tree", &f, "--name", "nope", "--human"], None);
+    assert_eq!(code, 0, "zero matches is ok, not an error: {stderr}");
+    let out = String::from_utf8(out).unwrap();
+    assert_eq!(out, format!("0 matches for name \"nope\" in {}\n", f), "{out:?}");
+    // JSON: ok:true, zero count, empty filtered table.
+    let (jcode, d, jstderr) = run_json(&["tree", &f, "--name", "nope", "--json"], None);
+    assert_eq!(jcode, 0, "{d} {jstderr}");
+    assert_eq!(d["ok"], true);
+    assert_eq!(d["result"]["count"], 0);
+    assert!(d["result"]["nodes"].as_array().unwrap().is_empty(), "{}", d["result"]);
+}
+
+#[test]
+fn tree_name_json_is_filtered_table() {
+    let f = fixture("name-sel-json.clj", NAME_SEL_FIXTURE);
+    // Both nested matches, in line order, with the queried name echoed
+    // (the full table's serialized `name` is top-level-only).
+    let (code, d, stderr) = run_json(&["tree", &f, "--name", "make-cfg", "--json"], None);
+    assert_eq!(code, 0, "{d} {stderr}");
+    assert_eq!(d["result"]["count"], 2);
+    let nodes = d["result"]["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 2, "{}", d["result"]);
+    let (n1, n2) = (&nodes[0], &nodes[1]);
+    for n in [n1, n2] {
+        assert_eq!(n["kind"], "list_lit");
+        assert_eq!(n["head"], "defn");
+        assert_eq!(n["name"], "make-cfg", "queried name echoed: {n}");
+    }
+    assert_eq!(n1["line"], serde_json::json!([4, 5]));
+    // Depth 4: the binding vector sits inside the let list, which is inside
+    // the outer defn.
+    assert_eq!(n1["depth"], 4);
+    assert_eq!(n2["line"], serde_json::json!([9, 10]));
+    assert_eq!(n2["depth"], 2);
+    // Same node shape as tree --json: the internal fields stay absent.
+    for n in [n1, n2] {
+        for key in ["path", "raw", "start_byte", "end_byte"] {
+            assert!(n.get(key).is_none(), "{key} leaked: {n}");
+        }
+    }
+    // The handles are the full-table handles (the same edit addresses).
+    assert_eq!(n1["handle"], handle_at_full(&f, 4, 4));
+    assert_eq!(n2["handle"], handle_at_full(&f, 9, 2));
+    // A top-level match filters to one node carrying its serialized name.
+    let (code, d, stderr) = run_json(&["tree", &f, "--name", "tail", "--json"], None);
+    assert_eq!(code, 0, "{d} {stderr}");
+    let nodes = d["result"]["nodes"].as_array().unwrap();
+    assert_eq!(d["result"]["count"], 1);
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0]["name"], "tail");
+    assert_eq!(nodes[0]["depth"], 1);
+}
+
+#[test]
+fn tree_name_depth_and_full_are_noops() {
+    // The selector overrides the depth view: matched blocks are always full
+    // depth, so --full and --depth do not change the result.
+    let f = fixture("name-sel-flags.clj", NAME_SEL_FIXTURE);
+    let (code, base, stderr) = run_bytes(&["tree", &f, "--name", "make-cfg", "--human"], None);
+    assert_eq!(code, 0, "{stderr}");
+    let extra_flags: &[&[&str]] = &[&["--full"], &["--depth", "1"], &["--depth", "all"]];
+    for extra in extra_flags {
+        let mut args: Vec<&str> = vec!["tree", f.as_str(), "--name", "make-cfg"];
+        args.extend_from_slice(extra);
+        args.push("--human");
+        let (code, out, stderr) = run_bytes(&args, None);
+        assert_eq!(code, 0, "{stderr}");
+        assert_eq!(
+            out, base,
+            "--name output must not depend on the depth flags: {:?}",
+            out
+        );
+    }
+}
+
+#[test]
+fn tree_default_view_is_unchanged_without_name() {
+    let f = fixture("name-sel-default.clj", NAME_SEL_FIXTURE);
+    // The default JSON table: no count, no nested names (the selector's
+    // names are internal), same shape as before.
+    let nodes = tree_full_nodes(&f);
+    assert!(nodes.iter().all(|n| n.get("count").is_none()));
+    let named: Vec<&Value> = nodes
+        .iter()
+        .filter(|n| n.get("name").is_some())
+        .collect();
+    // Only the top-level def-likes carry a serialized name.
+    let names: Vec<&str> = named
+        .iter()
+        .map(|n| n.get("name").and_then(|v| v.as_str()).unwrap())
+        .collect();
+    assert_eq!(names, vec!["outer", "other", "tail"], "{named:?}");
+    // The default human view: annotated source, no selector header.
+    let (code, out, stderr) = run_bytes(&["tree", &f, "--human"], None);
+    assert_eq!(code, 0, "{stderr}");
+    let out = String::from_utf8(out).unwrap();
+    assert!(!out.contains("match"), "no selector header in the default view: {out}");
+    // And the JSON envelope without --name has no `count` field at all.
+    let (jcode, d, jstderr) = run_json(&["tree", &f, "--json"], None);
+    assert_eq!(jcode, 0, "{jstderr}");
+    assert!(d["result"].get("count").is_none(), "{}", d["result"]);
+}
+
