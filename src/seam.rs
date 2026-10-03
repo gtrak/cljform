@@ -243,7 +243,12 @@ pub(crate) fn pull_displaced_closers(bytes: &[u8], new_bytes: &mut Vec<u8>, star
     {
         return None;
     }
-    let stop_orig = (end_line_end + 1).min(bytes.len());
+    // The window the closers REPLACE always ends at the end of the node's
+    // line, exclusive of the line's own newline: the newline survives
+    // (uniformly, whether or not it is the file's trailing one) and only
+    // the node's tail (separating space, the displaced closers) is replaced.
+    // In `new_bytes` coordinates that is `end_line_end - shift`.
+    let stop = end_line_end - shift;
     let start_line_start =
         bytes[..start].iter().rposition(|&b| b == b'\n').map_or(0, |p| p + 1);
     if start_line_start == end_line_start {
@@ -253,28 +258,41 @@ pub(crate) fn pull_displaced_closers(bytes: &[u8], new_bytes: &mut Vec<u8>, star
         // and not be a comment: landing the closers in a comment line
         // would comment them out (and the pull would not be a no-op for
         // `format`).
-        if start_line_start == 0 {
-            return None; // nothing above the anchor's line to lift onto
-        }
-        let pad = &bytes[start_line_start..start];
-        if pad.iter().all(|b| matches!(b, b' ' | b'\t')) {
-            let prev_nl = start_line_start - 1; // newline ending the previous line
-            let prev_start =
-                bytes[..prev_nl].iter().rposition(|&b| b == b'\n').map_or(0, |p| p + 1);
-            let prev = &bytes[prev_start..prev_nl];
-            let first = prev.iter().find(|b| !matches!(b, b' ' | b'\t'));
-            if !matches!(first, Some(b) if *b != b';') {
-                return None;
+        if start_line_start > 0 {
+            let pad = &bytes[start_line_start..start];
+            if pad.iter().all(|b| matches!(b, b' ' | b'\t')) {
+                let prev_nl = start_line_start - 1; // newline ending the previous line
+                let prev_start =
+                    bytes[..prev_nl].iter().rposition(|&b| b == b'\n').map_or(0, |p| p + 1);
+                let prev = &bytes[prev_start..prev_nl];
+                let first = prev.iter().find(|b| !matches!(b, b' ' | b'\t'));
+                if !matches!(first, Some(b) if *b != b';') {
+                    return None;
+                }
+                new_bytes.splice(prev_nl..stop, closers.iter().copied());
+                return Some((prev_nl, end_line_end));
             }
-            new_bytes.splice(prev_nl..stop_orig - shift, closers.iter().copied());
-            return Some((prev_nl, stop_orig));
         }
     }
     // Content before the node on its line (single- or multi-line node):
     // land the closers at the end of the node's start line — the spliced
     // tail line — where they follow real content.
-    new_bytes.splice(start..stop_orig - shift, closers.iter().copied());
-    Some((start, stop_orig))
+    //
+    // Issue 25 (C1): when the deleted node was preceded by a separator
+    // space/tab on its line, splicing at the node's start byte kept that
+    // space and left it dangling before the parent's closer ("(foo (bar 1) )").
+    // The separator is whitespace between forms — never a form byte — so
+    // consume it: the window starts one byte earlier and the pulled closer
+    // replaces the space in place. Identical with and without a trailing
+    // newline at EOF: the newline (if any) sits at `end_line_end` and the
+    // window above stops before it.
+    let cut = if start > 0 && matches!(bytes[start - 1], b' ' | b'\t') {
+        start - 1
+    } else {
+        start
+    };
+    new_bytes.splice(cut..stop, closers.iter().copied());
+    Some((cut, end_line_end))
 }
 /// Drop trailing whitespace-only lines from `text` (issue 14 R3, the seam
 /// guarantee): the base-shifted content must end on a real content line so

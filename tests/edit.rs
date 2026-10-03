@@ -392,6 +392,77 @@ fn patch_mode_line_growth_shifts_later_forms() {
     assert_eq!(rows[2]["hash"], after_hash, "shifted form kept its bytes");
 }
 
+// ─── post-edit summary (issue 23 S1) ────────────────────────────────────────
+
+#[test]
+fn replace_list_with_noncollection_reports_new_identity() {
+    // Issue 23 (S1): replacing a nested LIST with a non-collection changes
+    // the shape — the post-edit node at the same path no longer exists, so
+    // the path lookup misses. The fallback used to report the PRE-EDIT
+    // form's head/kind ("foo" / list_lit). The summary must instead report
+    // what now sits at the target (the new num), keeping the handle note.
+    let f = fixture("sum-noncoll.clj", b"(def x (foo 1 2))\n");
+    let h = handle_at_full(&f, 1, 2);
+    let (code, d, err) =
+        run_json(&["edit", &f, "--handle", &h, "--content", "99", "--json"], None);
+    assert_eq!(code, 0, "{d} {err}");
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), "(def x 99)\n");
+    let s = &d["result"]["summary"];
+    assert_eq!(s["action"], "replaced");
+    // Pre-edit identity is preserved under the was* keys…
+    assert_eq!(s["wasKind"], "list_lit");
+    assert_eq!(s["wasHandle"], h);
+    // …and the CURRENT identity is the num now sitting at the target —
+    // never the pre-edit list's head/kind.
+    assert_eq!(s["kind"], "num_lit", "post-edit kind: {d}");
+    assert!(s.get("head").is_none(), "a num has no head: {d}");
+    assert_eq!(s["line"], serde_json::json!([1, 1]));
+    // No recomputable handle at the same path: the field is absent and the
+    // existing note covers it.
+    assert!(s.get("handle").is_none(), "{d}");
+    let notes: Vec<&str> = d["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n.as_str().unwrap())
+        .collect();
+    assert!(
+        notes.iter().any(|n| n.contains("could not compute the new handle")),
+        "handle note kept: {notes:?}"
+    );
+    // The stale pre-edit head must not be reported as current in the
+    // human text either.
+    let text = d["result"]["text"].as_str().unwrap();
+    assert!(!text.contains("foo"), "pre-edit head must not leak: {text}");
+    check_ok(&f);
+}
+
+#[test]
+fn replace_list_with_list_reports_locatable_post_edit_node() {
+    // S1 control: a list replaced by another list keeps a node at the same
+    // path — the post-edit node IS locatable, so its handle/head/kind are
+    // reported (no fallback note).
+    let f = fixture("sum-listlist.clj", b"(def x (foo 1 2))\n");
+    let h = handle_at_full(&f, 1, 2);
+    let (code, d, err) =
+        run_json(&["edit", &f, "--handle", &h, "--content", "(bar 3)", "--json"], None);
+    assert_eq!(code, 0, "{d} {err}");
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), "(def x (bar 3))\n");
+    let s = &d["result"]["summary"];
+    assert_eq!(s["action"], "replaced");
+    assert_eq!(s["kind"], "list_lit");
+    assert_eq!(s["head"], "bar");
+    assert_eq!(s["line"], serde_json::json!([1, 1]));
+    assert_ne!(s["handle"].as_str().unwrap(), h, "new content, new handle");
+    assert_eq!(s["wasKind"], "list_lit");
+    assert_eq!(s["wasHandle"], h);
+    let notes = d["notes"].as_array().cloned().unwrap_or_default();
+    assert!(
+        notes.iter().all(|n| !n.as_str().unwrap().contains("could not compute")),
+        "no fallback note when the node is locatable: {notes:?}"
+    );
+}
+
 // ─── content reindent inside the edit (issue 11) ────────────────────────────
 
 #[test]

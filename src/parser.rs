@@ -173,6 +173,60 @@ fn text_of(node: Node, bytes: &[u8]) -> String {
     String::from_utf8_lossy(&bytes[start..end]).to_string()
 }
 
+/// Identity of the form sitting at a byte offset in a parsed file (issue
+/// 23 S1): the kind, head, and line span of the innermost NAMED parsed
+/// node covering `offset`. Used after an edit that changed structure
+/// (e.g. a list replaced by a non-collection) so the summary reports what
+/// NOW sits at the target instead of the pre-edit form's identity. Returns
+/// None only when the bytes do not parse or no named node covers the
+/// offset (whitespace bytes in an unparseable file).
+pub fn node_identity_at(bytes: &[u8], offset: usize) -> Option<NodeIdentity> {
+    let bytes = bytes.to_vec();
+    with_big_stack(move || node_identity_at_inner(&bytes, offset))
+}
+
+/// What a node identity carries: tree-sitter kind (e.g. `list_lit`,
+/// `int_lit`), the list's head symbol (None for non-lists), and the
+/// 1-based inclusive line span.
+#[derive(Debug, Clone)]
+pub struct NodeIdentity {
+    pub kind: String,
+    pub head: Option<String>,
+    pub line: [usize; 2],
+}
+
+fn node_identity_at_inner(bytes: &[u8], offset: usize) -> Option<NodeIdentity> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_clojure::LANGUAGE.into())
+        .expect("clojure grammar language");
+    let tree = parser.parse(bytes, None)?;
+    let root = tree.root_node();
+    let node = innermost_named_containing(root, offset)?;
+    Some(NodeIdentity {
+        kind: node.kind().to_string(),
+        head: (node.kind() == "list_lit").then(|| head_symbol(node, bytes)).flatten(),
+        line: [node.start_position().row + 1, node.end_position().row + 1],
+    })
+}
+
+/// Descend from `root` through the (disjoint) children that cover `offset`;
+/// the deepest NAMED node on that path is the innermost form containing the
+/// offset. Named nodes only: the anonymous delimiter tokens (`(`, `"`, …)
+/// cover the same offset as their owning form and would otherwise win.
+fn innermost_named_containing(node: Node, offset: usize) -> Option<Node> {
+    if !node.is_named() || node.start_byte() > offset || offset >= node.end_byte() {
+        return None;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if let Some(deeper) = innermost_named_containing(child, offset) {
+            return Some(deeper);
+        }
+    }
+    Some(node)
+}
+
 /// Head symbol of a form node as written, including any `ns/` qualifier:
 /// the leading `sym_lit` child's text (`sym_name` + optional `/sym_name`).
 pub fn head_symbol(node: Node, bytes: &[u8]) -> Option<String> {

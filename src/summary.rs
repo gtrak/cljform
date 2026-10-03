@@ -51,31 +51,53 @@ pub(crate) fn build_handle_summary(
     let at_path = new_nodes.iter().find(|n| n.path == node.path);
     match mode {
         Mode::Replace | Mode::Patch => {
-            // Head/name/kind describe what now sits at the target — the
+            // Head/name/kind/line describe what now sits at the target — the
             // POST-edit node at the same path, so the summary never
             // contradicts its own forms table. When the new node can't be
-            // located the pre-edit node stands in (its handle was not
-            // recomputable); a name may legitimately be absent, in which case
-            // the label falls back through head -> kind as usual.
-            let post = at_path.unwrap_or(node);
-            let line = post.line;
+            // located at the path (the shape changed, e.g. a list replaced by
+            // a non-collection), the post-edit parse identifies the form
+            // sitting at the target's splice byte (issue 23 S1); only if
+            // that is also impossible are head/kind/line suppressed rather
+            // than falling back to the pre-edit identity, which would report
+            // a form that no longer exists. A name may legitimately be
+            // absent, in which case the label falls back through head ->
+            // kind as usual.
             let mut summary = serde_json::json!({
                 "action": if mode == Mode::Replace { "replaced" } else { "patched" },
-                "kind": post.kind,
-                "name": post.name,
-                "head": post.head,
-                "line": line,
                 "wasKind": node.kind,
                 "wasLine": node.line,
                 "wasHandle": node.handle,
             });
             match at_path {
                 Some(n) => {
+                    summary["kind"] = serde_json::json!(n.kind);
+                    summary["name"] = serde_json::json!(n.name);
+                    summary["head"] = serde_json::json!(n.head);
+                    summary["line"] = serde_json::json!(n.line);
                     summary["handle"] = serde_json::json!(n.handle);
                 }
-                None => notes.push(
-                    "could not compute the new handle at the same path; re-run tree".to_string(),
-                ),
+                None => {
+                    // The splice lands the new content at the pre-edit node's
+                    // start byte: what now sits at the target is the innermost
+                    // post-edit form covering that byte.
+                    match parser::node_identity_at(new_bytes, bound.0) {
+                        Some(id) => {
+                            summary["kind"] = serde_json::json!(id.kind);
+                            if id.head.is_some() {
+                                summary["head"] = serde_json::json!(id.head);
+                            }
+                            summary["line"] = serde_json::json!(id.line);
+                        }
+                        None => {
+                            // Truly unlocatable: head/kind/line stay
+                            // suppressed; the note + forms table carry the
+                            // answer.
+                        }
+                    }
+                    notes.push(
+                        "could not compute the new handle at the same path; re-run tree".to_string(),
+                    );
+                }
             }
             if mode == Mode::Replace {
                 if let Some(Payload::Prepared(p)) = payload {

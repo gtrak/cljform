@@ -8,7 +8,7 @@
 
 mod common;
 
-use common::{edit_args, fixture, handle_at, handle_of, run_json};
+use common::{edit_args, fixture, handle_at, handle_of, run_json, tree_full_nodes};
 
 /// Canonical fixture: flat top-level forms (no nested closers to displace).
 const FLAT: &str = "(ns a)\n\n(def x 1)\n\n(defn f [v]\n  (g v))\n\n(def y 2)\n";
@@ -250,6 +250,85 @@ fn r3_nested_replace_pulls_displaced_closers_onto_last_line() {
         "(ns b)\n\n(defn outer [x]\n  (let [a 1]\n    (when x\n      (when a\n        (deep x)))))\n\n;; separator\n(def tail 1)\n"
     );
     assert_format_noop(&f, "R3 nested replace golden");
+}
+
+#[test]
+fn nested_delete_last_form_on_line_is_canonical() {
+    // Issue 25 (C1): deleting a nested form that is the LAST form on its
+    // line left the separating space dangling before the parent's closer
+    // ("(foo (bar 1) )") — non-canonical — and the seam pull additionally
+    // swallowed the file's trailing newline when the tail line was the
+    // file's last line. Every geometry variant must now land
+    // format-canonical (edit -> format is a no-op), with or without a
+    // trailing newline at EOF.
+    struct Case {
+        name: &'static str,
+        src: &'static [u8],
+        /// Line/depth of the deleted node — the LAST form on that line.
+        line: usize,
+        depth: usize,
+        expected: &'static str,
+    }
+    let cases = vec![
+        Case {
+            name: "single-line eof-newline",
+            src: b"(foo (bar 1) (baz 2))\n",
+            line: 1,
+            depth: 2,
+            expected: "(foo (bar 1))\n",
+        },
+        Case {
+            name: "single-line no-eof-newline",
+            src: b"(foo (bar 1) (baz 2))",
+            line: 1,
+            depth: 2,
+            expected: "(foo (bar 1))",
+        },
+        Case {
+            name: "vector eof-newline",
+            src: b"[a (bar 1) (baz 2)]\n",
+            line: 1,
+            depth: 2,
+            expected: "[a (bar 1)]\n",
+        },
+        Case {
+            name: "multiline eof-newline",
+            src: b"(foo\n  (bar 1)\n  (baz 2))\n",
+            line: 3,
+            depth: 2,
+            expected: "(foo\n  (bar 1))\n",
+        },
+        Case {
+            name: "multiline no-eof-newline",
+            src: b"(foo\n  (bar 1)\n  (baz 2))",
+            line: 3,
+            depth: 2,
+            expected: "(foo\n  (bar 1))",
+        },
+    ];
+    for c in &cases {
+        let name = c.name;
+        let f = fixture(&format!("del-last-{name}.clj"), c.src);
+        // Both siblings share (line, depth): target the LAST one.
+        let h = tree_full_nodes(&f)
+            .iter()
+            .rfind(|n| n["line"][0] == c.line && n["depth"] == c.depth)
+            .expect("target node")
+            .get("handle")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (code, d, err) = edit_args(&f, Some("delete"), Some(&h), &[]);
+        assert_eq!(code, 0, "{name}: {d} {err}");
+        assert_eq!(
+            std::fs::read_to_string(&f).unwrap(),
+            c.expected,
+            "{name}: exact post-delete bytes"
+        );
+        // The canonicality invariant: format must be a no-op on the result.
+        assert_format_noop(&f, &format!("{name}: canonical after nested delete"));
+    }
 }
 
 #[test]
