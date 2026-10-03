@@ -80,3 +80,20 @@ Both reported silent-corruption modes DO NOT reproduce (repros in /tmp/repro17):
   nested addressing would remove recurring friction. printf escaping for
   byte-exact content error-prone; content-file + documented exact-bytes
   recipe preferred.
+## T14 (dogfood of tree --name + two-case rule, ring) — 14 edits, 0 refusals, 0 refetches
+- VERDICT: two-case rule sufficient as discovery/address guidance; --name
+  fully removed the python-one-liner step for named nested forms; patch
+  scoping + exact-bytes refusal made the anonymous branch safe.
+- F12 (twice-reported now, T11 F10 + here): whole-form ops (replace/
+  insert/delete) emit empty result.diff while patch shows a unified diff —
+  worker reached for git diff to confirm a replace. Candidate fix: populate
+  the diff for whole-form ops (old form bytes vs new form bytes are both
+  in hand at summary time).
+- F13: delete of the last form at EOF leaves a trailing blank line and
+  format calls it canonical (parinfer does not trim EOF blanks). Cosmetic;
+  related to T10's double-blank seam note.
+- F14 (minor): --name blocks render the matched subtree only, not the
+  enclosing form; depth labels are collection depth, not def-nesting level.
+- Observation: D2 nesting detector did not flag a defn inside an
+  extend-protocol method body (did flag one inside a let) — recorded as
+  data, plausibly intended host scoping.
