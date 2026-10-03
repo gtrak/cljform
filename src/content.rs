@@ -25,6 +25,15 @@ pub struct Prepared {
     pub notes: Vec<String>,
 }
 
+/// Payload of one edit: prepared whole-form content (normalized/repaired) or
+/// a surgical patch scoped to the target's bytes (no repair — patch is
+/// exact-match). Lives with `Prepared` (the base module both `edit` and
+/// `summary` read) so the pipeline/summary boundary stays acyclic.
+pub enum Payload {
+    Prepared(Prepared),
+    Patch { bytes: Vec<u8>, diff: String, noop: bool },
+}
+
 pub enum PrepareError {
     /// Empty or comments-only: almost certainly not what the caller meant.
     Empty,

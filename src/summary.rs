@@ -3,12 +3,14 @@
 
 use std::path::Path;
 
+use crate::cli::Mode;
+use crate::content::Payload;
+use crate::errors::Output;
 use crate::handle;
 use crate::hashutil;
 use crate::invariants;
 use crate::parser;
 use crate::parser::Form;
-use crate::{Mode, Output, Payload};
 
 /// Summary of the file-edge insert (append/prepend, the only target-less
 /// edit modes): what now sits at the edge.

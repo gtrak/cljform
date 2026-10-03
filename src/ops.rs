@@ -1,0 +1,627 @@
+//! Read-side ops (`forms`, `get`, `check`, `materialize`, `tree`, `format`,
+//! `strip`), the shared read/parse helpers, and target/handle resolution
+//! (shared by `get` and the edit pipeline).
+
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+
+use crate::cli::{self, Cli};
+use crate::content;
+use crate::errors::{self, ErrorBody, Fail, Output};
+use crate::format;
+use crate::handle;
+use crate::hashutil;
+use crate::materialize;
+use crate::parser;
+use crate::summary;
+use crate::parser::Form;
+
+/// Read a file, stripping a leading UTF-8 BOM. Returns (bytes, had_bom);
+/// every downstream op works on stripped bytes and the write path re-prepends
+/// the BOM so the on-disk encoding is preserved.
+pub fn read_file(path: &Path) -> Result<(Vec<u8>, bool), Fail> {
+    let raw = std::fs::read(path).map_err(|e| {
+        Fail(
+            errors::exit::IO,
+            ErrorBody::new("io", format!("cannot read {}: {e}", path.display())),
+        )
+    })?;
+    const BOM: &[u8] = b"\xef\xbb\xbf";
+    if raw.starts_with(BOM) {
+        Ok((raw[3..].to_vec(), true))
+    } else {
+        Ok((raw, false))
+    }
+}
+
+pub fn with_bom(bytes: &[u8], had_bom: bool) -> Vec<u8> {
+    if had_bom {
+        let mut out = Vec::with_capacity(bytes.len() + 3);
+        out.extend_from_slice(b"\xef\xbb\xbf");
+        out.extend_from_slice(bytes);
+        out
+    } else {
+        bytes.to_vec()
+    }
+}
+
+pub fn parse_or_fail(bytes: &[u8], what: &str) -> Result<parser::Parsed, Fail> {
+    parser::parse(bytes).map_err(|e| {
+        Fail(
+            errors::exit::PARSE,
+            ErrorBody::new("parse-error", format!("{what} does not parse: {}", e.message))
+                .at(Some(e.line), Some(e.col))
+                .with_hint(
+                    "fix the bracket structure first; cljform never writes to a file that does not parse",
+                ),
+        )
+    })
+}
+
+/// Read a file and parse it, dropping the BOM flag — the read-only
+/// form-table callers (forms, get, check) need only the stripped bytes and
+/// the parsed forms.
+pub fn load_parsed(path: &Path) -> Result<(Vec<u8>, parser::Parsed), Fail> {
+    let (bytes, _bom) = read_file(path)?;
+    let parsed = parse_or_fail(&bytes, "file")?;
+    Ok((bytes, parsed))
+}
+
+/// Require `bytes` to parse (the "file" parse error), discarding the result
+/// — for callers (the tree view) that only need the parse to succeed and
+/// keep the raw bytes.
+pub fn require_parse(bytes: &[u8]) -> Result<(), Fail> {
+    parse_or_fail(bytes, "file").map(|_| ())
+}
+
+/// Read content from --content, --content-file, or stdin.
+pub fn read_content(
+    content: &Option<String>,
+    content_file: &Option<PathBuf>,
+) -> Result<String, Fail> {
+    if let Some(c) = content {
+        return Ok(c.clone());
+    }
+    if let Some(p) = content_file {
+        return std::fs::read_to_string(p).map_err(|e| {
+            Fail(
+                errors::exit::IO,
+                ErrorBody::new(
+                    "io",
+                    format!("cannot read content file {}: {e}", p.display()),
+                ),
+            )
+        });
+    }
+    let mut buf = String::new();
+    std::io::stdin().read_to_string(&mut buf).map_err(|e| {
+        Fail(
+            errors::exit::IO,
+            ErrorBody::new("io", format!("cannot read stdin: {e}"))
+                .with_hint("pass --content or --content-file when stdin is unavailable"),
+        )
+    })?;
+    Ok(buf)
+}
+
+struct Target {
+    form: Form,
+}
+
+/// The `get --name` lookup (SPEC §5): the unique top-level form whose head
+/// defines `name`. Edits target by handle only; this is the read path.
+fn resolve_target(forms: &[Form], name: &str) -> Result<Target, Fail> {
+    let matches: Vec<&Form> = forms
+        .iter()
+        .filter(|f| f.name.as_deref() == Some(name))
+        .collect();
+    match matches.len() {
+        1 => Ok(Target {
+            form: matches[0].clone(),
+        }),
+        0 => {
+            let suggestions = errors::suggestions_for(forms, name);
+            let hint = if suggestions.is_empty() {
+                "no def-like forms carry names in this file".to_string()
+            } else {
+                "pick one of the suggestions, or run tree to list handles".to_string()
+            };
+            Err(Fail(
+                errors::exit::TARGET,
+                ErrorBody::new("form-not-found", format!("no form defines {name:?}"))
+                    .with_hint(hint)
+                    .with_suggestions(suggestions),
+            ))
+        }
+        _ => {
+            let suggestions = matches
+                .iter()
+                .map(|f| errors::Suggestion {
+                    addr: f.addr,
+                    kind: f.kind.clone(),
+                    name: f.name.clone(),
+                    line: f.line,
+                })
+                .collect();
+            Err(Fail(
+                errors::exit::TARGET,
+                ErrorBody::new(
+                    "ambiguous",
+                    format!("{name:?} is defined {} times", matches.len()),
+                )
+                .with_hint("use --handle to pick one (run tree to list handles)")
+                .with_suggestions(suggestions),
+            ))
+        }
+    }
+}
+
+/// Resolve a `tree` handle to its node (SPEC §10.3): content-addressed, so a
+/// moved form still resolves, but a changed or absent one refuses.
+pub fn resolve_handle(bytes: &[u8], h: &str, file: &Path) -> Result<handle::Node, Fail> {
+    if h.len() < 6 {
+        return Err(Fail(
+            errors::exit::USAGE,
+            ErrorBody::new(
+                "usage",
+                format!("--handle must be at least 6 hex characters, got {h:?}"),
+            )
+            .with_hint("run tree to list current handles"),
+        ));
+    }
+    let nodes = handle::collect(bytes);
+    let hits: Vec<usize> = nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(i, n)| n.raw.starts_with(h).then_some(i))
+        .collect();
+    match hits.len() {
+        0 => {
+            // No assigned handle matches. A hand-computed pure content hash —
+            // the blake3 of the form's own bytes — is not a node's `raw` when
+            // that content is duplicated: every copy of a duplicated form gets
+            // a position-folded `raw`. So fall back to matching the raw
+            // *content* hash: a form the user named by its content resolves to
+            // the form(s) carrying that exact content. More than one such form
+            // is ambiguous, never a lying "changed or is gone".
+            let content_hits: Vec<usize> = nodes
+                .iter()
+                .enumerate()
+                .filter_map(|(i, n)| {
+                    blake3::hash(&bytes[n.start_byte..n.end_byte])
+                        .to_hex()
+                        .to_string()
+                        .starts_with(h)
+                        .then_some(i)
+                })
+                .collect();
+            match content_hits.len() {
+                0 => Err(Fail(
+                    errors::exit::TARGET,
+                    ErrorBody::new(
+                        "stale-handle",
+                        format!(
+                            "handle {h:?} does not match any form in {} — the form it names changed or is gone",
+                            file.display()
+                        ),
+                    )
+                    .with_hint("re-run tree to get current handles"),
+                )),
+                1 => resolve_at(&nodes, content_hits[0]),
+                _n => Err(Fail(
+                    errors::exit::TARGET,
+                    ErrorBody::new(
+                        "ambiguous-handle",
+                        ambiguous_handle_message(
+                            h,
+                            &content_hits.iter().map(|&i| &nodes[i]).collect::<Vec<_>>()
+                        )
+                    )
+                    .with_hint("re-run tree and copy a longer prefix"),
+                )),
+            }
+        }
+        1 => resolve_at(&nodes, hits[0]),
+        _n => {
+            Err(Fail(
+                errors::exit::TARGET,
+                ErrorBody::new(
+                    "ambiguous-handle",
+                    ambiguous_handle_message(
+                        h,
+                        &hits.iter().map(|&i| &nodes[i]).collect::<Vec<_>>()
+                    )
+                )
+                .with_hint("re-run tree and copy a longer prefix"),
+            ))
+        }
+    }
+}
+
+/// Clone the node at `idx` and fill its position chain (issue 22: the
+/// collected table stores parent indices, not path strings; only the
+/// resolved edit target carries the full chain, for the post-edit
+/// same-position lookup).
+fn resolve_at(nodes: &[handle::Node], idx: usize) -> Result<handle::Node, Fail> {
+    let mut node = nodes[idx].clone();
+    node.path_chain = handle::chain_of(nodes, idx);
+    Ok(node)
+}
+
+/// The `ambiguous-handle` message: the candidate handles (with their line
+/// ranges), never the internal structural paths — those are not addressable.
+fn ambiguous_handle_message(h: &str, candidates: &[&handle::Node]) -> String {
+    let list: Vec<String> = candidates
+        .iter()
+        .map(|x| format!("{} lines {}–{}", x.handle, x.line[0], x.line[1]))
+        .collect();
+    format!(
+        "handle {h:?} matches {} forms (handles: {list}) — extend the prefix to disambiguate",
+        candidates.len(),
+        list = list.join(", ")
+    )
+}
+
+/// `cljform forms`: the top-level form table (no nesting warnings — those
+/// are `check`'s job).
+pub fn run_forms(file: &Path) -> Result<Output, Fail> {
+    let (bytes, parsed) = load_parsed(file)?;
+    Ok(summary::forms_output("forms", file, &bytes, parsed.forms, vec![]))
+}
+
+/// `cljform get`: print one form — by `--handle` (the node's exact bytes +
+/// metadata) or `--name` (the def-like read lookup, SPEC §5).
+pub fn run_get(file: &Path, name: &Option<String>, handle: &Option<String>) -> Result<Output, Fail> {
+    let (bytes, parsed) = load_parsed(file)?;
+    if let Some(h) = handle {
+        // The read counterpart of the edit resolver (SPEC §5/§10.2):
+        // resolve the node via handle::collect, print its bytes +
+        // metadata. §10.4: a handle copied from the annotated tree
+        // view is the marker span itself; drop the glyphs, keep
+        // the bare handle.
+        let (bare, _extracted) = handle::bare_handle(h);
+        let node = resolve_handle(&bytes, &bare, file)?;
+        let form =
+            String::from_utf8_lossy(&bytes[node.start_byte..node.end_byte]).to_string();
+        let hash = hashutil::file_hash(&bytes[node.start_byte..node.end_byte]);
+        return Ok(
+            Output::ok("get")
+                .file(Some(file.display().to_string()))
+                .file_hash(hashutil::tagged(&hashutil::file_hash(&bytes)))
+                .forms(parsed.forms)
+                .result(serde_json::json!({
+                    "kind": node.kind,
+                    "head": node.head,
+                    "name": node.name,
+                    "line": node.line,
+                    "depth": node.depth,
+                    "handle": node.handle,
+                    "hash": hashutil::tagged(&hash),
+                    "form": form,
+                })),
+        );
+    }
+    let Some(n) = name else {
+        return Err(Fail(
+            errors::exit::USAGE,
+            ErrorBody::new("usage", "no target given: pass --name SYM or --handle H"),
+        ));
+    };
+    let target = resolve_target(&parsed.forms, n)?;
+    let f = &target.form;
+    let text = String::from_utf8_lossy(&bytes[f.start_byte..f.end_byte]).to_string();
+    // The read lookup carries the form's handle for use in an edit
+    // (SPEC §5); null for non-collection forms.
+    let nodes = handle::collect(&bytes);
+    let form_handle = nodes
+        .iter()
+        .find(|n| n.depth == 1 && n.child_idx == f.addr)
+        .map(|n| n.handle.clone());
+    Ok(
+        Output::ok("get")
+            .file(Some(file.display().to_string()))
+            .file_hash(hashutil::tagged(&hashutil::file_hash(&bytes)))
+            .forms(parsed.forms)
+            .result(serde_json::json!({
+                "addr": f.addr,
+                "kind": f.kind,
+                "name": f.name,
+                "line": f.line,
+                "hash": hashutil::tagged(&f.hash),
+                "handle": form_handle,
+                "form": text,
+            })),
+    )
+}
+
+/// `cljform check`: parse + form table + nesting warnings, from a file or
+/// stdin.
+pub fn run_check(file: &Option<PathBuf>) -> Result<Output, Fail> {
+    match file {
+        Some(f) => {
+            let (bytes, parsed) = load_parsed(f)?;
+            let warnings = parsed.warnings;
+            Ok(summary::forms_output("check", f, &bytes, parsed.forms, warnings))
+        }
+        None => {
+            let text = read_content(&None, &None)?;
+            let parsed = parse_or_fail(text.as_bytes(), "stdin content")?;
+            let warnings = parsed.warnings;
+            Ok(
+                Output::ok("check")
+                    .file_hash(hashutil::tagged(&hashutil::file_hash(text.as_bytes())))
+                    .forms(parsed.forms)
+                    .warnings(warnings),
+            )
+        }
+    }
+}
+
+/// `cljform materialize`: infer brackets from indentation (candidate only;
+/// never writes).
+pub fn run_materialize(
+    content: &Option<String>,
+    content_file: &Option<PathBuf>,
+) -> Result<Output, Fail> {
+    let raw = read_content(content, content_file)?;
+    // Run indent mode on the caller's REAL draft: `prepare` would
+    // repair the draft first and mask the very diff this op exists
+    // to show (a pre-repaired draft always looks like a no-op).
+    let (draft, mut notes, truncated_fence) = content::normalize_draft(&raw);
+    if draft.is_empty() {
+        return Err(Fail(
+            errors::exit::PARSE,
+            ErrorBody::new("materialize-error", "draft is empty"),
+        ));
+    }
+    let candidate = materialize::indent_mode(&draft)
+        .map_err(|e| Fail(errors::exit::PARSE, errors::positional_body("materialize-error", e.line, e.col, e.message)))?;
+    let diff = materialize::unified_diff(&draft, &candidate, "draft", "candidate");
+    if truncated_fence {
+        notes.push("draft began with a markdown fence that is never closed — if you did not mean this, the paste may be truncated".to_string());
+    }
+    let inferred = candidate != draft;
+    let draft_parses = parser::parse(draft.as_bytes()).is_ok();
+    let note = if inferred {
+        // Inference must yield something that actually parses; a bad
+        // candidate is worse than none.
+        if parser::parse(candidate.as_bytes()).is_err() {
+            return Err(Fail(
+                errors::exit::PARSE,
+                ErrorBody::new(
+                    "materialize-error",
+                    "indent inference produced a candidate that does not parse; refusing",
+                )
+                .with_hint(
+                    "fix the draft's explicit structure, or add the missing brackets by hand",
+                ),
+            ));
+        }
+        notes.push("brackets inferred from indentation; verify nesting before use".to_string());
+        "brackets inferred from indentation; verify nesting before use"
+    } else if draft_parses {
+        "draft already parses; nothing to infer (cljform closes brackets implied by indentation, but does not invent missing openers)"
+    } else {
+        "no change inferred — cljform closes brackets implied by indentation but does not invent missing openers; add the open brackets and retry"
+    };
+    Ok(
+        Output::ok("materialize")
+            .result(serde_json::json!({
+                "candidate": candidate,
+                "diff": diff,
+                "note": note,
+            }))
+            .notes(notes),
+    )
+}
+
+/// `cljform tree`: the annotated form view (raw `⟦handle⟧` text) or the node
+/// table with --json.
+pub fn run_tree(cli: &Cli, file: &Path, depth: &Option<String>, full: &bool) -> Result<Output, Fail> {
+    let (bytes, had_bom) = read_file(file)?;
+    // Same parse the resolver uses: unparseable files get no view.
+    require_parse(&bytes)?;
+    let nodes = handle::collect(&bytes);
+    let d = if *full {
+        handle::Depth::All
+    } else {
+        match depth {
+            Some(s) if s.eq_ignore_ascii_case("all") => handle::Depth::All,
+            Some(s) => match s.parse::<usize>() {
+                Ok(n) => handle::Depth::Levels(n),
+                Err(_) => {
+                    return Err(Fail(
+                        errors::exit::USAGE,
+                        ErrorBody::new(
+                            "usage",
+                            format!("--depth expects a number or 'all', got {s:?}"),
+                        ),
+                    ))
+                }
+            },
+            None => handle::Depth::Heuristic,
+        }
+    };
+    let human_mode = cli.human || (!cli.json && cli::atty_stdout());
+    if human_mode {
+        let annotated = handle::annotate(&bytes, d).map_err(|_| {
+            Fail(
+                errors::exit::PARSE,
+                ErrorBody::new(
+                    "annotate-conflict",
+                    format!(
+                        "the source already contains marker glyphs ({}/{}) and the view cannot be stripped losslessly",
+                        handle::MARKER_OPEN, handle::MARKER_CLOSE
+                    ),
+                )
+                .with_hint("use --json to list the nodes without markers"),
+            )
+        })?;
+        // Re-prepend the BOM so `strip` recovers the exact on-disk
+        // bytes of BOM-prefixed files.
+        let mut text = if had_bom {
+            String::from('\u{feff}')
+        } else {
+            String::new()
+        };
+        text.push_str(&annotated);
+        return Ok(
+            Output::ok("tree")
+                .file(Some(file.display().to_string()))
+                .file_hash(hashutil::tagged(&hashutil::file_hash(&bytes)))
+                .result(serde_json::json!({ "text": text })),
+        );
+    }
+    Ok(
+        Output::ok("tree")
+            .file(Some(file.display().to_string()))
+            .file_hash(hashutil::tagged(&hashutil::file_hash(&bytes)))
+            .result(serde_json::json!({ "nodes": nodes })),
+    )
+}
+
+/// `cljform format [file]` (issue 06): parinfer paren-mode reindent.
+/// Candidate-first — mirrors `materialize`'s result shape
+/// (`candidate`, `diff`, `note`) and never writes. The candidate must
+/// re-parse clean and pass the token gate (whitespace + closer positions
+/// only, `format_preserves_tokens`, §10.5); anything less is a
+/// `format-error` (exit 1) and is never emitted.
+pub fn run_format(file: &Option<PathBuf>) -> Result<Output, Fail> {
+    let (raw, file_path) = match file {
+        Some(p) => {
+            let (bytes, _bom) = read_file(p)?;
+            let text = String::from_utf8(bytes).map_err(|e| {
+                Fail(
+                    errors::exit::IO,
+                    ErrorBody::new("io", format!("{} is not valid UTF-8: {e}", p.display())),
+                )
+            })?;
+            (text, Some(p.display().to_string()))
+        }
+        None => (read_content(&None, &None)?, None),
+    };
+    if raw.trim().is_empty() {
+        return Err(Fail(errors::exit::PARSE, ErrorBody::new("format-error", "input is empty")));
+    }
+    // The input must parse clean: format reindents code, it does not repair
+    // structure (that is `materialize`'s job).
+    parse_or_fail(raw.as_bytes(), "input")?;
+    let candidate = format::format_paren(&raw)
+        .map_err(|e| Fail(errors::exit::PARSE, errors::positional_body("format-error", e.line, e.col, e.message)))?;
+    // Verification gates: re-parse clean + the token gate (SPEC §10.5):
+    // only whitespace and closing-delimiter positions may change, and a
+    // lifted closer may reorder against comment bytes (comments are not
+    // tokens) without tripping it.
+    if let Err(e) = parser::parse(candidate.as_bytes()) {
+        return Err(Fail(
+            errors::exit::PARSE,
+            errors::positional_body("format-error", e.line, e.col, format!("candidate does not parse: {}", e.message))
+                .with_hint("format must never change structure; report this as a cljform bug"),
+        ));
+    }
+    if !format::format_preserves_tokens(&raw, &candidate) {
+        return Err(Fail(
+            errors::exit::PARSE,
+            ErrorBody::new(
+                "format-error",
+                "candidate's tokens differ from the input (or a closing delimiter moved later); refusing to emit it",
+            )
+            .with_hint("report this as a cljform bug"),
+        ));
+    }
+    let diff = materialize::unified_diff(&raw, &candidate, "input", "candidate");
+    let note = if candidate == raw {
+        "already formatted (parinfer paren-mode); candidate is unchanged — not written"
+    } else {
+        "candidate reformatted to parinfer paren-mode indentation; token stream verified unchanged — not written"
+    };
+    Ok(
+        Output::ok("format")
+            .file(file_path)
+            .file_hash(hashutil::tagged(&hashutil::file_hash(raw.as_bytes())))
+            .result(serde_json::json!({
+                "candidate": candidate,
+                "diff": diff,
+                "note": note,
+            })),
+    )
+}
+
+/// `cljform strip [file]`: read the file (or stdin), delete every
+/// `⟦...⟧` span, and write the raw bytes to stdout (exit 0, no envelope).
+/// Read errors use the normal io error (exit 4).
+pub fn run_strip(file: &Option<PathBuf>, json: bool) -> ExitCode {
+    use std::io::Write;
+
+    let text: Result<String, Fail> = match file {
+        Some(p) => std::fs::read_to_string(p).map_err(|e| {
+            Fail(
+                errors::exit::IO,
+                ErrorBody::new("io", format!("cannot read {}: {e}", p.display())),
+            )
+        }),
+        None => {
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .map_err(|e| {
+                    Fail(
+                        errors::exit::IO,
+                        ErrorBody::new("io", format!("cannot read stdin: {e}")),
+                    )
+                })
+                .map(|_| buf)
+        }
+    };
+    match text {
+        Ok(t) => {
+            let out = handle::strip(&t);
+            let mut stdout = std::io::stdout().lock();
+            match stdout.write_all(out.as_bytes()).and_then(|_| stdout.flush()) {
+                Ok(()) => ExitCode::from(errors::exit::OK),
+                Err(e) => cli::fail_envelope(
+                    errors::exit::IO,
+                    ErrorBody::new("io", format!("write failed: {e}")),
+                    "strip",
+                    json,
+                ),
+            }
+        }
+        Err(Fail(exit, ebody)) => cli::fail_envelope(exit, ebody, "strip", json),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ambiguous_handle_message_lists_handles_not_paths() {
+        // The dotted structural path is internal; the message must name the
+        // candidate handles (with line ranges), never the paths.
+        let mk = |handle: &str, line: (usize, usize)| handle::Node {
+            parent: Some(0),
+            child_idx: 5,
+            top_level: 9,
+            path_chain: vec![9, 2, 2, 5],
+            kind: "list_lit".into(),
+            head: Some("def".into()),
+            name: Some("x".into()),
+            line: [line.0, line.1],
+            handle: handle.into(),
+            raw: "0".repeat(64),
+            start_byte: 0,
+            end_byte: 0,
+            depth: 1,
+        };
+        let a = mk("a3f9c1", (4, 4));
+        let b = mk("a3f9d2", (8, 8));
+        let msg = ambiguous_handle_message("a3f9", &[&a, &b]);
+        assert!(msg.contains("a3f9c1 lines 4\u{2013}4"), "lists first handle + range: {msg}");
+        assert!(msg.contains("a3f9d2 lines 8\u{2013}8"), "lists second handle + range: {msg}");
+        assert!(msg.contains("handles:"), "labels the candidate handles: {msg}");
+        assert!(!msg.contains("9.2.2.5"), "no internal dotted path leaks: {msg}");
+        assert!(!msg.contains("paths:"), "no path list: {msg}");
+    }
+}

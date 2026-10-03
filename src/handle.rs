@@ -200,14 +200,10 @@ fn collect_inner(bytes: &[u8]) -> Vec<Node> {
     };
     let root = tree.root_node();
     let mut nodes: Vec<Node> = Vec::new();
-    let mut cursor = root.walk();
     let mut form_idx = 0u32;
-    for child in root.children(&mut cursor) {
-        // Same children `parser::build_table` treats as forms: comments and
-        // discards are gaps, never addressable.
-        if child.kind() == "comment" || child.kind() == "dis_expr" {
-            continue;
-        }
+    // The same children `parser::build_table` treats as forms — the shared
+    // skip rule (comments and discards are gaps, never addressable).
+    parser::for_each_top_form(root, |child| {
         form_idx += 1;
         // Def var names are reported for top-level forms only.
         let name = parser::head_symbol(child, bytes)
@@ -222,7 +218,7 @@ fn collect_inner(bytes: &[u8]) -> Vec<Node> {
             name,
             &mut nodes,
         );
-    }
+    });
     nodes
 }
 

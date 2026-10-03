@@ -313,15 +313,25 @@ fn contains_counts(node: Node, bytes: &[u8]) -> BTreeMap<String, u64> {
     counts
 }
 
-fn build_table(root: &Node, bytes: &[u8]) -> Vec<Form> {
-    let mut forms = Vec::new();
+/// Visit every addressable top-level form: the root's direct children in
+/// document order, skipping comments and `#_` discards (those are gaps
+/// between forms, never addressable — their bytes are preserved by the
+/// splice model). Shared by the form table (`build_table`) and the handle
+/// table (`handle::collect_inner`) so the "what counts as a top-level form"
+/// rule has exactly one home.
+pub fn for_each_top_form<'a>(root: Node<'a>, mut f: impl FnMut(Node<'a>)) {
     let mut cursor = root.walk();
     for child in root.children(&mut cursor) {
-        // Comments and #_ discards are not forms; their bytes live in the
-        // gaps between forms and are preserved by the splice model.
         if child.kind() == "comment" || child.kind() == "dis_expr" {
             continue;
         }
+        f(child);
+    }
+}
+
+fn build_table(root: &Node, bytes: &[u8]) -> Vec<Form> {
+    let mut forms = Vec::new();
+    for_each_top_form(*root, |child| {
         let head = head_symbol(child, bytes);
         let kind = head.clone().unwrap_or_else(|| "expr".to_string());
         let name = head.as_deref().and_then(|h| def_name(child, h, bytes));
@@ -340,7 +350,7 @@ fn build_table(root: &Node, bytes: &[u8]) -> Vec<Form> {
             start_byte: child.start_byte(),
             end_byte: child.end_byte(),
         });
-    }
+    });
     forms
 }
 
