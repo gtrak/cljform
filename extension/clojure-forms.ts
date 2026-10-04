@@ -45,6 +45,19 @@ interface DetectorWarning {
 	message: string;
 }
 
+/** A broken-file diagnostic (issue 31): an error.diagnostics row. */
+type CljDiagnostic = {
+	kind: "parse-error";
+	line: [number, number];
+	message: string;
+} | {
+	kind: "conflict-region";
+	head?: [number, number] | null;
+	base?: [number, number] | null;
+	incoming?: [number, number] | null;
+	malformed?: boolean;
+};
+
 interface CljformOutput {
 	ok: boolean;
 	op: string;
@@ -71,6 +84,8 @@ interface CljformOutput {
 		message: string;
 		hint?: string;
 		suggestions?: { addr: number; kind: string; name: string | null; line: [number, number] }[];
+			/** Broken-file diagnostics (issue 31): conflict regions + parse-error spans. */
+			diagnostics?: CljDiagnostic[];
 	};
 }
 
@@ -138,6 +153,42 @@ function formTableText(forms: FormRow[]): string {
 
 function warningsText(ws: DetectorWarning[]): string[] {
 	return ws.map((w) => `WARNING ${w.id}: ${w.message}`);
+}
+
+/** `line a` or `lines a–b`. */
+function lineSpan(sp: [number, number]): string {
+	return sp[0] === sp[1] ? `line ${sp[0]}` : `lines ${sp[0]}–${sp[1]}`;
+}
+
+/**
+ * One human line per broken-file diagnostic (issue 31); mirrors the CLI's
+ * human_line: parse-error rows name their span + message, conflict rows
+ * name the full region span plus the recorded per-side spans.
+ */
+function diagnosticLine(d: CljDiagnostic): string {
+	if (d.kind === "parse-error") {
+		return `parse error ${lineSpan(d.line)}: ${d.message}`;
+	}
+	const NAMES = ["head", "base", "incoming"];
+	const sides = [d.head, d.base, d.incoming];
+	const parts: [number, number][] = [];
+	for (const sp of sides) {
+		if (Array.isArray(sp)) parts.push(sp);
+	}
+	if (parts.length === 0) {
+		return `conflict region${d.malformed ? " (malformed)" : ""}`;
+	}
+	let lo = Infinity;
+	let hi = 0;
+	for (const [a, b] of parts) {
+		lo = Math.min(lo, a);
+		hi = Math.max(hi, b);
+	}
+	const label = sides
+		.map((sp, i) => (Array.isArray(sp) ? `${NAMES[i]} ${lineSpan(sp)}` : null))
+		.filter((x): x is string => x !== null)
+		.join(" · ");
+	return `conflict region${d.malformed ? " (malformed)" : ""} ${lineSpan([lo, hi])} (${label})`;
 }
 
 function errorText(out: CljformOutput): string {
@@ -306,6 +357,7 @@ export default function ClojureForms(pi: ExtensionAPI) {
 			"Single-line forms usually have no handle: address them by text (oldText/newText patch) inside their parent form.",
 			"A stale-handle error means the form changed — re-run clj_tree, never retry the old handle.",
 			"On large files, page with startLine/endLine: windows expand to complete forms, and the echo tells you the effective span (real file lines).",
+			"Broken file (git conflict markers or broken brackets): the normal ops refuse (conflict-markers / parse-error). Call with recover: true — it shows the verbatim source, each conflict region's per-side line spans, the parse-error spans, and the intact top-level forms. Resolve the conflict with a TEXT edit (no handles are shown — the write path stays gated); once the file parses, cljform resumes normally.",
 		],
 		parameters: Type.Object({
 			path: Type.String({ description: "Path to the .clj/.cljs/.cljc/.edn file" }),
@@ -333,6 +385,12 @@ export default function ClojureForms(pi: ExtensionAPI) {
 						"Last line of the viewing window (1-based, inclusive; default EOF). See startLine",
 				}),
 			),
+			recover: Type.Optional(
+				Type.Boolean({
+					description:
+						"Recovery view for a BROKEN file (git conflict markers or parse errors): the verbatim source, each conflict region with its per-side line spans, the parse-error spans, and the intact top-level forms. No handles — cljform's write path stays gated until the file parses. On a healthy file this is just the normal tree view",
+				}),
+			),
 			json: Type.Optional(
 				Type.Boolean({
 					description:
@@ -355,6 +413,9 @@ export default function ClojureForms(pi: ExtensionAPI) {
 			if (params.endLine !== undefined) {
 				args.push("--end-line", String(params.endLine));
 			}
+			if (params.recover) {
+				args.push("--recover");
+			}
 			const run = await runClj(args, 15_000);
 			// Human path: `tree --human` prints the annotated source directly — not a
 			// JSON envelope. On success (exit 0) pass the stdout text straight
@@ -369,6 +430,30 @@ export default function ClojureForms(pi: ExtensionAPI) {
 			// JSON path: the CLI emits a JSON envelope (tree --json).
 			const out = run.out;
 			const r = out.result ?? {};
+			if (Array.isArray(r.diagnostics)) {
+				// The --recover view on a broken file (issue 31): diagnostics +
+				// intact-form labels, no handles (the write path is gated until
+				// the file parses).
+				const diags = r.diagnostics as CljDiagnostic[];
+				const lines = [
+					`${params.path}: file does not parse — ${diags.length} diagnostic(s); handles appear when the file is repaired`,
+					...diags.map(diagnosticLine),
+					...((r.forms as string[]) ?? []).map((f) => `intact: ${f}`),
+				];
+				if (r.window) {
+					const req = r.window.requested ?? [];
+					const eff = r.window.effective ?? [];
+					lines.push(
+						eff.length === 2
+							? `window: requested lines ${req[0]}–${req[1]}, effective lines ${eff[0]}–${eff[1]}`
+							: `window: requested lines ${req[0]}–${req[1]}`,
+					);
+				}
+				return {
+					content: [{ type: "text", text: lines.join("\n") }],
+					details: { diagnostics: diags, forms: r.forms, window: r.window },
+				};
+			}
 			const nodes: TreeNode[] = (r.nodes as TreeNode[]) ?? [];
 			const lines = [
 				`${params.path}: ${nodes.length} nodes · ${out.file_hash?.slice(0, 19)}…`,
@@ -703,6 +788,11 @@ export default function ClojureForms(pi: ExtensionAPI) {
 			report.push(
 				`BLOCKING: the file no longer parses — ${e.message}${e.line ? ` (line ${e.line}, col ${e.col ?? 1})` : ""}`,
 			);
+			// issue 31: one line per diagnostic (conflict regions with per-side
+			// spans, parse-error spans) instead of only the single BLOCKING
+			// line — progressive multi-conflict feedback: after each built-in
+			// edit the hook states the remaining regions.
+			for (const d of e.diagnostics ?? []) report.push(`  ${diagnosticLine(d)}`);
 			report.push("Fix the bracket structure immediately; nothing else about this edit is verified.");
 		} else {
 			const prev = cache.get(abs);
