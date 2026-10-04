@@ -115,3 +115,11 @@ Both reported silent-corruption modes DO NOT reproduce (repros in /tmp/repro17):
 - F18 window expansion math: a 100-line window rendered 252 lines
   (correct complete-forms semantics; document that page-of-N != N lines
   of output; step from the EFFECTIVE end when paging).
+- F15 RESOLUTION (user question, verified): comments ARE insertable via
+  patch in both placements — inside a form (oldText anchored at an inner
+  line) and between top-level forms (patch the neighbor with newText =
+  ";; note\n" + the form's first bytes; the comment becomes seam bytes,
+  summary reports the def's own span). The insert-mode refusal is coherent:
+  insert builds a forms table and a comment is not a form (no handle to
+  return). Guidance line if we want it: "comment -> patch the anchor form,
+  include the comment in new-text; insert modes splice forms only."
