@@ -345,7 +345,18 @@ pub fn conflict_fail(regions: &[Diagnostic]) -> Fail {
         .iter()
         .filter(|d| matches!(d, Diagnostic::ConflictRegion { .. }))
         .collect();
-    let list: Vec<String> = regions.iter().map(|d| lr(&d.span())).collect();
+    // The plan's exact gate-message shape: plain hyphens, every region.
+    let list: Vec<String> = regions
+        .iter()
+        .map(|d| {
+            let (a, b) = d.span();
+            if a == b {
+                a.to_string()
+            } else {
+                format!("{a}-{b}")
+            }
+        })
+        .collect();
     Fail(
         errors::exit::PARSE,
         ErrorBody::new(
@@ -867,7 +878,7 @@ mod tests {
         let fail = conflict_fail(&regions);
         assert_eq!(fail.0, errors::exit::PARSE);
         assert_eq!(fail.1.code, "conflict-markers");
-        assert_eq!(fail.1.message, "2 conflict region(s) (lines 1–5, 7–11)");
+        assert_eq!(fail.1.message, "2 conflict region(s) (lines 1-5, 7-11)");
         assert_eq!(
             fail.1.hint.as_deref(),
             Some("resolve the conflict(s) with a text edit; cljform resumes when the file parses")

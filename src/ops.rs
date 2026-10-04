@@ -7,6 +7,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use crate::broken;
 use crate::cli::{self, Cli};
 use crate::content;
 use crate::errors::{self, ErrorBody, Fail, Output};
@@ -48,6 +49,17 @@ pub fn with_bom(bytes: &[u8], had_bom: bool) -> Vec<u8> {
 }
 
 pub fn parse_or_fail(bytes: &[u8], what: &str) -> Result<parser::Parsed, Fail> {
+    // issue 31: layered diagnostics, per the owner. Conflict markers gate
+    // BEFORE the parse — tree-sitter reads `<<<<<<<` as a legal symbol, so
+    // a conflicted file "parses" clean (the safety hole this closes: today
+    // check says ok:true on a conflicted file and edits succeed). Markers
+    // win over parse errors: a file that is both conflicted and bracket-
+    // broken reports conflict-markers, and the parse-error layer only
+    // appears once the markers are resolved (a text edit).
+    let regions = broken::scan_conflicts(bytes);
+    if !regions.is_empty() {
+        return Err(broken::conflict_fail(&regions));
+    }
     parser::parse(bytes).map_err(|e| {
         Fail(
             errors::exit::PARSE,
@@ -55,7 +67,8 @@ pub fn parse_or_fail(bytes: &[u8], what: &str) -> Result<parser::Parsed, Fail> {
                 .at(Some(e.line), Some(e.col))
                 .with_hint(
                     "fix the bracket structure first; cljform never writes to a file that does not parse",
-                ),
+                )
+                .with_diagnostics(broken::collect_parse_diagnostics(&e)),
         )
     })
 }
@@ -995,6 +1008,20 @@ pub fn run_strip(file: &Option<PathBuf>, json: bool) -> ExitCode {
     };
     match text {
         Ok(t) => {
+            // issue 31: conflict markers gate the strip filter too — a
+            // conflicted file's marker lines would survive the filter and
+            // masquerade as content. Parse errors alone do NOT gate it: the
+            // filter emits bytes, not code, and stays a pure filter on
+            // other broken input.
+            let regions = crate::broken::scan_conflicts(t.as_bytes());
+            if !regions.is_empty() {
+                return cli::fail_envelope(
+                    errors::exit::PARSE,
+                    crate::broken::conflict_fail(&regions).1,
+                    "strip",
+                    json,
+                );
+            }
             let out = handle::strip(&t);
             let mut stdout = std::io::stdout().lock();
             match stdout.write_all(out.as_bytes()).and_then(|_| stdout.flush()) {
