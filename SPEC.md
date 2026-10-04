@@ -549,6 +549,16 @@ collection delimiter:
   refuse to annotate (`annotate-conflict`, exit 1) and fall back to `--json`.
 - Markers go only at AST delimiter positions, never inside strings, regexes,
   comments, or char literals.
+- **Top-level atom literals (no opening delimiter)** — a top-level char /
+  string / number / keyword / symbol / regex / bool literal, or a
+  quote/unquote wrapper around one (`'1`, `~1`), has no opening delimiter to
+  anchor the handle. It is rendered as an *opaque leaf*: its bytes are emitted
+  verbatim with `⟦handle⟧` immediately **before** them (no delimiter
+  bookkeeping). This is decided per node from the node's own bytes (a
+  `NodeShape::OpaqueLeaf`), so the delimiter lookup is unreachable for leaves.
+  issue 29: such a form used to panic the human path (rc 101) while `--json`
+  stayed fine; nested occurrences (a char/string inside a collection) are
+  content, not nodes, and are untouched.
 - `tree --json` emits the flat node table (`kind`, `head`, `name`,
   `line`, `depth`, `handle`; null `head`/`name` omitted; the structural
   `path`, the hash, and the byte offsets are internal and not serialized)
