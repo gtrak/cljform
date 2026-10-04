@@ -294,6 +294,42 @@ pub(crate) fn pull_displaced_closers(bytes: &[u8], new_bytes: &mut Vec<u8>, star
     new_bytes.splice(cut..stop, closers.iter().copied());
     Some((cut, end_line_end))
 }
+/// The number of trailing end-of-line units in `bytes` — a `\n` or a
+/// `\r\n`, counted from the end of the slice. Issue 27 (F13): the EOF
+/// delete seam compares these counts so a delete of the last form never
+/// leaves more trailing blank lines at EOF than the input had.
+pub(crate) fn trailing_eol_units(bytes: &[u8]) -> usize {
+    let mut i = bytes.len();
+    let mut n = 0usize;
+    while i > 0 && bytes[i - 1] == b'\n' {
+        i -= 1;
+        if i > 0 && bytes[i - 1] == b'\r' {
+            i -= 1;
+        }
+        n += 1;
+    }
+    n
+}
+/// Byte offset of the start of the last `units` end-of-line units of
+/// `bytes` (0-based; the callers derive `units` from the same slice
+/// first, so the run is always long enough). Sibling of
+/// [`trailing_eol_units`]: trimming the run means deleting
+/// `bytes[trailing_eol_cut(b, n)..]`.
+pub(crate) fn trailing_eol_cut(bytes: &[u8], units: usize) -> usize {
+    let mut i = bytes.len();
+    for _ in 0..units {
+        i -= 1; // the unit's trailing `\n`
+        if i > 0 && bytes[i - 1] == b'\r' {
+            i -= 1;
+        }
+    }
+    i
+}
+/// The byte length of the last `units` end-of-line units of `bytes`
+/// (`\n` or `\r\n`, see [`trailing_eol_units`]).
+pub(crate) fn trailing_eol_units_len(bytes: &[u8], units: usize) -> usize {
+    bytes.len() - trailing_eol_cut(bytes, units)
+}
 /// Drop trailing whitespace-only lines from `text` (issue 14 R3, the seam
 /// guarantee): the base-shifted content must end on a real content line so
 /// the closers displaced by the splice land on it, not on their own padded

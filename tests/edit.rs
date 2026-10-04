@@ -5,7 +5,7 @@ mod common;
 
 use common::{
     assert_untouched, check_ok, edit_args, fixture, fresh, forms, handle_at_full, handle_of,
-    run_json, FRESH_FIXTURE, HEDIT_FIXTURE,
+    run_bytes, run_json, FRESH_FIXTURE, HEDIT_FIXTURE,
 };
 
 #[test]
@@ -392,6 +392,291 @@ fn patch_mode_line_growth_shifts_later_forms() {
     assert_eq!(rows[2]["hash"], after_hash, "shifted form kept its bytes");
 }
 
+// ─── whole-form result.diff (issue 27 F12) ──────────────────────────────
+
+#[test]
+fn whole_form_ops_carry_changed_region_diff() {
+    // Replace: a non-empty unified diff over the target form's bytes,
+    // patch-style headers + hunk, showing the old and new form.
+    let f = fixture("diff-replace.clj", b"(ns d)\n\n(def a 1)\n\n(def b 2)\n");
+    let h = handle_of(&f, "a");
+    let (code, d, err) = run_json(
+        &[
+            "edit",
+            &f,
+            "--handle",
+            &h,
+            "--content",
+            "(def a 100)",
+            "--json",
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "{d} {err}");
+    let diff = d["result"]["diff"].as_str().unwrap();
+    assert!(diff.starts_with("--- before\n+++ after\n"), "patch-shaped headers: {diff}");
+    assert!(diff.contains("@@ -"), "a hunk: {diff}");
+    assert!(diff.contains("-(def a 1)"), "old form bytes: {diff}");
+    assert!(diff.contains("+(def a 100)"), "new form bytes: {diff}");
+
+    // Insert-after: the diff is non-empty and names the inserted form.
+    let f = fixture("diff-insert.clj", b"(def a 1)\n\n(def b 2)\n");
+    let h = handle_of(&f, "a");
+    let (code, d, err) = run_json(
+        &[
+            "edit",
+            &f,
+            "--handle",
+            &h,
+            "--mode",
+            "insert-after",
+            "--content",
+            "(defn g [x] x)",
+            "--json",
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "{d} {err}");
+    let diff = d["result"]["diff"].as_str().unwrap();
+    assert!(diff.starts_with("--- before\n+++ after\n"), "patch-shaped headers: {diff}");
+    assert!(diff.contains("+(defn g [x] x)"), "inserted form bytes: {diff}");
+
+    // Delete: the diff is non-empty and shows the removed form.
+    let f = fixture("diff-delete.clj", b"(def a 1)\n\n(def b 2)\n");
+    let h = handle_of(&f, "b");
+    let (code, d, err) = run_json(
+        &[
+            "edit",
+            &f,
+            "--handle",
+            &h,
+            "--mode",
+            "delete",
+            "--json",
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "{d} {err}");
+    let diff = d["result"]["diff"].as_str().unwrap();
+    assert!(diff.starts_with("--- before\n+++ after\n"), "patch-shaped headers: {diff}");
+    assert!(diff.contains("-(def b 2)"), "deleted form bytes: {diff}");
+
+    // Append/prepend: file-edge inserts carry their diff too.
+    let f = fixture("diff-append.clj", b"(def a 1)\n");
+    let (code, d, err) = run_json(
+        &[
+            "edit",
+            &f,
+            "--mode",
+            "append",
+            "--content",
+            "(def appended 1)",
+            "--json",
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "{d} {err}");
+    let diff = d["result"]["diff"].as_str().unwrap();
+    assert!(diff.contains("+(def appended 1)"), "appended form bytes: {diff}");
+
+    let f = fixture("diff-prepend.clj", b"(def a 1)\n");
+    let (code, d, err) = run_json(
+        &[
+            "edit",
+            &f,
+            "--mode",
+            "prepend",
+            "--content",
+            "(def prepended 1)",
+            "--json",
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "{d} {err}");
+    let diff = d["result"]["diff"].as_str().unwrap();
+    assert!(diff.contains("+(def prepended 1)"), "prepended form bytes: {diff}");
+}
+
+#[test]
+fn whole_form_no_ops_keep_empty_diff() {
+    // No-op replace: file bytes unchanged -> empty diff (issue 27 F12).
+    let f = fixture("diff-noop-replace.clj", b"(def a 1)\n");
+    let h = handle_of(&f, "1");
+    let (code, d, err) = run_json(
+        &[
+            "edit",
+            &f,
+            "--handle",
+            &h,
+            "--content",
+            "(def a 1)",
+            "--json",
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "{d} {err}");
+    assert_eq!(d["result"]["diff"], serde_json::json!(""), "no-op replace: {d}");
+    assert!(d["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|n| n.as_str().unwrap_or("").contains("no-op")));
+
+    // No-op patch: unchanged empty-diff behavior (issue 27 F12).
+    let f = fixture(
+        "diff-noop-patch.clj",
+        b"(ns p)\n\n(defn f [x]\n  (h x))\n",
+    );
+    let h = handle_of(&f, "f");
+    let (code, d, err) = run_json(
+        &[
+            "edit",
+            &f,
+            "--handle",
+            &h,
+            "--mode",
+            "patch",
+            "--old-text",
+            "(h x)",
+            "--new-text",
+            "(h x)",
+            "--json",
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "{d} {err}");
+    assert_eq!(d["result"]["diff"], serde_json::json!(""), "no-op patch: {d}");
+}
+
+#[test]
+fn whole_form_ops_show_diff_in_human_output() {
+    // Human output matches patch parity (issue 27 F12): the summary line
+    // and forms table stay as-is; the diff block rides underneath.
+    let f = fixture("diff-human.clj", b"(ns d)\n\n(def a 1)\n\n(def b 2)\n");
+    let h = handle_of(&f, "a");
+    let (code, out, err) = run_bytes(
+        &[
+            "edit",
+            &f,
+            "--handle",
+            &h,
+            "--content",
+            "(def a 7)",
+            "--human",
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "{out:?} {err}");
+    let out = String::from_utf8(out).unwrap();
+    assert!(out.contains("--- before"), "diff shown like patch: {out}");
+    assert!(out.contains("-(def a 1)"), "old form in the diff: {out}");
+    assert!(out.contains("+(def a 7)"), "new form in the diff: {out}");
+}
+
+// ─── EOF delete seam (issue 27 F13) ──────────────────────────────────────
+
+#[test]
+fn delete_last_form_keeps_trailing_newline_convention() {
+    // Deleting the last form must not leave a trailing blank at EOF, and
+    // the file's trailing-newline convention is preserved.
+    struct Case {
+        name: &'static str,
+        src: &'static [u8],
+        exact: &'static str,
+    }
+    let cases = vec![
+        Case {
+            // LF + trailing newline: exactly one \n survives.
+            name: "lf-trailing",
+            src: b"(def a 1)\n\n(def b 2)\n",
+            exact: "(def a 1)\n",
+        },
+        Case {
+            // LF, no trailing newline: none survives.
+            name: "lf-no-trailing",
+            src: b"(def a 1)\n\n(def b 2)",
+            exact: "(def a 1)",
+        },
+        Case {
+            // CRLF: exactly one \r\n survives.
+            name: "crlf",
+            src: b"(def a 1)\r\n\r\n(def b 2)\r\n",
+            exact: "(def a 1)\r\n",
+        },
+        Case {
+            // No separator blank line before the last form.
+            name: "no-separator",
+            src: b"(def a 1)\n(def b 2)\n",
+            exact: "(def a 1)\n",
+        },
+        Case {
+            // Two forms on one line at EOF, no trailing newline.
+            name: "same-line",
+            src: b"(def a 1) (def b 2)",
+            exact: "(def a 1) ",
+        },
+    ];
+    for c in &cases {
+        let name = c.name;
+        let f = fixture(&format!("eol-{name}.clj"), c.src);
+        let h = handle_of(&f, "b");
+        let (code, d, err) = run_json(
+            &[
+                "edit",
+                &f,
+                "--handle",
+                &h,
+                "--mode",
+                "delete",
+                "--json",
+            ],
+            None,
+        );
+        assert_eq!(code, 0, "{name}: {d} {err}");
+        let text = std::fs::read_to_string(&f).unwrap();
+        assert_eq!(text, c.exact, "{name}: {text:?}");
+        // The result is still format-canonical (the T14 complaint: a
+        // trailing blank the format pass would call canonical).
+        let (_cc, fmt, _e) = run_json(&["format", &f, "--json"], None);
+        assert_eq!(
+            fmt["result"]["candidate"],
+            serde_json::json!(&text),
+            "{name}: format must agree the file is clean"
+        );
+    }
+}
+
+#[test]
+fn delete_non_last_form_keeps_interior_blank_behavior() {
+    // Only the EOF delete is trimmed (issue 27 F13): an interior delete
+    // keeps its existing seam behavior byte-for-byte — the blank-line
+    // runs around the gap are exactly what the old build wrote.
+    let f = fixture(
+        "eol-interior.clj",
+        b"(def a 1)\n\n;; keep\n(def mid 9)\n\n(def b 2)\n",
+    );
+    let h = handle_of(&f, "mid");
+    let (code, d, err) = run_json(
+        &[
+            "edit",
+            &f,
+            "--handle",
+            &h,
+            "--mode",
+            "delete",
+            "--json",
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "{d} {err}");
+    assert_eq!(
+        std::fs::read_to_string(&f).unwrap(),
+        "(def a 1)\n\n;; keep\n\n\n(def b 2)\n",
+        "interior delete seam unchanged"
+    );
+    check_ok(&f);
+}
+
 // ─── post-edit summary (issue 23 S1) ────────────────────────────────────────
 
 #[test]
@@ -430,10 +715,12 @@ fn replace_list_with_noncollection_reports_new_identity() {
         notes.iter().any(|n| n.contains("could not compute the new handle")),
         "handle note kept: {notes:?}"
     );
-    // The stale pre-edit head must not be reported as current in the
-    // human text either.
+    // The stale pre-edit head must not be reported as CURRENT in the
+    // human summary line (the diff block under it may show the old
+    // bytes — that is what a diff is for, issue 27 F12).
     let text = d["result"]["text"].as_str().unwrap();
-    assert!(!text.contains("foo"), "pre-edit head must not leak: {text}");
+    let summary_line = text.lines().next().unwrap_or("");
+    assert!(!summary_line.contains("foo"), "pre-edit head must not leak: {text}");
     check_ok(&f);
 }
 

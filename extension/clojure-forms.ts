@@ -615,7 +615,7 @@ export default function ClojureForms(pi: ExtensionAPI) {
 		}
 		if (r.diff) {
 			lines.push("");
-			lines.push("patch diff:");
+			lines.push("diff (changed region):");
 			lines.push(r.diff);
 		}
 		if (out.forms) {

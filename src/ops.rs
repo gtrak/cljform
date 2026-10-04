@@ -525,8 +525,9 @@ fn run_tree_named(
         format!("{} matches for name {name:?} in {}", matches.len(), file.display())
     };
     if human {
-        // Each match: its line range, then the full-depth annotated source
-        // block with its handles inline (SPEC §10.2).
+        // Each match: its line range, then the enclosing-context line
+        // (issue 27 F14), then the full-depth annotated source block with
+        // its handles inline (SPEC §10.2).
         let mut blocks: Vec<String> = Vec::with_capacity(matches.len());
         for &i in &matches {
             let node = &nodes[i];
@@ -543,7 +544,21 @@ fn run_tree_named(
                     .with_hint("use --json to list the nodes without markers"),
                 )
             })?;
+            // One line of enclosing context: the enclosing top-level form's
+            // handle + label + line range (display context, not an address
+            // — the match's own handle stays the only edit address).
+            let context = match enclosing_top_level(&nodes, i) {
+                Some(e) => format!(
+                    "inside form \u{27E6}{}\u{27E7} {} (lines {}\u{2013}{})\n",
+                    e.handle,
+                    enclosing_label(e),
+                    e.line[0],
+                    e.line[1],
+                ),
+                None => "top-level form\n".to_string(),
+            };
             let mut b = format!("lines {}–{}\n", node.line[0], node.line[1]);
+            b.push_str(&context);
             b.push_str(&block);
             if !b.ends_with('\n') {
                 b.push('\n');
@@ -572,7 +587,18 @@ fn run_tree_named(
             if n.name.is_none() {
                 n.name = Some(name.to_string());
             }
-            serde_json::to_value(&n).expect("Node serializes")
+            let mut v = serde_json::to_value(&n).expect("Node serializes");
+            // Issue 27 (F14): the enclosing top-level form's handle
+            // (null at top level) — display context, not an address.
+            if let serde_json::Value::Object(map) = &mut v {
+                map.insert(
+                    "parentHandle".to_string(),
+                    enclosing_top_level(&nodes, i)
+                        .map(|e| serde_json::Value::String(e.handle.clone()))
+                        .unwrap_or(serde_json::Value::Null),
+                );
+            }
+            v
         })
         .collect();
     Ok(
@@ -581,6 +607,27 @@ fn run_tree_named(
             .file_hash(hashutil::tagged(&hashutil::file_hash(bytes)))
             .result(serde_json::json!({ "count": matches.len(), "nodes": out_nodes })),
     )
+}
+
+/// `tree --name` enclosing context (issue 27 F14): the top-level form
+/// node `i` sits in — the root of its parent chain (O(depth), the
+/// issue-22 machinery) — or None when the node is itself top-level.
+fn enclosing_top_level(nodes: &[handle::Node], i: usize) -> Option<&handle::Node> {
+    let mut cur = i;
+    while let Some(p) = nodes[cur].parent {
+        cur = p;
+    }
+    (cur != i).then_some(&nodes[cur])
+}
+/// The enclosing form's display label: head + name for a def-like form
+/// ("defn outer"), else head, else name, else kind.
+fn enclosing_label(n: &handle::Node) -> String {
+    match (&n.head, &n.name) {
+        (Some(h), Some(x)) => format!("{h} {x}"),
+        (Some(h), None) => h.clone(),
+        (None, Some(x)) => x.clone(),
+        (None, None) => n.kind.clone(),
+    }
 }
 
 /// `cljform format [file]` (issue 06): parinfer paren-mode reindent.

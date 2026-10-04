@@ -507,17 +507,25 @@ fn plan_splice(
             unreachable!("append/prepend carry prepared content")
         };
         match mode {
-            Mode::Append => (
-                splice::Splice::Insert {
-                    after: before_forms.len(),
-                    content: p.bytes.clone(),
-                },
-                invariants::Allowed::Insert {
-                    at: before_forms.len() + 1,
-                    n: p.forms,
-                },
-                (0, 0),
-            ),
+            Mode::Append => {
+                // The seam position: past the last form's line tail (or the
+                // file edge) — the same position the splicer takes, and the
+                // changed-region window the result diff is computed over
+                // (issue 27 F12).
+                let pos =
+                    splice::insert_after_pos(bytes, before_forms, before_forms.len());
+                (
+                    splice::Splice::Insert {
+                        after: before_forms.len(),
+                        content: p.bytes.clone(),
+                    },
+                    invariants::Allowed::Insert {
+                        at: before_forms.len() + 1,
+                        n: p.forms,
+                    },
+                    (pos, pos),
+                )
+            }
             Mode::Prepend => (
                 splice::Splice::InsertBefore {
                     before: 0,
@@ -643,6 +651,59 @@ pub fn run_edit(
     let (sp, allowed, mut bound) =
         plan_splice(mode, &bytes, &before_forms, handle_node.as_ref(), &payload);
 
+    // Issue 27 (F13): a delete of the last form must not leave MORE
+    // trailing blank lines at EOF than the input had — the file's
+    // trailing-newline convention is preserved (file ended with a
+    // newline -> exactly one; none -> none). The excess units are folded
+    // into the delete window itself: the splice removes them as part of
+    // its range, so the boundary check still proves "prefix + suffix"
+    // over the adjusted window. A delete that ends inside the file can
+    // never grow the EOF run, so interior deletes keep their seam
+    // behavior byte-identical (k = 0, the window is untouched).
+    let sp = if mode == Mode::Delete {
+        let (start, end) = bound;
+        let result_units = if end == bytes.len() {
+            // The node reached EOF: the spliced tail is what the prefix
+            // ends in.
+            seam::trailing_eol_units(&bytes[..start])
+        } else {
+            let t = seam::trailing_eol_units(&bytes[end..]);
+            if t == 0 {
+                0
+            } else if seam::trailing_eol_cut(&bytes[end..], t) == 0 {
+                // The whole tail is the newline run: it stacks on the
+                // prefix's own trailing run.
+                t + seam::trailing_eol_units(&bytes[..start])
+            } else {
+                t
+            }
+        };
+        let k = result_units.saturating_sub(seam::trailing_eol_units(&bytes));
+        if k > 0 {
+            let (start, end) = if end < bytes.len() {
+                let t = seam::trailing_eol_units(&bytes[end..]);
+                if k <= t {
+                    // The excess sits in the tail run past the node: extend
+                    // the window to the right.
+                    (start, end + seam::trailing_eol_units_len(&bytes[end..], k))
+                } else {
+                    // The whole tail is the run and the prefix ends in
+                    // newlines too: eat the tail, trim the rest from the
+                    // prefix's end (extend the window to the left).
+                    (seam::trailing_eol_cut(&bytes[..start], k - t), bytes.len())
+                }
+            } else {
+                (seam::trailing_eol_cut(&bytes[..start], k), bytes.len())
+            };
+            bound = (start, end);
+            splice::Splice::Range { start, end, content: Vec::new() }
+        } else {
+            sp
+        }
+    } else {
+        sp
+    };
+
     let mut new_bytes = splice::apply(&bytes, &before_forms, &sp);
 
     // R3 seam (issue 14, delete): a delete that leaves only the displaced
@@ -705,23 +766,43 @@ pub fn run_edit(
     };
     notes.extend(summary_notes);
 
+    // Issue 27 (F12): every mutating op carries a unified diff of its
+    // changed region in the result — patch already scopes its diff to
+    // the target node's bytes; the whole-form ops take the same shape
+    // and headers over the splice window the pipeline already computed
+    // (the node range for replace/delete, the insert position for
+    // inserts, the file edge for append/prepend). The no-op case (the
+    // file bytes are unchanged) keeps its empty diff.
+    let diff = match &payload {
+        Some(content::Payload::Patch { diff, .. }) => diff.clone(),
+        _ if new_bytes == bytes => String::new(),
+        _ => {
+            let (lo, hi) = bound;
+            let content_len = new_bytes.len() - lo - (bytes.len() - hi);
+            let old = String::from_utf8_lossy(&bytes[lo..hi]).to_string();
+            let new = String::from_utf8_lossy(&new_bytes[lo..lo + content_len]).to_string();
+            materialize::unified_diff(&old, &new, "before", "after")
+        }
+    };
+
     let mut text = summary::human_summary(&summary_val, &shape);
-    match &payload {
-        Some(content::Payload::Prepared(p)) if p.repaired && !p.repair_diff.is_empty() => {
+    if let Some(content::Payload::Prepared(p)) = &payload {
+        if p.repaired && !p.repair_diff.is_empty() {
             text.push('\n');
             text.push_str(&p.repair_diff);
         }
-        Some(content::Payload::Patch { diff, .. }) if !diff.is_empty() => {
-            text.push('\n');
-            text.push_str(diff);
-        }
-        _ => {}
+    }
+    // The diff rides in the human text exactly as it does for patch
+    // (issue 27 F12: the summary line and forms table stay as-is; the
+    // diff block is the shared seam visibility).
+    if !diff.is_empty() {
+        text.push('\n');
+        text.push_str(&diff);
     }
 
-    let (repaired, repair_diff, patch_diff) = match &payload {
-        Some(content::Payload::Prepared(p)) => (p.repaired, p.repair_diff.clone(), String::new()),
-        Some(content::Payload::Patch { diff, .. }) => (false, String::new(), diff.clone()),
-        None => (false, String::new(), String::new()),
+    let (repaired, repair_diff) = match &payload {
+        Some(content::Payload::Prepared(p)) => (p.repaired, p.repair_diff.clone()),
+        _ => (false, String::new()),
     };
 
     let result = serde_json::json!({
@@ -731,7 +812,7 @@ pub fn run_edit(
         "untouched": shape.untouched,
         "repaired": repaired,
         "repairDiff": repair_diff,
-        "diff": patch_diff,
+        "diff": diff,
         "wrote": !dry_run,
     });
 

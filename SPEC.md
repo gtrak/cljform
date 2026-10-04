@@ -213,6 +213,17 @@ only touch its window — the node's byte range for replace/patch/delete, the
 insert position for inserts. Prefix and suffix equality are verified after
 the splice; a violation → `shape-violation` (exit 1), nothing written.
 
+**Changed-region diff (issue 27):** every mutating op returns a unified
+diff of its changed region in the result (`"diff"`), in patch's style
+(`--- before` / `+++ after` headers, 2-line context): `patch` over the
+target form's before/after bytes (as before), the whole-form ops
+(replace / insert-after / insert-before / append / prepend / delete) over
+the splice window the pipeline already computes (the node range for
+replace/delete, the insert position for inserts, the file edge for
+append/prepend). The no-op case — the file bytes come back unchanged —
+keeps the empty diff. The human output shows the diff for every mutating
+op (as `patch` did); the summary line and forms table are unchanged.
+
 **Marker auto-strip on ingest (§10.4):** `⟦…⟧` markers in `--content`,
 `--old-text`, and `--new-text` are stripped before use (lossless, with a
 note), so annotated text can be copied straight back into an edit without
@@ -555,6 +566,12 @@ collection delimiter:
   shape as `tree --json`, plus a `count`); a nested match echoes the queried
   name in `name` (the full table's serialized `name` stays top-level-only). Zero
   matches is `ok:true` with a zero count and empty node list — not an error.
+  **Enclosing context (issue 27):** each human match block carries one line
+  naming the enclosing top-level form — its handle + label + line range
+  (`inside form ⟦7d21⟧ defn outer (lines 3–6)`); top-level matches say so
+  (`top-level form`). The JSON match nodes carry `parentHandle` (the
+  enclosing form's handle, `null` for top-level matches). Display context,
+  not an address: the match's own handle stays the only edit address.
   Discovery-only: handles remain the ONLY edit address. Two-case rule for
   callers (worker guidance): a named nested form → `tree --name X`, copy the
   handle, edit; anonymous nested content → patch within the enclosing form's

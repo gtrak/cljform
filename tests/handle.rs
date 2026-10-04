@@ -664,11 +664,14 @@ fn replace_summary_reflects_post_edit_head_and_name() {
     assert_eq!(s["kind"], "list_lit");
     // The pre-edit form's handle is preserved under the `was*` key.
     assert_eq!(s["wasHandle"], h);
-    // The human text labels the new form by its post-edit head, and must not
-    // leak the stale pre-edit def name `one`.
+    // The human summary line labels the new form by its post-edit head,
+    // and must not leak the stale pre-edit def name `one`. (The diff
+    // block under it shows the pre-edit bytes by design — issue 27 F12 —
+    // so the leak guard covers the summary line.)
     let text = d["result"]["text"].as_str().expect("result.text");
-    assert!(text.contains("let"), "human text names the post-edit head: {text}");
-    assert!(!text.contains("one"), "stale pre-edit name must not leak: {text}");
+    let summary_line = text.lines().next().unwrap_or("");
+    assert!(summary_line.contains("let"), "human text names the post-edit head: {text}");
+    assert!(!summary_line.contains("one"), "stale pre-edit name must not leak: {text}");
 }
 
 #[test]
@@ -938,3 +941,76 @@ fn tree_default_view_is_unchanged_without_name() {
     assert!(d["result"].get("count").is_none(), "{}", d["result"]);
 }
 
+
+// ─── --name enclosing context (issue 27 F14) ─────────────────────────────
+//
+// Each match block gains one line naming the enclosing top-level form
+// (handle + label + line range; top-level matches say so), and the JSON
+// match nodes gain `parentHandle` (null at top level). Display context,
+// not an address: the match's own handle stays the only edit address.
+
+#[test]
+fn tree_name_matches_carry_enclosing_context() {
+    let f = fixture("name-sel-ctx.clj", NAME_SEL_FIXTURE);
+
+    // Nested matches: both blocks name the enclosing top-level form —
+    // handle + label + line range (NAME_SEL_FIXTURE: outer is lines 3–6,
+    // other is lines 8–11).
+    let (code, out, stderr) = run_bytes(&["tree", &f, "--name", "make-cfg", "--human"], None);
+    assert_eq!(code, 0, "{stderr}");
+    let out = String::from_utf8(out).unwrap();
+    let outer_h = handle_at_full(&f, 3, 1);
+    assert!(
+        out.contains(&format!("inside form \u{27E6}{outer_h}\u{27E7} defn outer (lines 3\u{2013}6)")),
+        "first block names the enclosing form: {out}"
+    );
+    let other_h = handle_at_full(&f, 8, 1);
+    assert!(
+        out.contains(&format!("inside form \u{27E6}{other_h}\u{27E7} defn other (lines 8\u{2013}11)")),
+        "second block names its enclosing form: {out}"
+    );
+    // The match's own handle stays in the block (context never replaces
+    // the address).
+    let h = handle_at_full(&f, 4, 4);
+    assert!(out.contains(&format!("\u{27E6}{h}\u{27E7}")), "match handle inline: {out}");
+
+    // Top-level matches say so.
+    let (code, out, stderr) = run_bytes(&["tree", &f, "--name", "tail", "--human"], None);
+    assert_eq!(code, 0, "{stderr}");
+    let out = String::from_utf8(out).unwrap();
+    assert!(
+        out.contains("top-level form"),
+        "top-level match says so: {out}"
+    );
+    assert!(!out.contains("inside form"), "no enclosing line for top-level: {out}");
+
+    // JSON: parentHandle is the enclosing form's handle (nested) …
+    let (code, d, stderr) = run_json(&["tree", &f, "--name", "make-cfg", "--json"], None);
+    assert_eq!(code, 0, "{d} {stderr}");
+    let nodes = d["result"]["nodes"].as_array().unwrap();
+    assert_eq!(nodes[0]["parentHandle"], outer_h, "{:?}", nodes[0]);
+    assert_eq!(nodes[1]["parentHandle"], other_h, "{:?}", nodes[1]);
+    // … and null at top level — present, not omitted.
+    let (code, d, stderr) = run_json(&["tree", &f, "--name", "tail", "--json"], None);
+    assert_eq!(code, 0, "{d} {stderr}");
+    let nodes = d["result"]["nodes"].as_array().unwrap();
+    assert!(nodes[0].get("parentHandle").is_some(), "field present: {:?}", nodes[0]);
+    assert_eq!(nodes[0]["parentHandle"], serde_json::Value::Null, "{:?}", nodes[0]);
+}
+
+#[test]
+fn tree_name_context_does_not_leak_into_default_views() {
+    // The context is a `--name` concern: the default JSON node table and
+    // annotated views carry no parentHandle / context lines.
+    let f = fixture("name-sel-ctx-leak.clj", NAME_SEL_FIXTURE);
+    let nodes = tree_full_nodes(&f);
+    assert!(
+        nodes.iter().all(|n| n.get("parentHandle").is_none()),
+        "no parentHandle in the default table"
+    );
+    let (code, out, stderr) = run_bytes(&["tree", &f, "--human"], None);
+    assert_eq!(code, 0, "{stderr}");
+    let out = String::from_utf8(out).unwrap();
+    assert!(!out.contains("inside form"), "{out}");
+    assert!(!out.contains("top-level form"), "{out}");
+}
