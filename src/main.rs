@@ -8,6 +8,7 @@
 // constructed once per process and returned, so the large-err lint is noise.
 #![allow(clippy::result_large_err)]
 
+mod broken;
 mod cli;
 mod content;
 mod edit;

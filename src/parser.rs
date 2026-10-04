@@ -81,6 +81,20 @@ pub struct ParseError {
     pub line: usize,
     pub col: usize,
     pub message: String,
+    /// Every ERROR/MISSING region (1-based, inclusive line span + the
+    /// region's message), in document order; the first entry carries
+    /// (line, col, message) above — the unchanged first-error contract.
+    /// Feeds the `error.diagnostics` envelope (issue 31).
+    pub diagnostics: Vec<ParseDiagnostic>,
+}
+
+/// One ERROR/MISSING region of a failed parse: 1-based, inclusive line
+/// span and the parser's message for it.
+#[derive(Debug, Clone)]
+pub struct ParseDiagnostic {
+    pub line: usize,
+    pub end_line: usize,
+    pub message: String,
 }
 
 #[derive(Debug)]
@@ -132,6 +146,8 @@ fn parse_inner(bytes: &[u8]) -> Result<Parsed, ParseError> {
         line: 1,
         col: 1,
         message: "parser produced no tree".to_string(),
+        // No tree means no regions; the envelope key stays absent.
+        diagnostics: Vec::new(),
     })?;
     let root = tree.root_node();
     if root.has_error() {
@@ -143,6 +159,10 @@ fn parse_inner(bytes: &[u8]) -> Result<Parsed, ParseError> {
     Ok(Parsed { forms, warnings })
 }
 
+/// The first-error contract, unchanged (line, col, message come from the
+/// first ERROR/MISSING region in document order) plus the FULL region list
+/// (issue 31): the same document-order walk, so `diagnostics[0]` is always
+/// (line, col, message).
 fn first_error(root: &Node, bytes: &[u8]) -> ParseError {
     fn find(node: Node) -> Option<Node> {
         if node.is_error() || node.is_missing() {
@@ -159,7 +179,32 @@ fn first_error(root: &Node, bytes: &[u8]) -> ParseError {
     let node = find(*root).unwrap_or(*root);
     let line = node.start_position().row + 1;
     let col = node.start_position().column + 1;
-    let message = if node.is_missing() {
+    let message = error_message(node, bytes);
+    let diagnostics = collect_errors(root, bytes);
+    // `root.has_error()` guarantees at least one region, so this fallback
+    // (no region node found) is defensive only — it keeps the list
+    // non-empty in lockstep with (line, col, message).
+    let diagnostics = if diagnostics.is_empty() {
+        vec![ParseDiagnostic {
+            line,
+            end_line: line,
+            message: message.clone(),
+        }]
+    } else {
+        diagnostics
+    };
+    ParseError {
+        line,
+        col,
+        message,
+        diagnostics,
+    }
+}
+
+/// The parser's message for one ERROR/MISSING region (the first-error
+/// message logic, per region).
+fn error_message(node: Node, bytes: &[u8]) -> String {
+    if node.is_missing() {
         match node.kind() {
             ")" => "unclosed open-paren: expected ')'".to_string(),
             "}" => "unclosed map literal: expected '}'".to_string(),
@@ -171,12 +216,57 @@ fn first_error(root: &Node, bytes: &[u8]) -> ParseError {
         "unclosed open-paren (form reaches end of file)".to_string()
     } else {
         format!("unexpected token {:?}", text_of(node, bytes))
-    };
-    ParseError {
-        line,
-        col,
-        message,
     }
+}
+
+/// Every ERROR/MISSING region of the tree, document order (issue 31): the
+/// first-error node plus every later region — ALL spans, not just the
+/// first. A region's interior is part of the region, never a second one
+/// (no descent into ERROR/MISSING nodes).
+fn collect_errors(root: &Node, bytes: &[u8]) -> Vec<ParseDiagnostic> {
+    fn walk(node: Node, bytes: &[u8], out: &mut Vec<ParseDiagnostic>) {
+        if node.is_error() || node.is_missing() {
+            out.push(ParseDiagnostic {
+                line: node.start_position().row + 1,
+                end_line: node.end_position().row + 1,
+                message: error_message(node, bytes),
+            });
+            return;
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            walk(child, bytes, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(*root, bytes, &mut out);
+    out
+}
+
+/// Top-level forms of a possibly BROKEN parse (issue 31 recovery view):
+/// the partial tree's addressable children. Complete forms table normally
+/// on both sides of a broken region; ERROR/MISSING children are skipped
+/// (they are diagnostics, not forms — see `for_each_top_form`). Runs on
+/// the big-stack worker like `parse`; empty when the parser produced no
+/// tree.
+// Temporary (issue 31, commit 1 of 5): consumed by the `tree --recover`
+// branch (commit 3); the bin target sees no use until then.
+#[allow(dead_code)]
+pub fn partial_top_forms(bytes: &[u8]) -> Vec<Form> {
+    let bytes = bytes.to_vec();
+    with_big_stack(move || {
+        let mut parser = Parser::new();
+        // Fresh parser with no open tree: set_language cannot fail (see
+        // parse_inner).
+        #[allow(clippy::expect_used)]
+        parser
+            .set_language(&tree_sitter_clojure::LANGUAGE.into())
+            .expect("clojure grammar language");
+        match parser.parse(&bytes, None) {
+            Some(tree) => build_table(&tree.root_node(), &bytes),
+            None => Vec::new(),
+        }
+    })
 }
 
 fn text_of(node: Node, bytes: &[u8]) -> String {
@@ -338,6 +428,12 @@ pub fn for_each_top_form<'a>(root: Node<'a>, mut f: impl FnMut(Node<'a>)) {
     let mut cursor = root.walk();
     for child in root.children(&mut cursor) {
         if child.kind() == "comment" || child.kind() == "dis_expr" {
+            continue;
+        }
+        // Broken-file partial trees (issue 31): an ERROR/MISSING child is a
+        // diagnostic region, never a form. Healthy trees carry none, so
+        // this changes nothing outside the recovery path.
+        if child.is_error() || child.is_missing() {
             continue;
         }
         f(child);

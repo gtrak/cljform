@@ -4,6 +4,7 @@
 
 use serde::Serialize;
 
+use crate::broken::Diagnostic;
 use crate::content;
 use crate::invariants;
 use crate::parser::Form;
@@ -48,6 +49,12 @@ pub struct ErrorBody {
     pub hint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub suggestions: Option<Vec<Suggestion>>,
+    /// Broken-file diagnostics (issue 31): the full conflict-region /
+    /// parse-error list on `conflict-markers` and `parse-error` failures.
+    /// Additive key, present only when non-empty — healthy-file envelopes
+    /// stay byte-identical.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<Vec<Diagnostic>>,
 }
 
 impl ErrorBody {
@@ -61,6 +68,7 @@ impl ErrorBody {
             message: message.into(),
             hint: None,
             suggestions: None,
+            diagnostics: None,
         }
     }
 
@@ -78,6 +86,15 @@ impl ErrorBody {
 
     pub fn with_suggestions(mut self, suggestions: Vec<Suggestion>) -> Self {
         self.suggestions = Some(suggestions);
+        self
+    }
+
+    /// Attach the broken-file diagnostics (issue 31); an empty list
+    /// attaches nothing (the key must stay absent on non-broken errors).
+    pub fn with_diagnostics(mut self, diagnostics: Vec<Diagnostic>) -> Self {
+        if !diagnostics.is_empty() {
+            self.diagnostics = Some(diagnostics);
+        }
         self
     }
 }
