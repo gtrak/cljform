@@ -24,3 +24,6 @@ unicode-width = "0.1.5"
 [profile.release]
 lto = true
 codegen-units = 1
+# Deterministic arithmetic in the shipped binary: overflow wraps no more
+# than it does in debug (issue 30 L2).
+overflow-checks = true

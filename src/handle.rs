@@ -302,6 +302,9 @@ const COLLECTION_KINDS: &[&str] = &[
 
 fn collect_inner(bytes: &[u8]) -> Vec<Node> {
     let mut parser = Parser::new();
+    // Fresh parser with no open tree: set_language cannot fail (see
+    // parser::parse_inner).
+    #[allow(clippy::expect_used)]
     parser
         .set_language(&tree_sitter_clojure::LANGUAGE.into())
         .expect("clojure grammar language");
@@ -591,6 +594,9 @@ pub fn contains_marker(bytes: &[u8]) -> bool {
 }
 
 #[cfg(test)]
+// Test harness: a failing unwrap/expect is a failed test, not a tool bug
+// (issue 30 L1); the fixtures are balanced, so annotate cannot error.
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
 

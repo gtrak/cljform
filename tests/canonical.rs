@@ -5,6 +5,11 @@
 //! input). The R1–R4 repros are golden tests here (the R1/R4 shape goldens
 //! also live in `tests/format.rs` against the parinfer-rust differential
 //! corpus, where they belong).
+// Test harness (issue 30 L1): panicking asserts are the harness's
+// own failure mode — a hit fails the test, not the tool; the
+// binary-under-test is asserted by its envelope/exit contract.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 
 mod common;
 

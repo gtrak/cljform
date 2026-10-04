@@ -176,6 +176,9 @@ pub fn indent_mode(draft: &str) -> Result<String, MaterializeError> {
             if !closer_is_the_match {
                 while let Some(open) = stack.last() {
                     if open.col >= indent {
+                        // The loop guard `while let Some(open) = stack.last()`
+                        // proves pop() is Some on every iteration.
+                        #[allow(clippy::expect_used)]
                         to_close.push(stack.pop().expect("just peeked"));
                     } else {
                         break;

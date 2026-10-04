@@ -4,6 +4,11 @@
 //! and the installed parinfer-rust binary over a fixture corpus and
 //! asserts byte equality. It SKIPS (does not fail) when the binary is
 //! absent, so the suite stays hermetic.
+// Test harness (issue 30 L1): panicking asserts are the harness's
+// own failure mode — a hit fails the test, not the tool; the
+// binary-under-test is asserted by its envelope/exit contract.
+#![allow(clippy::unwrap_used, clippy::panic)]
+
 
 mod common;
 

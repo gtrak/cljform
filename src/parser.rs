@@ -94,10 +94,19 @@ pub struct Parsed {
 /// owned (we copy the source bytes in and move results out). Shared with
 /// `handle::collect`, which walks trees with the same recursion risk.
 pub fn with_big_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
-    std::thread::Builder::new()
+    // thread::Builder::spawn fails only on OS-level errors (reserving the
+    // 256 MiB stack at OOM); there is no sensible recovery, so a hit is a
+    // tool bug (issue 30 L1).
+    #[allow(clippy::expect_used)]
+    let worker = std::thread::Builder::new()
         .stack_size(PARSE_STACK_BYTES)
         .spawn(f)
-        .expect("spawn parse worker")
+        .expect("spawn parse worker");
+    // Re-panics on the main thread carrying the worker's payload, where the
+    // dispatch-boundary catch_unwind converts it into the internal-error
+    // envelope (issue 30 L3).
+    #[allow(clippy::expect_used)]
+    worker
         .join()
         .expect("parse worker panicked")
 }
@@ -113,6 +122,9 @@ pub fn parse(bytes: &[u8]) -> Result<Parsed, ParseError> {
 
 fn parse_inner(bytes: &[u8]) -> Result<Parsed, ParseError> {
     let mut parser = Parser::new();
+    // Fresh parser with no open tree: set_language can only fail on a
+    // language switch, and this is the only call — it cannot fail.
+    #[allow(clippy::expect_used)]
     parser
         .set_language(&tree_sitter_clojure::LANGUAGE.into())
         .expect("clojure grammar language");
@@ -197,6 +209,9 @@ pub struct NodeIdentity {
 
 fn node_identity_at_inner(bytes: &[u8], offset: usize) -> Option<NodeIdentity> {
     let mut parser = Parser::new();
+    // Fresh parser with no open tree: set_language cannot fail (see
+    // parse_inner).
+    #[allow(clippy::expect_used)]
     parser
         .set_language(&tree_sitter_clojure::LANGUAGE.into())
         .expect("clojure grammar language");

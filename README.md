@@ -39,7 +39,9 @@ cljform [--json|--human] <op> …
 | `format [file]` | Reformat indentation the way parinfer paren mode does — the only op that imposes a style on a whole file (the edit path reindents its submitted content with the same pass, by default, then base-shifts it). Candidate-first: candidate + unified diff vs the input + note, never writes. The candidate must re-parse clean and keep the input's token stream (only whitespace and closing-delimiter position may move); otherwise `format-error`, exit 1, nothing emitted |
 
 Exit codes: `0` ok · `1` parse/structure failure or `annotate-conflict`
-(nothing written) · `2` usage · `3` targeting failure or refused content /
+(nothing written), or `internal-error` (a residual panic caught at the
+dispatch boundary — a tool bug; nothing was written) · `2` usage ·
+`3` targeting failure or refused content /
 repair (`form-not-found` / `ambiguous` / `stale-handle` / `ambiguous-handle`
 / `unbalanced-content` / `repair-refused`) · `4` I/O.
 
@@ -132,6 +134,15 @@ cargo install --path .              # binary → ~/.cargo/bin/cljform
 cargo test                          # cli, forms, repair,
                                     # robustness, F1 regression
 ```
+
+Standard gates (run before reporting any change): `cargo build` ·
+`cargo clippy --all-targets -- -D warnings -W clippy::unwrap_used
+-W clippy::expect_used -W clippy::panic -W clippy::unreachable -D
+clippy::todo` · `cargo test`. The lint gate denies panicking constructs
+(`unwrap`/`expect`/`panic!`/`unreachable!`/`todo!`); every remaining site
+is an in-source `#[allow]` carrying a one-line written justification
+(auditable assumptions, issue 30), and a residual panic is converted at
+the dispatch boundary into the `internal-error` envelope (SPEC §4.1).
 
 Dependencies: `tree-sitter` + `tree-sitter-clojure` (pinned via Cargo.lock —
 golden tables are grammar-sensitive), `clap`, `serde`/`serde_json`,

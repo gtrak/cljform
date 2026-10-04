@@ -1,4 +1,9 @@
 //! CLI contract: flags, exit codes, human/JSON rendering, usage errors.
+// Test harness (issue 30 L1): panicking asserts are the harness's
+// own failure mode — a hit fails the test, not the tool; the
+// binary-under-test is asserted by its envelope/exit contract.
+#![allow(clippy::unwrap_used)]
+
 
 mod common;
 

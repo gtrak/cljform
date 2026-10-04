@@ -93,7 +93,7 @@ fn build_patch_payload(
     bytes: &[u8],
     old_text: &Option<String>,
     new_text: &Option<String>,
-    handle_node: Option<&handle::Node>,
+    node: &handle::Node,
     notes: &mut Vec<String>,
 ) -> Result<content::Payload, Fail> {
     let Some(old_raw) = old_text.as_deref().filter(|s| !s.is_empty()) else {
@@ -115,9 +115,8 @@ fn build_patch_payload(
     // a mismatching needle is a refusal, not a normalization.
     let crlf = seam::dominant_crlf(bytes);
     let new = seam::normalize_line_endings(&new, crlf);
-    // Patch is handle-only: the usage check above guarantees a node.
-    let node = handle_node
-        .expect("patch requires --handle (validated above)");
+    // Patch is handle-only: the caller (run_edit) refuses a patch without a
+    // resolved node with a usage error before reaching this helper.
     let scoped = &bytes[node.start_byte..node.end_byte];
     let (line_range, scope_label, scope_bytes) = (
         node.line,
@@ -357,17 +356,33 @@ fn build_prepared_payload(
     Ok(content::Payload::Prepared(prepared))
 }
 
+/// A tool-bug failure of a (mode, target, payload) internal invariant
+/// (issue 30 L1): the triple is constructed upstream by `run_edit`, so a
+/// mismatch is never an input error — report it as `internal-error`
+/// (exit 1, nothing written) instead of panicking.
+fn internal_invariant(what: &str) -> Fail {
+    Fail(
+        errors::exit::INTERNAL,
+        ErrorBody::new(
+            "internal-error",
+            format!("tool bug: {what}; the file was not written"),
+        ),
+    )
+}
+
 /// Build splice + allowed-change window + actual splice window (lo, hi):
 /// the node range for replace/patch/delete, and the insert position for
 /// inserts. For a top-level insert-after the position can sit past
 /// node.end_byte (a same-line trailing comment stays with the anchor).
+/// Returns `internal-error` when the (mode, target, payload) triple
+/// mismaps — a tool bug, not an input error (see `internal_invariant`).
 fn plan_splice(
     mode: Mode,
     bytes: &[u8],
     before_forms: &[Form],
     handle_node: Option<&handle::Node>,
     payload: &Option<content::Payload>,
-) -> (splice::Splice, invariants::Allowed, (usize, usize)) {
+) -> Result<(splice::Splice, invariants::Allowed, (usize, usize)), Fail> {
     if let Some(node) = handle_node {
         let top_level = node.top_level as usize;
         // The I3 window depends on depth. Nested edits never change the
@@ -397,8 +412,8 @@ fn plan_splice(
         let (start, end) = (node.start_byte, node.end_byte);
         let (sp, bound): (splice::Splice, (usize, usize)) = match mode {
             Mode::Replace => {
-                let content::Payload::Prepared(ref p) = payload.as_ref().unwrap() else {
-                    unreachable!("whole-form modes carry prepared content")
+                let Some(content::Payload::Prepared(p)) = payload.as_ref() else {
+                    return Err(internal_invariant("replace mode carries prepared content"));
                 };
                 (
                     splice::Splice::Range {
@@ -410,8 +425,8 @@ fn plan_splice(
                 )
             }
             Mode::InsertBefore => {
-                let content::Payload::Prepared(ref p) = payload.as_ref().unwrap() else {
-                    unreachable!("whole-form modes carry prepared content")
+                let Some(content::Payload::Prepared(p)) = payload.as_ref() else {
+                    return Err(internal_invariant("insert-before carries prepared content"));
                 };
                 if node.depth > 1 {
                     // Nested: byte-exact insert at the node's start. When
@@ -442,8 +457,8 @@ fn plan_splice(
                 }
             }
             Mode::InsertAfter => {
-                let content::Payload::Prepared(ref p) = payload.as_ref().unwrap() else {
-                    unreachable!("whole-form modes carry prepared content")
+                let Some(content::Payload::Prepared(p)) = payload.as_ref() else {
+                    return Err(internal_invariant("insert-after carries prepared content"));
                 };
                 if node.depth > 1 {
                     // Nested: byte-exact insert at the node's end (the
@@ -473,10 +488,8 @@ fn plan_splice(
                 }
             }
             Mode::Patch => {
-                let content::Payload::Patch { bytes: content, .. } =
-                    payload.as_ref().unwrap()
-                else {
-                    unreachable!("patch carries patched node bytes")
+                let Some(content::Payload::Patch { bytes: content, .. }) = payload.as_ref() else {
+                    return Err(internal_invariant("patch carries patched node bytes"));
                 };
                 (
                     splice::Splice::Range {
@@ -496,46 +509,59 @@ fn plan_splice(
                 (start, end),
             ),
             Mode::Append | Mode::Prepend => {
-                unreachable!("append/prepend are refused for --handle")
+                // resolve_edit_target already refused --handle for
+                // append/prepend; an error (not a panic) keeps the
+                // construction total (issue 30 L1).
+                return Err(internal_invariant(
+                    "append/prepend are refused for --handle",
+                ));
             }
         };
-        (sp, window, bound)
+        Ok((sp, window, bound))
     } else {
         // append/prepend: file-edge inserts with the seam logic (blank-line
         // separation, trailing newline at EOF).
         let Some(content::Payload::Prepared(p)) = payload.as_ref() else {
-            unreachable!("append/prepend carry prepared content")
+            return Err(internal_invariant("append/prepend carry prepared content"));
         };
-        match mode {
-            Mode::Append => {
-                // The seam position: past the last form's line tail (or the
-                // file edge) — the same position the splicer takes, and the
-                // changed-region window the result diff is computed over
-                // (issue 27 F12).
-                let pos =
-                    splice::insert_after_pos(bytes, before_forms, before_forms.len());
-                (
-                    splice::Splice::Insert {
-                        after: before_forms.len(),
+        Ok(
+            match mode {
+                Mode::Append => {
+                    // The seam position: past the last form's line tail (or the
+                    // file edge) — the same position the splicer takes, and the
+                    // changed-region window the result diff is computed over
+                    // (issue 27 F12).
+                    let pos =
+                        splice::insert_after_pos(bytes, before_forms, before_forms.len());
+                    (
+                        splice::Splice::Insert {
+                            after: before_forms.len(),
+                            content: p.bytes.clone(),
+                        },
+                        invariants::Allowed::Insert {
+                            at: before_forms.len() + 1,
+                            n: p.forms,
+                        },
+                        (pos, pos),
+                    )
+                }
+                Mode::Prepend => (
+                    splice::Splice::InsertBefore {
+                        before: 0,
                         content: p.bytes.clone(),
                     },
-                    invariants::Allowed::Insert {
-                        at: before_forms.len() + 1,
-                        n: p.forms,
-                    },
-                    (pos, pos),
-                )
-            }
-            Mode::Prepend => (
-                splice::Splice::InsertBefore {
-                    before: 0,
-                    content: p.bytes.clone(),
-                },
-                invariants::Allowed::Insert { at: 1, n: p.forms },
-                (0, 0),
-            ),
-            _ => unreachable!("target-less edit is append/prepend only"),
-        }
+                    invariants::Allowed::Insert { at: 1, n: p.forms },
+                    (0, 0),
+                ),
+                // resolve_edit_target refused a target-less non-append/prepend
+                // mode with a usage error before we reached here.
+                _ => {
+                    return Err(internal_invariant(
+                        "target-less edit is append/prepend only",
+                    ))
+                }
+            },
+        )
     }
 }
 
@@ -636,11 +662,21 @@ pub fn run_edit(
     // scoped to the target node's bytes (no repair — patch is exact).
     let payload: Option<content::Payload> = match mode {
         Mode::Delete => None,
-        Mode::Patch => {
-            Some(build_patch_payload(
-                &bytes, old_text, new_text, handle_node.as_ref(), &mut notes,
-            )?)
-        }
+        Mode::Patch => match handle_node.as_ref() {
+            Some(node) => {
+                Some(build_patch_payload(&bytes, old_text, new_text, node, &mut notes)?
+                )
+            }
+            // resolve_edit_target already refused a patch without --handle
+            // with a usage error; the error (not a panic) keeps the
+            // construction total (issue 30 L1).
+            None => {
+                return Err(Fail(
+                    errors::exit::USAGE,
+                    ErrorBody::new("usage", "patch mode requires --handle H"),
+                ))
+            }
+        },
         _ => Some(build_prepared_payload(
             mode, content, content_file, handle_node.as_ref(), &bytes, strict, repair,
             format_content, &mut notes,
@@ -649,7 +685,7 @@ pub fn run_edit(
 
     // Splice + allowed-change window + actual splice window (lo, hi).
     let (sp, allowed, mut bound) =
-        plan_splice(mode, &bytes, &before_forms, handle_node.as_ref(), &payload);
+        plan_splice(mode, &bytes, &before_forms, handle_node.as_ref(), &payload)?;
 
     // Issue 27 (F13): a delete of the last form must not leave MORE
     // trailing blank lines at EOF than the input had — the file's

@@ -214,6 +214,10 @@ pub fn verify_untouched(
             }
             Allowed::Delete { addr } => Some(if i >= addr - 1 { i + 1 } else { i }),
         };
+        // Every arm above either `continue`s for a free (changed) index or
+        // returns a Some(old_idx) — None is impossible by construction
+        // (issue 30 L1).
+        #[allow(clippy::expect_used)]
         let old_form = &before[old_idx.expect("free cases continued above")];
         if old_form.hash != new_form.hash || old_form.kind != new_form.kind {
             return Err(format!(

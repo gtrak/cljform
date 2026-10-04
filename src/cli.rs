@@ -186,13 +186,17 @@ pub fn atty_stdout() -> bool {
 
 pub fn print_envelope(out: &Output, json: bool) {
     if json {
-        println!(
-            "{}",
-            serde_json::to_string(out).expect("serializable envelope")
-        );
+        println!("{}", json_envelope(out));
         return;
     }
     print_human(out);
+}
+
+/// Every Output field is infallibly serializable (String / Option / Vec of
+/// serializable types), so to_string cannot fail (issue 30 L1).
+#[allow(clippy::expect_used)]
+fn json_envelope(out: &Output) -> String {
+    serde_json::to_string(out).expect("serializable envelope")
 }
 
 /// Print a payload verbatim to stdout, adding a trailing newline only when

@@ -6,6 +6,11 @@
 //! line ranges) may be larger than the requested window, and the echo
 //! (human header / JSON `window` key) carries both. No window given leaves
 //! the output byte-identical to the legacy views.
+// Test harness (issue 30 L1): panicking asserts are the harness's
+// own failure mode — a hit fails the test, not the tool; the
+// binary-under-test is asserted by its envelope/exit contract.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 
 mod common;
 

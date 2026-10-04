@@ -158,9 +158,14 @@ pub fn prepare(
     //    the candidate + diff it would have applied.
     match materialize::indent_mode(&text) {
         Err(e) => Err(PrepareError::Materialize(e)),
-        Ok(cand) if cand == text => Err(PrepareError::Unparseable(
-            parser::parse(text.as_bytes()).expect_err("parse failed above"),
-        )),
+        Ok(cand) if cand == text => {
+            // The same `text` failed to parse a few lines above (step 2) and
+            // the parser is deterministic, so the re-parse is still Err — a
+            // hard assertion is the right call (issue 30 L1).
+            #[allow(clippy::expect_used)]
+            let err = parser::parse(text.as_bytes()).expect_err("parse failed above");
+            Err(PrepareError::Unparseable(err))
+        }
         Ok(cand) => {
             let diff = materialize::unified_diff(&text, &cand, "submitted", "repaired");
             if strict && repair {
@@ -170,9 +175,12 @@ pub fn prepare(
             // parses; otherwise surface the direct parse error (more
             // precise).
             let parsed = parser::parse(cand.as_bytes()).map_err(|_| {
-                PrepareError::Unparseable(
-                    parser::parse(text.as_bytes()).expect_err("parse failed above"),
-                )
+                // Same deterministic re-parse of the input that failed in
+                // step 2 above; Err is guaranteed (issue 30 L1).
+                #[allow(clippy::expect_used)]
+                let err =
+                    parser::parse(text.as_bytes()).expect_err("parse failed above");
+                PrepareError::Unparseable(err)
             })?;
             if !repair {
                 return Err(PrepareError::Unbalanced { candidate: cand, diff });

@@ -402,16 +402,25 @@ impl Fmt {
                     self.ctx = Ctx::String;
                     self.string_open = Some((self.line_no, self.x));
                 }
-                "(" | "[" | "{" => self.stack.push(Open {
-                    ch: ch.chars().next().expect("delimiter"),
-                    line: self.line_no,
-                    col: self.x,
-                    max_child: None,
-                    indent_delta: self.indent_delta,
-                }),
+                "(" | "[" | "{" => {
+                    // ch is the single-character `(`/`[`/`{` from the match
+                    // arm above; chars().next() cannot be None.
+                    #[allow(clippy::expect_used)]
+                    let opener_ch = ch.chars().next().expect("delimiter");
+                    self.stack.push(Open {
+                        ch: opener_ch,
+                        line: self.line_no,
+                        col: self.x,
+                        max_child: None,
+                        indent_delta: self.indent_delta,
+                    })
+                }
                 ")" | "]" | "}" if valid_close(&self.stack, ch) => {
                     // in_code_on_matched_close_paren: extend the trail.
                     self.trail_end = Some(self.x + 1);
+                    // The `valid_close` guard above proves the stack is
+                    // non-empty and its top matches, so pop() is Some.
+                    #[allow(clippy::expect_used)]
                     let opener = self.stack.pop().expect("matched close");
                     self.trail_openers.push(opener);
                 }
@@ -446,6 +455,9 @@ impl Fmt {
     /// content line at the trail's end, and its opener's column becomes
     /// the max for whatever is still open.
     fn append_paren_trail(&mut self) {
+        // Only caller (check_indent) runs under the `valid_close` guard, so
+        // the stack is non-empty and pop() is Some.
+        #[allow(clippy::expect_used)]
         let opener = self.stack.pop().expect("valid close");
         self.set_max_indent(opener.col);
         if let (Some(tl), Some(e)) = (self.trail_line, self.trail_end) {
@@ -576,6 +588,9 @@ fn column_byte_index(s: &str, x: usize) -> usize {
 }
 
 #[cfg(test)]
+// Test harness: a failing expect is a failed test, not a tool bug
+// (issue 30 L1); format_paren is infallible on these balanced fixtures.
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 

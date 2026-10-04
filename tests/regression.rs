@@ -4,6 +4,11 @@
 //!
 //! Must report the reduced top-level count AND fire D1 with exact line
 //! ranges. This test exists because nothing else caught F1.
+// Test harness (issue 30 L1): panicking asserts are the harness's
+// own failure mode — a hit fails the test, not the tool; the
+// binary-under-test is asserted by its envelope/exit contract.
+#![allow(clippy::unwrap_used)]
+
 
 mod common;
 

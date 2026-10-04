@@ -1,6 +1,11 @@
 //! `tree` / `strip` suite: the lossless round-trip over adversarial
 //! fixtures, the marking rules (heuristic / depth / full), filter purity,
 //! and marker-conflict refusal — plus `--handle` edit resolution.
+// Test harness (issue 30 L1): panicking asserts are the harness's
+// own failure mode — a hit fails the test, not the tool; the
+// binary-under-test is asserted by its envelope/exit contract.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 
 mod common;
 

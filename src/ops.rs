@@ -501,12 +501,18 @@ pub fn run_tree(
             .iter()
             .map(|&i| nodes[i].top_level)
             .collect();
-        let out_nodes: Vec<serde_json::Value> = nodes
-            .iter()
-            .filter(|n| addrs.contains(&n.top_level))
-            .map(serde_json::to_value)
-            .collect::<Result<Vec<_>, _>>()
-            .expect("Node serializes");
+        let out_nodes: Vec<serde_json::Value> = {
+            let r: Result<Vec<_>, _> = nodes
+                .iter()
+                .filter(|n| addrs.contains(&n.top_level))
+                .map(serde_json::to_value)
+                .collect();
+            // Node's fields are all infallibly serializable (String/usize/
+            // u32/Option/Vec); the Result cannot be Err (issue 30 L1).
+            #[allow(clippy::expect_used)]
+            let out = r.expect("Node serializes");
+            out
+        };
         let effective = if included.is_empty() {
             serde_json::json!([])
         } else {
@@ -807,11 +813,13 @@ fn run_tree_named(
     }
     let mut out: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
     out.insert("count".into(), serde_json::json!(matches.len()));
-    out.insert(
-        "nodes".into(),
-        serde_json::to_value(named_nodes(&nodes, &matches, name))
-            .expect("named nodes serialize"),
-    );
+    out.insert("nodes".into(), {
+        let r = serde_json::to_value(named_nodes(&nodes, &matches, name));
+        // A Vec of infallibly serializable Node values; cannot fail.
+        #[allow(clippy::expect_used)]
+        let v = r.expect("named nodes serialize");
+        v
+    });
     if let Some((s, e)) = window {
         let effective = if matches.is_empty() {
             serde_json::json!([])
@@ -852,7 +860,10 @@ fn named_nodes(
             if n.name.is_none() {
                 n.name = Some(name.to_string());
             }
-            let mut v = serde_json::to_value(&n).expect("Node serializes");
+            let r = serde_json::to_value(&n);
+            // Node's fields are all infallibly serializable; cannot fail.
+            #[allow(clippy::expect_used)]
+            let mut v = r.expect("Node serializes");
             // Issue 27 (F14): the enclosing top-level form's handle
             // (null at top level) — display context, not an address.
             if let serde_json::Value::Object(map) = &mut v {

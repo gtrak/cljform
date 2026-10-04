@@ -20,6 +20,10 @@ pub(crate) fn append_prepend_summary(
 ) -> serde_json::Value {
     let (at, n) = match allowed {
         invariants::Allowed::Insert { at, n } => (*at, *n),
+        // plan_splice hands append/prepend only an Insert window (it is
+        // constructed upstream); a mismatch is an internal invariant
+        // break, so the hard assertion is kept (issue 30 L1).
+        #[allow(clippy::unreachable)]
         _ => unreachable!("append/prepend carry the Insert window"),
     };
     let inserted: Vec<serde_json::Value> = after_parsed.forms[at - 1..at - 1 + n]
@@ -140,12 +144,15 @@ pub(crate) fn build_handle_summary(
             let handles: Vec<String> = inserted.iter().map(|n| n.handle.clone()).collect();
             // Line span of the inserted content (min start .. max end over the
             // inserted nodes); internal to the human/JSON view, not a path.
-            let line: [usize; 2] = if inserted.is_empty() {
-                node.line
-            } else {
-                let lo = inserted.iter().map(|n| n.line[0]).min().unwrap();
-                let hi = inserted.iter().map(|n| n.line[1]).max().unwrap();
-                [lo, hi]
+            // Checked form: an empty `inserted` falls back to the anchor's
+            // own line, else the min/max over a non-empty iterator cannot
+            // be None (issue 30 L1).
+            let line: [usize; 2] = match (
+                inserted.iter().map(|n| n.line[0]).min(),
+                inserted.iter().map(|n| n.line[1]).max(),
+            ) {
+                (Some(lo), Some(hi)) => [lo, hi],
+                _ => node.line,
             };
             let mut summary = serde_json::json!({
                 "action": "inserted",
@@ -160,9 +167,11 @@ pub(crate) fn build_handle_summary(
             }
             (summary, notes)
         }
-        Mode::Append | Mode::Prepend => {
-            unreachable!("append/prepend are refused for --handle")
-        }
+        // resolve_edit_target refused --handle for append/prepend before
+        // this summary builder runs; the hard assertion is kept as the
+        // internal-invariant proof (issue 30 L1).
+        #[allow(clippy::unreachable)]
+        Mode::Append | Mode::Prepend => unreachable!("append/prepend are refused for --handle"),
     }
 }
 pub(crate) fn human_summary(summary: &serde_json::Value, shape: &invariants::ShapeCheck) -> String {

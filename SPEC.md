@@ -100,7 +100,8 @@ cljform [--json|--human] <op> [args]
   - `1` — parse/structure error: `parse-error`, `not-one-form`,
     `truncated-content`, `shape-violation`, `detector-fatal` (under
     `--strict`), `annotate-conflict` (`tree` view), `materialize-error`,
-    `format-error`
+    `format-error` — plus `internal-error` (a residual panic caught at
+    the dispatch boundary; see the backstop below)
   - `2` — usage error: `usage` (bad args, unknown op, target required but
     missing, `--handle` shorter than 6 hex chars, `--handle` with
     append/prepend)
@@ -109,6 +110,21 @@ cljform [--json|--human] <op> [args]
     `unbalanced-content` (unbalanced content, inference is opt-in),
     `repair-refused` (`--strict` beats `--repair`)
   - `4` — I/O error: `io` (unreadable file, write failure)
+- **Residual-panic backstop (issue 30).** Every envelope op runs inside
+  a `catch_unwind` at the dispatch boundary. A residual panic (always a
+  tool bug: panicking constructs are lint-denied with audited site-level
+  allowances, and release builds run with `overflow-checks = true`) is
+  converted to an `ok: false` envelope with code `internal-error`, exit
+  1, a message carrying the panic payload, and a note that this is a tool
+  bug and the file was NOT written. **No-mid-write statement:** the only
+  file write in the binary is the single atomic write at the very END of
+  the `edit` pipeline — every fallible computation (read, parse, target
+  resolution, payload building, splice planning/application, I1–I3
+  verification) completes before it, and every other op is read-only.
+  Panics can therefore only fire before the write step, and a caught
+  panic proves the file is unchanged (no partial write is possible).
+  The profile keeps the default `panic = unwind` (never `abort`): the
+  backstop requires the payload to be catchable.
 - **JSON envelope** (success):
   ```json
   { "ok": true, "op": "edit", "file": "/abs/path",
@@ -281,6 +297,9 @@ token. Numeric insert anchors (`--after N`) go likewise — anchor by handle, an
 - **I1 — no unparseable writes.** A file is only written if the post-splice
   content parses clean (paren mode, zero errors). Atomic write: temp file in
   same directory → write → fsync → rename, preserving the original file mode.
+  The write is the LAST step of the pipeline and the only one that can fail
+  on I/O; a residual panic (tool bug) is caught before the envelope is
+  printed — `internal-error`, exit 1, nothing written (§4.1 backstop).
 - **I2 — untouched bytes are untouched.** Every form other than the target
   must be byte-identical before/after. Verified by re-parsing and comparing
   per-form hashes; reported in the result (`"untouched": 41, "changed": 1`).

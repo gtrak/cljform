@@ -2,6 +2,11 @@
 //! declares `mod common;` and uses these instead of re-declaring its own
 //! copies of the fixture content, envelope runner, handle lookups, and
 //! edit-invocation helpers.
+// Test harness (issue 30 L1): panicking asserts are the harness's
+// own failure mode — a hit fails the test, not the tool; the
+// binary-under-test is asserted by its envelope/exit contract.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 
 #![allow(dead_code)]
 

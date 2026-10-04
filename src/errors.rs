@@ -25,6 +25,12 @@ pub mod exit {
     pub const TARGET: u8 = 3;
     /// I/O failure (file/stdin read, stdout/file write).
     pub const IO: u8 = 4;
+    /// Residual panic caught at the dispatch boundary (`internal-error`,
+    /// issue 30 L3): a tool bug, never an input error. Shares the value 1
+    /// — wrappers only branch on nonzero = failure — with the parse/
+    /// structure codes, and the envelope's `internal-error` code is what
+    /// distinguishes it.
+    pub const INTERNAL: u8 = 1;
 }
 
 /// Internal error carrier: (exit code, error body).

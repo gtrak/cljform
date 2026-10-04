@@ -1,5 +1,10 @@
 //! Edit ops: replace/patch/insert/delete, comment-gap reseaming, untouched
 //! byte-identity, multi-form content, and ambiguity.
+// Test harness (issue 30 L1): panicking asserts are the harness's
+// own failure mode — a hit fails the test, not the tool; the
+// binary-under-test is asserted by its envelope/exit contract.
+#![allow(clippy::unwrap_used)]
+
 
 mod common;
 
