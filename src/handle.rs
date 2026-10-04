@@ -4,9 +4,11 @@
 //! A handle is the shortest unique prefix (>= 6 hex chars) of a collection's
 //! blake3 key, with the position path folded in only when identical content
 //! would otherwise be ambiguous. The annotated view inserts `⟦handle⟧`
-//! immediately after the opening delimiter of each marked collection;
-//! `strip` deletes those spans, so `strip(annotate(x)) == x` for any
-//! parseable `x`.
+//! immediately after the opening delimiter of each marked collection — or,
+//! for a marked node with no opening delimiter (a top-level atom literal,
+//! see [`NodeShape::OpaqueLeaf`], issue 29), immediately before that node's
+//! own bytes. `strip` deletes those spans, so `strip(annotate(x)) == x` for
+//! any parseable `x`.
 
 use std::collections::HashMap;
 
@@ -39,6 +41,31 @@ pub enum AnnotateError {
     MarkerConflict,
 }
 
+/// How a node renders in the annotated view (SPEC §10.2), precomputed into the
+/// node table from the node's own bytes at collect time. A `Collection` opens
+/// with a delimiter — the marker lands just after it. An `OpaqueLeaf` has no
+/// opening delimiter (a top-level atom literal: char/string/number/keyword/
+/// symbol/regex/bool, or a quote/unquote wrapper around an atom) — its bytes
+/// are emitted verbatim with the handle placed immediately before them and no
+/// delimiter bookkeeping at all.
+///
+/// issue 29: the annotate path used to assume every marked node was a
+/// collection and `expect` an opening delimiter, so a top-level atom literal
+/// (`\x`, `:kw`, `42`, `"str"`, `'1`, `~1`, …) panicked (rc 101) on the
+/// human path while `--json` stayed fine. Encoding this in the table makes the
+/// two cases explicit and the delimiter lookup unreachable-by-construction for
+/// leaves, so the panic cannot be reintroduced by a future edit to
+/// [`annotate_marked`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeShape {
+    /// Opens with `(`, `[`, or `{` (its own, or a prefix reader-macro / metadata
+    /// one): the marker goes just after the opening delimiter.
+    Collection,
+    /// No opening delimiter (an atom literal): the marker goes immediately
+    /// before the node's own bytes; the bytes are copied verbatim.
+    OpaqueLeaf,
+}
+
 /// One collection node, in document order.
 #[derive(Debug, Clone, Serialize)]
 pub struct Node {
@@ -67,6 +94,11 @@ pub struct Node {
     pub path_chain: Vec<u32>,
     /// list_lit | vec_lit | map_lit | set_lit | anon_fn_lit | …
     pub kind: String,
+    /// How this node renders in the annotated view (see [`NodeShape`]) —
+    /// precomputed from the node's own bytes. Never serialized (it is a view
+    /// concern, not addressable data).
+    #[serde(skip)]
+    pub shape: NodeShape,
     /// Leading sym for list forms, else None.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub head: Option<String>,
@@ -104,9 +136,11 @@ pub fn collect(bytes: &[u8]) -> Vec<Node> {
     nodes
 }
 
-/// Insert `⟦handle⟧` immediately after the opening delimiter of each marked
+/// Insert `⟦handle⟧` after the opening delimiter of each marked `Collection`
 /// node (the first `([{` byte at/after `start_byte`; for `#(`/`#{` that is
-/// `start+1`). See [`Depth`] for the marking rules.
+/// `start+1`), or — for a marked `OpaqueLeaf` atom with no opening delimiter —
+/// immediately before that node's own bytes (issue 29). See [`Depth`] for the
+/// marking rules and [`NodeShape`] for the two cases.
 pub fn annotate(bytes: &[u8], depth: Depth) -> Result<String, AnnotateError> {
     if contains_marker(bytes) {
         return Err(AnnotateError::MarkerConflict);
@@ -153,10 +187,11 @@ pub fn annotate_subtree(bytes: &[u8], idx: usize) -> Result<String, AnnotateErro
 }
 
 /// The marker insertion itself: copy `bytes[start..end]`, inserting
-/// `⟦handle⟧` after the opening delimiter of each marked node whose start
-/// lies in the region. The marked set is a view concern only (depth flags,
-/// subtree selectors, line windows — the region restricts what is emitted,
-/// the marks decide what is labeled).
+/// `⟦handle⟧` after the opening delimiter of each marked `Collection` node
+/// (or immediately before the bytes of a marked `OpaqueLeaf` atom, issue 29)
+/// whose start lies in the region. The marked set is a view concern only
+/// (depth flags, subtree selectors, line windows — the region restricts what is
+/// emitted, the marks decide what is labeled).
 pub fn annotate_marked(
     nodes: &[Node],
     bytes: &[u8],
@@ -170,12 +205,22 @@ pub fn annotate_marked(
         if !marked[i] || node.start_byte < start || node.start_byte >= end {
             continue;
         }
-        let after_delim = opening_delimiter_end(bytes, node.start_byte);
-        out.push_str(&String::from_utf8_lossy(&bytes[cursor..after_delim]));
+        // Where the marker's copy lands: a `Collection` copies up to (and
+        // including) its opening delimiter, so the marker sits just after it;
+        // an `OpaqueLeaf` has no delimiter, so the marker sits immediately
+        // before the node's own bytes (no delimiter bookkeeping — issue 29).
+        // The shape was precomputed at collect time, so the delimiter lookup
+        // below is unreachable for leaves; the `unwrap_or` can never fire.
+        let insert_at = match node.shape {
+            NodeShape::Collection => opening_delimiter_end(bytes, node.start_byte, node.end_byte)
+                .unwrap_or(node.start_byte),
+            NodeShape::OpaqueLeaf => node.start_byte,
+        };
+        out.push_str(&String::from_utf8_lossy(&bytes[cursor..insert_at]));
         out.push_str(MARKER_OPEN);
         out.push_str(&node.handle);
         out.push_str(MARKER_CLOSE);
-        cursor = after_delim;
+        cursor = insert_at;
     }
     out.push_str(&String::from_utf8_lossy(&bytes[cursor..end]));
     out
@@ -314,6 +359,7 @@ fn record_subtree(
         top_level,
         path_chain: Vec::new(), // filled only on a resolved edit target
         kind: node.kind().to_string(),
+        shape: node_shape(bytes, node.start_byte(), node.end_byte()),
         head: head.clone(),
         name,
         def_name,
@@ -497,15 +543,43 @@ fn heuristic_marks(nodes: &[Node]) -> Vec<bool> {
     marked
 }
 
-/// Byte offset just past the node's opening delimiter: the first `([{` at/
-/// after `start_byte`, + 1. For `#(` and `#{` that is `start + 1`.
-fn opening_delimiter_end(bytes: &[u8], start: usize) -> usize {
-    let pos = bytes[start..]
+/// The [`NodeShape`] of the node at `bytes[start..end)`: a `Collection` iff the
+/// node's own span contains an opening delimiter (`(`/`[`/`{`) — its own
+/// opening, or a prefix reader-macro / metadata one (a `#(`/`#{` form, a
+/// metadata-prefixed list, or a quote/unquote wrapper around a collection
+/// borrows the wrapped form's `(`); an `OpaqueLeaf` otherwise (an atom
+/// literal: char/string/number/keyword/symbol/regex/bool, or a quote/unquote
+/// wrapper around an atom). Deriving shape from the bytes — not a kind
+/// allow-list — keeps the two wrapper kinds (`'(...)`, `'1`) classified the
+/// way their current output already is, so this is byte-identical to the old
+/// annotate scan for every previously-panicking-or-not input. The scan
+/// short-circuits at the first delimiter, so it is O(1) for a collection
+/// (the delimiter sits at/near the span start) and O(length) only for the
+/// small atom leaves it applies to — never quadratic in nesting depth.
+fn node_shape(bytes: &[u8], start: usize, end: usize) -> NodeShape {
+    if bytes[start..end].iter().any(|b| matches!(b, b'(' | b'[' | b'{')) {
+        NodeShape::Collection
+    } else {
+        NodeShape::OpaqueLeaf
+    }
+}
+
+/// Exclusive end of the node's opening delimiter: the first `([{` byte at/`
+/// after `start` and strictly before `end` (the node's own span), + 1.
+/// `None` when the node carries no opening delimiter at all — an `OpaqueLeaf`,
+/// which `annotate_marked` never routes here (it places the marker before the
+/// node's bytes instead). Called only on `NodeShape::Collection` nodes, where
+/// [`node_shape`] has already established a delimiter is present, so the
+/// result is always `Some`. Scanning is bounded to the node's span so a
+/// delimiter appearing inside an atom (a `[` within a string literal) is
+/// treated as content, never as structure; for a collection the opening
+/// delimiter is always within its own span, so `#(`/`#{` still resolve to
+/// `start + 1` exactly as before.
+fn opening_delimiter_end(bytes: &[u8], start: usize, end: usize) -> Option<usize> {
+    bytes[start..end]
         .iter()
         .position(|b| matches!(b, b'(' | b'[' | b'{'))
-        .expect("a collection node always has an opening delimiter")
-        + start;
-    pos + 1
+        .map(|pos| pos + start + 1)
 }
 
 pub fn contains_marker(bytes: &[u8]) -> bool {
@@ -650,5 +724,62 @@ mod tests {
         );
         // Round trip on the annotated view.
         assert_eq!(strip(&all), std::str::from_utf8(src).unwrap());
+    }
+
+    #[test]
+    fn top_level_atom_literals_annotate_without_panicking() {
+        // issue 29: a top-level atom literal has no opening delimiter, so
+        // `opening_delimiter_end` used to panic. Each now renders as an
+        // opaque leaf (its bytes with a handle, no delimiter bookkeeping) at
+        // every depth and round-trips through `strip`.
+        let atoms: &[&[u8]] = &[
+            b"\\x\n",   // char_lit
+            b"\"str\"\n", // str_lit
+            b"123\n",     // num_lit (int)
+            b"1.5\n",     // num_lit (float)
+            b"1/2\n",     // num_lit (ratio)
+            b":kwd\n",    // kwd_lit
+            b"some-sym\n", // sym_lit
+            b"#\"re\"\n",  // regex_lit
+            b"true\n",     // bool_lit
+        ];
+        for src in atoms {
+            for depth in [Depth::Heuristic, Depth::Levels(1), Depth::Levels(9), Depth::All] {
+                let annotated =
+                    annotate(src, depth).expect("top-level atom must not panic");
+                assert!(
+                    annotated.contains(MARKER_OPEN),
+                    "atom leaf must carry a handle ({depth:?}): {annotated:?}"
+                );
+                // Lossless: stripping the opaque leaf recovers the source.
+                assert_eq!(strip(&annotated), std::str::from_utf8(src).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn top_level_atom_leaf_marker_leads_its_bytes() {
+        // A top-level atom's handle sits immediately before its own bytes (no
+        // delimiter bookkeeping), while a top-level collection's still sits
+        // just after its opening `(`. Both coexist in one view.
+        let annotated = annotate(b"\\x (a 1)\n", Depth::Heuristic).unwrap();
+        assert!(
+            annotated.starts_with(MARKER_OPEN),
+            "char leaf marker must lead its bytes: {annotated:?}"
+        );
+        assert!(annotated.contains("(\u{27E6}"), "list marker after `(`: {annotated:?}");
+        assert_eq!(strip(&annotated), "\\x (a 1)\n");
+    }
+
+    #[test]
+    fn nested_char_literal_stays_untouched() {
+        // A char literal INSIDE a collection is content, not a node: exactly
+        // one marker (the list's) and the char bytes appear verbatim — a nested
+        // char must keep working exactly as today.
+        let src = b"(def x \\a)\n";
+        let annotated = annotate(src, Depth::All).unwrap();
+        assert_eq!(annotated.matches(MARKER_OPEN).count(), 1, "{annotated:?}");
+        assert!(annotated.contains("\\a"), "nested char bytes verbatim: {annotated:?}");
+        assert_eq!(strip(&annotated), "(def x \\a)\n");
     }
 }

@@ -1014,6 +1014,7 @@ mod tests {
             top_level: 9,
             path_chain: vec![9, 2, 2, 5],
             kind: "list_lit".into(),
+            shape: handle::NodeShape::Collection,
             head: Some("def".into()),
             name: Some("x".into()),
             def_name: Some("x".into()),

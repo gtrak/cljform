@@ -1014,3 +1014,121 @@ fn tree_name_context_does_not_leak_into_default_views() {
     assert!(!out.contains("inside form"), "{out}");
     assert!(!out.contains("top-level form"), "{out}");
 }
+
+// ─── issue 29: top-level atom literals (no opening delimiter) ──────────────
+
+/// The exact issue-29 repro: a file whose sole top-level form is a char
+/// literal — the human annotate path used to panic here (rc 101).
+const TOP_LEVEL_CHAR: &[u8] = b"\\x\n";
+
+#[test]
+fn top_level_char_human_no_longer_panics() {
+    let f = fixture("tl-char.clj", TOP_LEVEL_CHAR);
+    // human (raw): the opaque leaf is its bytes with a handle, no panic.
+    let (code, out, stderr) = run_bytes(&["tree", &f, "--human"], None);
+    assert_eq!(code, 0, "issue 29 human must not panic: {stderr}");
+    let text = String::from_utf8_lossy(&out).to_string();
+    assert!(text.contains('\u{27E6}'), "char leaf carries a handle: {text:?}");
+    assert!(text.contains('\\'), "char bytes preserved: {text:?}");
+    // lossless: strip(annotate) recovers the exact char bytes.
+    let (scode, stripped, serr) = run_bytes(&["strip"], Some(&out));
+    assert_eq!(scode, 0, "{serr}");
+    assert_eq!(&stripped[..], TOP_LEVEL_CHAR, "strip must recover the char file");
+}
+
+#[test]
+fn top_level_char_json_path() {
+    let f = fixture("tl-char-j.clj", TOP_LEVEL_CHAR);
+    let (code, d, stderr) = run_json(&["tree", &f, "--json"], None);
+    assert_eq!(code, 0, "issue 29 json: {stderr}");
+    let nodes = d["result"]["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 1, "{d:?}");
+    assert_eq!(nodes[0]["kind"], "char_lit");
+    assert_eq!(nodes[0]["handle"], "b0d04c");
+    assert_eq!(nodes[0]["line"], serde_json::json!([1, 1]));
+}
+
+#[test]
+fn top_level_char_window_path() {
+    let f = fixture("tl-char-w.clj", TOP_LEVEL_CHAR);
+    // Human window: header + the opaque-leaf block (char bytes with a handle,
+    // no panic — this path panicked before the fix).
+    let (code, out, stderr) =
+        run_bytes(&["tree", &f, "--human", "--start-line", "1", "--end-line", "1"], None);
+    assert_eq!(code, 0, "issue 29 window must not panic: {stderr}");
+    let out = String::from_utf8_lossy(&out).to_string();
+    assert!(out.contains("forms in lines 1"), "{out}");
+    assert!(out.contains('\\'), "char bytes in the window block: {out:?}");
+    // JSON window: node table filtered to the included char node.
+    let (jcode, d, jerr) =
+        run_json(&["tree", &f, "--json", "--start-line", "1", "--end-line", "1"], None);
+    assert_eq!(jcode, 0, "{jerr}");
+    let nodes = d["result"]["nodes"].as_array().unwrap();
+    assert_eq!(nodes.len(), 1, "{d:?}");
+    assert_eq!(nodes[0]["kind"], "char_lit");
+}
+
+#[test]
+fn top_level_char_name_path_is_clean() {
+    let f = fixture("tl-char-n.clj", TOP_LEVEL_CHAR);
+    // A char literal defines no var: `--name` yields an ok empty result, no
+    // panic.
+    let (code, out, stderr) = run_bytes(&["tree", &f, "--human", "--name", "foo"], None);
+    assert_eq!(code, 0, "issue 29 --name must not panic: {stderr}");
+    let out = String::from_utf8_lossy(&out).to_string();
+    assert!(out.contains("0 matches"), "{out}");
+}
+
+#[test]
+fn every_delimiter_less_kind_at_top_level() {
+    // Every atom kind the grammar can produce at top level: human annotate
+    // must not panic, must be lossless, and the JSON path must record the
+    // node (issue 29 sweep).
+    let atoms: &[(&str, &str)] = &[
+        ("char", "\\x"),
+        ("str", "\"s\""),
+        ("int", "123"),
+        ("float", "1.5"),
+        ("ratio", "1/2"),
+        ("kwd", ":k"),
+        ("sym", "s-sym"),
+        ("regex", "#\"r\""),
+        ("bool", "true"),
+    ];
+    for (label, body) in atoms {
+        let src = format!("{body}\n").into_bytes();
+        let name = format!("tl-atom-{label}.clj");
+        let f = fixture(&name, &src);
+        let (code, out, stderr) = run_bytes(&["tree", &f, "--human"], None);
+        assert_eq!(code, 0, "{label} human panicked: {stderr}");
+        let (scode, stripped, _serr) = run_bytes(&["strip"], Some(&out));
+        assert_eq!(scode, 0, "{label} strip");
+        assert_eq!(&stripped[..], &src[..], "{label} round trip");
+        let (jcode, d, jerr) = run_json(&["tree", &f, "--json"], None);
+        assert_eq!(jcode, 0, "{label} json: {jerr}");
+        let nodes = d["result"]["nodes"].as_array().unwrap();
+        assert!(!nodes.is_empty(), "{label} json node table empty");
+        assert_eq!(nodes[0]["line"], serde_json::json!([1, 1]), "{label} {d:?}");
+    }
+}
+
+#[test]
+fn nested_char_literal_stays_byte_identical() {
+    // A char literal nested inside a collection is content, never a node:
+    // exactly one marker (the enclosing collection's), the char bytes
+    // verbatim, and the collection annotates exactly as it did before the fix.
+    let src = b"(def x \\a)\n";
+    let f = fixture("nested-char.clj", src);
+    let (code, out, stderr) = run_bytes(&["tree", &f, "--full", "--human"], None);
+    assert_eq!(code, 0, "{stderr}");
+    let out = String::from_utf8_lossy(&out).to_string();
+    assert_eq!(
+        out.matches('\u{27E6}').count(),
+        1,
+        "only the collection is marked: {out:?}"
+    );
+    assert!(out.contains("\\a"), "nested char bytes verbatim: {out:?}");
+    let (scode, stripped, _serr) = run_bytes(&["strip"], Some(out.as_bytes()));
+    assert_eq!(scode, 0);
+    assert_eq!(&stripped[..], src, "round trip");
+}
