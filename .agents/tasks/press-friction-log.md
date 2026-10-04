@@ -97,3 +97,21 @@ Both reported silent-corruption modes DO NOT reproduce (repros in /tmp/repro17):
 - Observation: D2 nesting detector did not flag a defn inside an
   extend-protocol method body (did flag one inside a let) — recorded as
   data, plausibly intended host scoping.
+## T15 (dogfood of issues 26/27/28 post-T14 changes, clj-kondo) — 8 edits, 1 refusal, 0 refetches, 0 git-diff usage
+- ALL FOUR CHANGES ADOPTED: paging (3 windows on analyzer.clj, true-line
+  labels correlated against sed), --name enclosing context (enclosing-form
+  edit without a second tree call — the T14 "impossible" move), whole-form
+  diffs (all verification from the tool's own hunk + header), EOF trim
+  (delete+append restore byte-identical, clean single-\n tail).
+- F15 comment asymmetry: insert of comments-only content is refused
+  (not-one-form) while comment FORMS are first-class table entries
+  deletable/editable. Trivial workaround (wrap in (comment ...)) but the
+  asymmetry deserves either a documented exception or support.
+- F16 edit envelope volume on big files: full 159-line forms table prints
+  before the diff (echoes T10 F5 result-buried). Candidate: --quiet or
+  result-first ordering.
+- F17 get --name --json returns the full forms array beside the single
+  result — heavy for routine lookup on big files.
+- F18 window expansion math: a 100-line window rendered 252 lines
+  (correct complete-forms semantics; document that page-of-N != N lines
+  of output; step from the EFFECTIVE end when paging).
