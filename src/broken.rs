@@ -13,10 +13,6 @@
 //!
 //! All spans are 1-based, inclusive line ranges (the same line numbers the
 //! view reports; byte offsets deliberately absent).
-// Temporary (issue 31, commit 1 of 5): the model is not yet wired into the
-// ops (that is commit 2+3); the bin target sees no use until then. Removed
-// once the gate + recover view consume the module.
-#![allow(dead_code)]
 
 use serde::Serialize;
 use serde::ser::SerializeMap;
@@ -57,27 +53,6 @@ pub struct Broken {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-impl Broken {
-    pub fn is_empty(&self) -> bool {
-        self.diagnostics.is_empty()
-    }
-
-    /// The conflict regions only (the gate checks these before parsing).
-    pub fn conflicts(&self) -> Vec<&Diagnostic> {
-        self.diagnostics
-            .iter()
-            .filter(|d| matches!(d, Diagnostic::ConflictRegion { .. }))
-            .collect()
-    }
-
-    /// Count of parse-error diagnostics.
-    pub fn parse_error_count(&self) -> usize {
-        self.diagnostics
-            .iter()
-            .filter(|d| matches!(d, Diagnostic::ParseError { .. }))
-            .count()
-    }
-}
 
 impl Diagnostic {
     /// The diagnostic's first line (the union's ordering key; a conflict
@@ -130,7 +105,7 @@ impl Diagnostic {
     pub fn human_line(&self) -> String {
         match self {
             Diagnostic::ParseError { span, message } => {
-                format!("parse error line{}: {}", lr(span), message)
+                format!("parse error {}: {}", line_span(span), message)
             }
             Diagnostic::ConflictRegion {
                 head, base, incoming, malformed,
@@ -146,9 +121,9 @@ impl Diagnostic {
                     sides.push(format!("incoming lines {}", lr(s)));
                 }
                 let mut out = format!(
-                    "conflict region{} line{}",
+                    "conflict region{} {}",
                     if *malformed { " (malformed)" } else { "" },
-                    lr(&self.span())
+                    line_span(&self.span())
                 );
                 if !sides.is_empty() {
                     out.push_str(&format!(" ({})", sides.join(" · ")));
@@ -159,12 +134,21 @@ impl Diagnostic {
     }
 }
 
-/// `lines a–b`, or `line a` when the span is a single line.
+/// The bare span: `a–b`, or just `a` when single-line.
 fn lr(span: &(usize, usize)) -> String {
     if span.0 == span.1 {
         format!("{}", span.0)
     } else {
         format!("{}–{}", span.0, span.1)
+    }
+}
+
+/// The human span phrase: `line a` or `lines a–b`.
+fn line_span(span: &(usize, usize)) -> String {
+    if span.0 == span.1 {
+        format!("line {}", span.0)
+    } else {
+        format!("lines {}–{}", span.0, span.1)
     }
 }
 
@@ -409,7 +393,7 @@ pub fn recover_human(
     if !intact.is_empty() {
         t.push_str(&format!("intact forms ({}):\n", intact.len()));
         for f in intact {
-            t.push_str(&format!("  {} (lines {})\n", form_label(f), lr(&(f.line[0], f.line[1]))));
+            t.push_str(&format!("  {} ({})\n", form_label(f), line_span(&(f.line[0], f.line[1]))));
         }
     }
     t
@@ -435,9 +419,9 @@ pub fn recover_result(
                 .iter()
                 .map(|f| {
                     serde_json::Value::String(format!(
-                        "{} (lines {})",
+                        "{} ({})",
                         form_label(f),
-                        lr(&(f.line[0], f.line[1]))
+                        line_span(&(f.line[0], f.line[1]))
                     ))
                 })
                 .collect(),
@@ -810,10 +794,19 @@ mod tests {
             .err()
             .expect("the conflicted-unparsable file must fail to parse");
         let b = broken(conflicts, Some(&parse_err));
-        assert!(!b.is_empty());
-        assert_eq!(b.parse_error_count(), parse_err.diagnostics.len());
+        assert!(!b.diagnostics.is_empty());
         assert_eq!(
-            b.conflicts().len(),
+            b.diagnostics
+                .iter()
+                .filter(|d| matches!(d, Diagnostic::ParseError { .. }))
+                .count(),
+            parse_err.diagnostics.len()
+        );
+        assert_eq!(
+            b.diagnostics
+                .iter()
+                .filter(|d| matches!(d, Diagnostic::ConflictRegion { .. }))
+                .count(),
             1,
             "one conflict region: {:?}",
             b.diagnostics
@@ -830,7 +823,7 @@ mod tests {
         );
         // A clean parse contributes nothing.
         let clean = broken(Vec::new(), None);
-        assert!(clean.is_empty());
+        assert!(clean.diagnostics.is_empty());
     }
 
     // ─── serialization shape ───

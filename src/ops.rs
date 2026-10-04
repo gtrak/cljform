@@ -438,6 +438,9 @@ pub fn run_materialize(
 /// rendered in FULL (complete forms only), so the effective region is the
 /// union of the included spans and may be larger than the window — the
 /// echo (human header / JSON `window` key) carries both.
+/// `tree`'s flag surface is long (selector + depth/full + window +
+/// recover) — one documented allow is clearer than a parameter struct.
+#[allow(clippy::too_many_arguments)]
 pub fn run_tree(
     cli: &Cli,
     file: &Path,
@@ -446,11 +449,35 @@ pub fn run_tree(
     name: &Option<String>,
     start_line: Option<u32>,
     end_line: Option<u32>,
+    recover: bool,
 ) -> Result<Output, Fail> {
     let (bytes, had_bom) = read_file(file)?;
-    // Same parse the resolver uses: unparseable files get no view.
-    require_parse(&bytes)?;
     let window = window_bounds(start_line, end_line, &bytes)?;
+    let human_mode = cli.human || (!cli.json && cli::atty_stdout());
+
+    // issue 31: the recovery view. `--recover` on a HEALTHY file renders
+    // the normal tree view (documented; the diagnostics are empty), so a
+    // healthy file's output is byte-identical with or without the flag.
+    if recover {
+        let regions = broken::scan_conflicts(&bytes);
+        let parsed = parser::parse(&bytes);
+        if !regions.is_empty() || parsed.is_err() {
+            if name.is_some() {
+                return Err(not_supported_broken());
+            }
+            // `--depth` composes with --recover as a documented no-op on
+            // broken files (the intact list is top-level only), but a bad
+            // value is still a usage error — same contract as the normal
+            // view.
+            let _ = depth_arg(depth, full)?;
+            let b = broken::broken(regions, parsed.as_ref().err());
+            return render_recover_view(file, &bytes, had_bom, &b, window, human_mode);
+        }
+    }
+    // Same parse the resolver uses: unparseable files get no view (and the
+    // gate's conflict-markers layer fires first — plain `tree` on a broken
+    // file keeps erroring, byte-identical to the check envelope).
+    require_parse(&bytes)?;
     if let Some(n) = name {
         return run_tree_named(
             file,
@@ -461,27 +488,7 @@ pub fn run_tree(
         );
     }
     let nodes = handle::collect(&bytes);
-    let d = if *full {
-        handle::Depth::All
-    } else {
-        match depth {
-            Some(s) if s.eq_ignore_ascii_case("all") => handle::Depth::All,
-            Some(s) => match s.parse::<usize>() {
-                Ok(n) => handle::Depth::Levels(n),
-                Err(_) => {
-                    return Err(Fail(
-                        errors::exit::USAGE,
-                        ErrorBody::new(
-                            "usage",
-                            format!("--depth expects a number or 'all', got {s:?}"),
-                        ),
-                    ))
-                }
-            },
-            None => handle::Depth::Heuristic,
-        }
-    };
-    let human_mode = cli.human || (!cli.json && cli::atty_stdout());
+    let d = depth_arg(depth, full)?;
     if human_mode {
         // Issue 28: with a window, the view is the included top-level
         // forms, each as a labeled block (true file line range, --name
@@ -568,6 +575,92 @@ fn annotate_conflict() -> Fail {
             ),
         )
             .with_hint("use --json to list the nodes without markers"),
+    )
+}
+
+/// The depth/view argument: `--full`, `--depth all`, `--depth N`, or the
+/// heuristic default (usage error on a bad value). Shared by the normal
+/// view and the `--recover` branch (which validates the same way — the
+/// flag composes with `--recover` as a documented no-op on broken files).
+fn depth_arg(depth: &Option<String>, full: &bool) -> Result<handle::Depth, Fail> {
+    if *full {
+        return Ok(handle::Depth::All);
+    }
+    match depth {
+        Some(s) if s.eq_ignore_ascii_case("all") => Ok(handle::Depth::All),
+        Some(s) => match s.parse::<usize>() {
+            Ok(n) => Ok(handle::Depth::Levels(n)),
+            Err(_) => {
+                Err(Fail(
+                    errors::exit::USAGE,
+                    ErrorBody::new(
+                        "usage",
+                        format!("--depth expects a number or 'all', got {s:?}"),
+                    ),
+                ))
+            }
+        },
+        None => Ok(handle::Depth::Heuristic),
+    }
+}
+
+/// `tree --name` on a broken file (issue 31): the name table of an
+/// unparsable file is unreliable, so the selector refuses. A plain
+/// refusal in the parse family (exit 1) — the plan's explicit answer to
+/// "document the refusal as a usage error? NO".
+fn not_supported_broken() -> Fail {
+    Fail(
+        errors::exit::PARSE,
+        ErrorBody::new("not-supported-broken", "tree --name is not supported on broken files")
+            .with_hint(
+                "run tree --recover to see the broken state, or resolve the file first (cljform resumes once it parses)",
+            ),
+    )
+}
+
+/// The `tree --recover` branch (issue 31): the broken state is the
+/// payload — the verbatim source slice (window-composable; the BOM is
+/// re-prepended when the window starts at line 1, so the block is
+/// byte-verbatim from the on-disk file, assertable) + the diagnostics
+/// table + the intact-forms table. No handles anywhere (the design note;
+/// see the broken.rs module doc). `--depth` is validated by the caller
+/// and marks nothing here: the intact list is top-level only, and the
+/// nested structure lives in the verbatim source.
+fn render_recover_view(
+    file: &Path,
+    bytes: &[u8],
+    had_bom: bool,
+    b: &broken::Broken,
+    window: Option<(usize, usize)>,
+    human_mode: bool,
+) -> Result<Output, Fail> {
+    let (start, end) = window.unwrap_or((1, file_last_line(bytes) as usize));
+    let (lo, hi) = broken::line_range_bytes(bytes, start, end);
+    let mut source = String::new();
+    if had_bom && start == 1 {
+        source.push('\u{feff}');
+    }
+    source.push_str(&String::from_utf8_lossy(&bytes[lo..hi]));
+    // The intact forms: the partial tree's top-level forms whose span does
+    // not overlap any diagnostic span. The window composes: the labels are
+    // filtered to the forms whose span intersects the window (source slice
+    // + intact-form labels).
+    let forms = parser::partial_top_forms(bytes);
+    let mut intact = broken::intact_forms(&forms, &b.diagnostics);
+    if let Some((s, e)) = window {
+        intact.retain(|f| f.line[0] <= e && s <= f.line[1]);
+    }
+    let result = if human_mode {
+        let text = broken::recover_human(&source, (start, end), &b.diagnostics, &intact);
+        serde_json::json!({ "text": text })
+    } else {
+        broken::recover_result(&b.diagnostics, &intact, window)
+    };
+    Ok(
+        Output::ok("tree")
+            .file(Some(file.display().to_string()))
+            .file_hash(hashutil::tagged(&hashutil::file_hash(bytes)))
+            .result(result),
     )
 }
 

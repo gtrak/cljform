@@ -249,9 +249,6 @@ fn collect_errors(root: &Node, bytes: &[u8]) -> Vec<ParseDiagnostic> {
 /// (they are diagnostics, not forms — see `for_each_top_form`). Runs on
 /// the big-stack worker like `parse`; empty when the parser produced no
 /// tree.
-// Temporary (issue 31, commit 1 of 5): consumed by the `tree --recover`
-// branch (commit 3); the bin target sees no use until then.
-#[allow(dead_code)]
 pub fn partial_top_forms(bytes: &[u8]) -> Vec<Form> {
     let bytes = bytes.to_vec();
     with_big_stack(move || {

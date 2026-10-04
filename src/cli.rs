@@ -158,6 +158,16 @@ pub enum Op {
         /// See --start-line.
         #[arg(long, value_name = "N")]
         end_line: Option<u32>,
+        /// The recovery view for a BROKEN file (issue 31): the verbatim
+        /// source + the diagnostics table (conflict regions per side +
+        /// parse-error spans) + the intact top-level forms. No handles —
+        /// the write path stays gated until the file parses. On a healthy
+        /// file this is the normal tree view (byte-identical, documented).
+        /// Composes with --start-line/--end-line (the source slice) and
+        /// --json; does not compose with --name (the broken file's name
+        /// table is unreliable — a documented refusal).
+        #[arg(long)]
+        recover: bool,
     },
     /// Delete every `⟦...⟧` marker span; the stripped bytes go to stdout
     /// raw (a pure filter, no envelope).

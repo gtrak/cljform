@@ -146,6 +146,7 @@ fn dispatch(cli: &Cli) -> Result<Output, Fail> {
             name,
             start_line,
             end_line,
+            recover,
         } => ops::run_tree(
             cli,
             file,
@@ -154,6 +155,7 @@ fn dispatch(cli: &Cli) -> Result<Output, Fail> {
             name,
             *start_line,
             *end_line,
+            *recover,
         ),
         // Strip is intercepted in main() before dispatch; the arm exists
         // only for match exhaustiveness and is provably unreachable.
