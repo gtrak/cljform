@@ -61,6 +61,8 @@ interface CljformOutput {
 		repaired?: boolean;
 		repairDiff?: string;
 		wrote?: boolean;
+		/** tree line window (issue 28): requested vs effective span; real file lines. */
+		window?: { requested?: [number, number]; effective?: number[] };
 	};
 	error?: {
 		code: string;
@@ -294,13 +296,16 @@ export default function ClojureForms(pi: ExtensionAPI) {
 			"edit targets for clj_edit. Handles are content-addressed: they survive edits elsewhere in the " +
 			"file and refuse (stale-handle) when their own form changed. Pass name to select only the forms " +
 			"that define it (exact def-like name, any nesting depth): each matched subtree renders at full " +
-			"depth with its handles inline; zero matches is an ok empty result, not an error.",
+			"depth with its handles inline; zero matches is an ok empty result, not an error. On large files, " +
+			"page with startLine/endLine: the window expands to COMPLETE forms only (any form intersecting it " +
+			"is returned in full) and the result echoes the effective span with TRUE file line numbers.",
 		promptSnippet: "Read a Clojure file annotated with ⟦handle⟧ markers (the only edit targets).",
 		promptGuidelines: [
 			"Run clj_tree before any clj_edit; copy the ⟦handle⟧ you want to edit and pass it as handle.",
 			"Two cases for nested content: a NAMED nested form (defn/def/deftest… inside another form) → call with name: <that name> and copy the handle from the full-depth block; ANONYMOUS nested content (let/when bodies, vectors, maps) → patch within the enclosing form's handle (oldText/newText).",
 			"Single-line forms usually have no handle: address them by text (oldText/newText patch) inside their parent form.",
 			"A stale-handle error means the form changed — re-run clj_tree, never retry the old handle.",
+			"On large files, page with startLine/endLine: windows expand to complete forms, and the echo tells you the effective span (real file lines).",
 		],
 		parameters: Type.Object({
 			path: Type.String({ description: "Path to the .clj/.cljs/.cljc/.edn file" }),
@@ -314,6 +319,18 @@ export default function ClojureForms(pi: ExtensionAPI) {
 				Type.Union([Type.Number(), Type.Literal("all")], {
 					description:
 						"Nesting depth to mark (top-level = 1). Default is a heuristic (top-level + multi-line forms); 'all' marks every collection",
+				}),
+			),
+			startLine: Type.Optional(
+				Type.Number({
+					description:
+						"First line of the viewing window (1-based, inclusive; default 1). Only complete forms are returned: any form whose line span intersects the window is included in full, and the echo reports the effective span",
+				}),
+			),
+			endLine: Type.Optional(
+				Type.Number({
+					description:
+						"Last line of the viewing window (1-based, inclusive; default EOF). See startLine",
 				}),
 			),
 			json: Type.Optional(
@@ -331,6 +348,12 @@ export default function ClojureForms(pi: ExtensionAPI) {
 			}
 			if (params.depth !== undefined) {
 				args.push("--depth", params.depth === "all" ? "all" : String(params.depth));
+			}
+			if (params.startLine !== undefined) {
+				args.push("--start-line", String(params.startLine));
+			}
+			if (params.endLine !== undefined) {
+				args.push("--end-line", String(params.endLine));
 			}
 			const run = await runClj(args, 15_000);
 			// Human path: `tree --human` prints the annotated source directly — not a
@@ -354,7 +377,17 @@ export default function ClojureForms(pi: ExtensionAPI) {
 						`${"  ".repeat(Math.max(0, n.depth - 1))}⟦${n.handle}⟧ ${n.kind}${n.name ? ` ${n.name}` : ""} · lines ${n.line[0]}–${n.line[1]}`,
 				),
 			];
-			return { content: [{ type: "text", text: lines.join("\n") }], details: { nodes } };
+			// Window echo (issue 28): pass the real-file-line span through unchanged.
+			if (r.window) {
+				const req = r.window.requested ?? [];
+				const eff = r.window.effective ?? [];
+				lines.push(
+					eff.length === 2
+						? `window: requested lines ${req[0]}–${req[1]}, effective lines ${eff[0]}–${eff[1]}`
+						: `window: requested lines ${req[0]}–${req[1]}, no complete forms intersect`,
+				);
+			}
+			return { content: [{ type: "text", text: lines.join("\n") }], details: { nodes, window: r.window } };
 		},
 	});
 

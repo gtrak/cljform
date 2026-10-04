@@ -148,6 +148,16 @@ pub enum Op {
         /// §10.2). Zero matches is an ok empty result, not an error.
         #[arg(long, value_name = "SYM")]
         name: Option<String>,
+        /// First line of the viewing window (1-based, inclusive; default 1).
+        /// A form is included iff its line span intersects
+        /// [start-line, end-line]; included forms render in full, so the
+        /// effective region may extend past the window (SPEC §10.2).
+        #[arg(long, value_name = "N")]
+        start_line: Option<u32>,
+        /// Last line of the viewing window (1-based, inclusive; default EOF).
+        /// See --start-line.
+        #[arg(long, value_name = "N")]
+        end_line: Option<u32>,
     },
     /// Delete every `⟦...⟧` marker span; the stripped bytes go to stdout
     /// raw (a pure filter, no envelope).

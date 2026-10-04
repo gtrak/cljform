@@ -159,7 +159,7 @@ not serialized — it is not addressable).
 | Op | Purpose | Mutates | Key args |
 |----|---------|---------|----------|
 | `forms <file>` | top-level form table (§4.2) | no | — |
-| `tree <file>` | annotated view: source with `⟦handle⟧` after each marked collection's opening delimiter (§10.2) | no | `--depth N\|all`, `--full`, `--json` (flat node table), `--name SYM` (selector, §10.2) |
+| `tree <file>` | annotated view: source with `⟦handle⟧` after each marked collection's opening delimiter (§10.2) | no | `--depth N\|all`, `--full`, `--json` (flat node table), `--name SYM` (selector, §10.2), `--start-line N` / `--end-line N` (line window, §10.2) |
 | `strip [file]` | delete every `⟦…⟧` marker → the exact original bytes; pure stdout filter, no envelope (§10.2) | no | file or stdin |
 | `get <file>` | one form's exact bytes + metadata, including its handle | no | `--name sym` \| `--handle H` |
 | `check [file]` | parse + form table + nesting warnings | no | file or stdin |
@@ -412,7 +412,7 @@ session.
 | Tool | Params | Maps to |
 |------|--------|---------|
 | `clj_forms` | `{path}` | `cljform forms --json`; refreshes the fingerprint cache |
-| `clj_tree` | `{path, name?, depth?, json?}` | `cljform tree` — the primary handle-discovery view (`--depth N\|all`); `name` maps to `--name SYM` (the §10.2 selector: matched subtrees at full depth, zero matches is an ok empty result); `json` returns the structured node list. **Human path (default, `--human`) is a pass-through:** the annotated source is not a JSON envelope, so on exit 0 the wrapper returns `stdout` directly (BOM-stripped, `trimEnd`) with no `isError` — a successful default `clj_tree` is never an error and is never prefixed `cljform failed:`. Only a nonzero exit (or, in `json` mode, an unparseable/`ok:false` envelope) yields `isError`, using `errorText` when the output parses as an error envelope, else the `cljform failed: ${stderr \|\| stdout}` fallback |
+| `clj_tree` | `{path, name?, depth?, json?, startLine?, endLine?}` | `cljform tree` — the primary handle-discovery view (`--depth N\|all`); `name` maps to `--name SYM` (the §10.2 selector: matched subtrees at full depth, zero matches is an ok empty result); `json` returns the structured node list; `startLine`/`endLine` map to `--start-line`/`--end-line` (the §10.2 line window: complete forms only, real file line numbers, the effective span echoed — page large files; the window header/echo passes through unchanged). **Human path (default, `--human`) is a pass-through:** the annotated source is not a JSON envelope, so on exit 0 the wrapper returns `stdout` directly (BOM-stripped, `trimEnd`) with no `isError` — a successful default `clj_tree` is never an error and is never prefixed `cljform failed:`. Only a nonzero exit (or, in `json` mode, an unparseable/`ok:false` envelope) yields `isError`, using `errorText` when the output parses as an error envelope, else the `cljform failed: ${stderr \|\| stdout}` fallback |
 | `clj_get` | `{path, name? / handle?}` | `cljform get --json` — exact bytes + the form's `⟦handle⟧` |
 | `clj_edit` | `{path, handle?, mode?, content? / oldText? + newText?, dryRun?, strict?, repair?, autoFormat?}` | `cljform edit --handle …` — mode auto-selects `patch` when `oldText` is present; append/prepend take no handle; `dryRun` ⇒ `--dry-run`, `strict` ⇒ `--strict`, `repair` ⇒ `--repair`; `autoFormat` (default true) maps to the in-edit content reindent: `false` passes `--no-format-content`, `true` (the default) passes nothing and lets `cljform edit` reindent the content itself in parinfer paren mode (§10.3/§10.5; a refused reindent is reported by the CLI as a note, the edit never fails for it); the wrapper no longer runs a separate `cljform format` call; `oldText`/`newText` are exact patch text and are never reformatted. **Next-handle affordance:** on every successful (non-dry-run) edit the wrapper appends a final line sourced from the JSON envelope (`result.summary`), never from re-parsing the human text — `replace`/`patch` append `next handle: ⟦H⟧ — use it for the next edit to this form` (from `summary.handle`; falls back to `summary.wasHandle` only when `handle` is absent) so the agent chases the returned handle instead of re-fetching; `insert-after`/`insert-before` append `inserted handles: ⟦…⟧, ⟦…⟧ (anchor ⟦…⟧) — use these for the next edit` (from `summary.handles`, plus `summary.wasHandle` when present); `delete` appends nothing (the form is gone — no stale handle) |
 | `clj_draft` | `{content}` | `cljform materialize --content-file …` — returns candidate + diff; never writes |
@@ -576,6 +576,31 @@ collection delimiter:
   callers (worker guidance): a named nested form → `tree --name X`, copy the
   handle, edit; anonymous nested content → patch within the enclosing form's
   handle.
+- **`--start-line S` / `--end-line E` window (issue 28)** — incremental
+  viewing of large files. `S`/`E` are 1-based, inclusive-inclusive **line**
+  bounds (default: start 1, end EOF; lines, not bytes — the same line
+  ranges the view reports; byte offsets deliberately not added, one
+  unambiguous way). **Complete forms only:** a top-level form is included
+  iff its line span INTERSECTS the window; it is rendered in full even
+  when its span extends past the window ("increase the bounds to allow
+  it") and its subtrees come with it; no partial form, no handle for a
+  fragment. The effective region — the union of the included forms' spans
+  — may be LARGER than the requested window, and the output echoes both.
+  The windowed view is labeled with **REAL file line numbers**: each
+  included form is a block headed by `⟦handle⟧ <label> (lines S–E)` in the
+  true file range (never renumbered from the slice start), and the JSON
+  nodes keep their true `[start,end]` untouched. Human: a header line
+  `forms in lines S–E (complete forms span lines X–Y)` precedes the
+  blocks; `--json`: the node table filtered to the included forms' subtrees
+  (same node shape) plus `window: {requested: [S,E], effective: [X,Y]}`
+  (`effective` is `[]` when nothing intersects — a window past EOF or in
+  whitespace between forms is `ok:true` with zero forms and the echo
+  explaining it, never an error). `start > end` and 0-valued lines are
+  usage errors (exit 2). Composes with `--depth` (the depth cutoff applies
+  inside the region) and `--json`; with `--name` the name filter applies
+  first and the window then filters matches by span, both reported in the
+  echo. With no window given the output is byte-identical to the unflagged
+  views (no header, no `window` key).
 
 ### 10.3 Edit contract
 
@@ -894,3 +919,20 @@ design):
   and every successful edit must come back from `cljform format` as a
   no-op (candidate == content); the R1–R4 repros are golden tests in
   `tests/canonical.rs` and `tests/format.rs`.
+- **`tree` line window (issue 28).** `tree <file> --start-line S --end-line E`
+  pages large files by line with the **complete-forms-only** invariant: a
+  top-level form is included iff its line span intersects the window and
+  renders in full; the effective region (union of included spans, which may
+  be larger than the window) is what is rendered, and the output echoes
+  requested vs effective. Human: header `forms in lines S–E (complete forms
+  span lines X–Y)` + one labeled block per included form, each labeled with
+  its **TRUE file line range** (`⟦handle⟧ defn f (lines 100–122)` — never
+  slice-relative); JSON: the node table filtered to the included forms'
+  subtrees (real line ranges untouched) + `window: {requested, effective}`
+  (`effective: []` when empty). `start > end` / 0-valued lines: usage error
+  (exit 2). Composes with `--depth` (cutoff applies inside the region),
+  `--json`, and `--name` (name filter first, window filters matches; both
+  echoed). No window: byte-identical legacy output (verified by the
+  old-vs-new battery). The wrapper's `clj_tree` gains `startLine`/`endLine`
+  (pass-through, real ranges preserved; guidance: page large files, windows
+  expand to complete forms).

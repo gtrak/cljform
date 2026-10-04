@@ -2,6 +2,7 @@
 //! `strip`), the shared read/parse helpers, and target/handle resolution
 //! (shared by `get` and the edit pipeline).
 
+use std::collections::HashSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -418,23 +419,32 @@ pub fn run_materialize(
 
 /// `cljform tree`: the annotated form view (raw `⟦handle⟧` text) or the node
 /// table with --json; `--name X` lists only the forms that define `X`
-/// (SPEC §10.2).
+/// (SPEC §10.2). `--start-line S --end-line E` (issue 28) restricts the
+/// view to a 1-based inclusive-inclusive line window: a top-level form is
+/// included iff its line span intersects the window; included forms are
+/// rendered in FULL (complete forms only), so the effective region is the
+/// union of the included spans and may be larger than the window — the
+/// echo (human header / JSON `window` key) carries both.
 pub fn run_tree(
     cli: &Cli,
     file: &Path,
     depth: &Option<String>,
     full: &bool,
     name: &Option<String>,
+    start_line: Option<u32>,
+    end_line: Option<u32>,
 ) -> Result<Output, Fail> {
     let (bytes, had_bom) = read_file(file)?;
     // Same parse the resolver uses: unparseable files get no view.
     require_parse(&bytes)?;
+    let window = window_bounds(start_line, end_line, &bytes)?;
     if let Some(n) = name {
         return run_tree_named(
             file,
             &bytes,
             n,
             cli.human || (!cli.json && cli::atty_stdout()),
+            window,
         );
     }
     let nodes = handle::collect(&bytes);
@@ -460,19 +470,14 @@ pub fn run_tree(
     };
     let human_mode = cli.human || (!cli.json && cli::atty_stdout());
     if human_mode {
-        let annotated = handle::annotate(&bytes, d).map_err(|_| {
-            Fail(
-                errors::exit::PARSE,
-                ErrorBody::new(
-                    "annotate-conflict",
-                    format!(
-                        "the source already contains marker glyphs ({}/{}) and the view cannot be stripped losslessly",
-                        handle::MARKER_OPEN, handle::MARKER_CLOSE
-                    ),
-                )
-                .with_hint("use --json to list the nodes without markers"),
-            )
-        })?;
+        // Issue 28: with a window, the view is the included top-level
+        // forms, each as a labeled block (true file line range, --name
+        // block style) rendered at the depth cutoff.
+        if let Some((s, e)) = window {
+            let marked = handle::depth_marks(&nodes, d);
+            return render_window_blocks(file, &bytes, &nodes, &marked, had_bom, s, e);
+        }
+        let annotated = handle::annotate(&bytes, d).map_err(|_| annotate_conflict())?;
         // Re-prepend the BOM so `strip` recovers the exact on-disk
         // bytes of BOM-prefixed files.
         let mut text = if had_bom {
@@ -488,6 +493,41 @@ pub fn run_tree(
                 .result(serde_json::json!({ "text": text })),
         );
     }
+    if let Some((s, e)) = window {
+        // Node table FILTERED to the included forms' subtrees (same node
+        // shape, real file line ranges untouched) + the window echo.
+        let included = included_top_level(&nodes, s, e);
+        let addrs: HashSet<u32> = included
+            .iter()
+            .map(|&i| nodes[i].top_level)
+            .collect();
+        let out_nodes: Vec<serde_json::Value> = nodes
+            .iter()
+            .filter(|n| addrs.contains(&n.top_level))
+            .map(serde_json::to_value)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("Node serializes");
+        let effective = if included.is_empty() {
+            serde_json::json!([])
+        } else {
+            serde_json::json!([
+                nodes[included[0]].line[0],
+                nodes[included[included.len() - 1]].line[1]
+            ])
+        };
+        return Ok(
+            Output::ok("tree")
+                .file(Some(file.display().to_string()))
+                .file_hash(hashutil::tagged(&hashutil::file_hash(&bytes)))
+                .result(serde_json::json!({
+                    "nodes": out_nodes,
+                    "window": {
+                        "requested": [s, e],
+                        "effective": effective
+                    }
+                })),
+        );
+    }
     Ok(
         Output::ok("tree")
             .file(Some(file.display().to_string()))
@@ -496,17 +536,209 @@ pub fn run_tree(
     )
 }
 
+/// The `annotate-conflict` failure: the source already contains marker
+/// glyphs, so the view cannot be stripped losslessly.
+fn annotate_conflict() -> Fail {
+    Fail(
+        errors::exit::PARSE,
+        ErrorBody::new(
+            "annotate-conflict",
+            format!(
+                "the source already contains marker glyphs ({}/{}) and the view cannot be stripped losslessly",
+                handle::MARKER_OPEN, handle::MARKER_CLOSE
+            ),
+        )
+            .with_hint("use --json to list the nodes without markers"),
+    )
+}
+
+/// Issue 28: normalize the `--start-line`/`--end-line` window. 1-based,
+/// inclusive-inclusive; a zero line or start > end is a usage error (exit
+/// 2); an open end defaults to the file's last line (lines, not bytes —
+/// the same line ranges the view reports).
+fn window_bounds(
+    start_line: Option<u32>,
+    end_line: Option<u32>,
+    bytes: &[u8],
+) -> Result<Option<(usize, usize)>, Fail> {
+    let Some(bound) = start_line.or(end_line) else {
+        return Ok(None); // no window: the legacy byte-identical view
+    };
+    let start = start_line.unwrap_or(1);
+    let end = end_line.unwrap_or_else(|| file_last_line(bytes));
+    if start == 0 || end == 0 {
+        return Err(Fail(
+            errors::exit::USAGE,
+            ErrorBody::new(
+                "usage",
+                format!("--start-line/--end-line are 1-based, got line {bound}"),
+            ),
+        ));
+    }
+    if start > end {
+        return Err(Fail(
+            errors::exit::USAGE,
+            ErrorBody::new(
+                "usage",
+                format!("--start-line {start} is greater than --end-line {end}"),
+            )
+            .with_hint("the window is inclusive-inclusive: start <= end"),
+        ));
+    }
+    Ok(Some((start as usize, end as usize)))
+}
+
+/// 1-based last line number of the stripped bytes (1 for an empty file).
+fn file_last_line(bytes: &[u8]) -> u32 {
+    if bytes.is_empty() {
+        return 1;
+    }
+    let newlines = bytes.iter().filter(|&&b| b == b'\n').count() as u32;
+    if bytes.ends_with(b"\n") {
+        newlines
+    } else {
+        newlines + 1
+    }
+}
+
+/// The top-level form nodes (depth 1, document order) whose line span
+/// intersects [start, end]. Contiguous by construction: spans nest and
+/// top-level forms are disjoint and ordered.
+fn included_top_level(nodes: &[handle::Node], start: usize, end: usize) -> Vec<usize> {
+    nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| n.depth == 1 && n.line[0] <= end && start <= n.line[1])
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// Issue 28 human window view: header echoing requested vs effective span,
+/// then each included top-level form as a labeled block — its TRUE file
+/// line range (never renumbered from the slice start), head + name like
+/// the `--name` blocks — followed by the form's annotated source at the
+/// depth cutoff.
+fn render_window_blocks(
+    file: &Path,
+    bytes: &[u8],
+    nodes: &[handle::Node],
+    marked: &[bool],
+    had_bom: bool,
+    start: usize,
+    end: usize,
+) -> Result<Output, Fail> {
+    let included = included_top_level(nodes, start, end);
+    let header = if included.is_empty() {
+        format!(
+            "forms in lines {}\u{2013}{} (no complete forms intersect the window)",
+            start, end
+        )
+    } else {
+        format!(
+            "forms in lines {}\u{2013}{} (complete forms span lines {}\u{2013}{})",
+            start,
+            end,
+            nodes[included[0]].line[0],
+            nodes[included[included.len() - 1]].line[1]
+        )
+    };
+    if included.is_empty() {
+        let mut text = bom_prefix(had_bom);
+        text.push_str(&header);
+        return Ok(window_output(file, bytes, text));
+    }
+    // The depth cutoff (heuristic / --depth / --full) composes with the
+    // window: the included forms are top-level, so the full-table marks are
+    // exactly the region-relative marks — `marked` decides what is labeled,
+    // the window decides what is emitted.
+    // A marker glyph anywhere in the effective region would make the view
+    // unstrippable — refuse before emitting anything.
+    let (region_start, region_end) = (
+        nodes[included[0]].start_byte,
+        nodes[included[included.len() - 1]].end_byte,
+    );
+    if handle::contains_marker(&bytes[region_start..region_end]) {
+        return Err(annotate_conflict());
+    }
+    let blocks: Vec<String> = included
+        .iter()
+        .map(|&i| {
+            let n = &nodes[i];
+            let label = form_block_label(n);
+            let block = handle::annotate_marked(nodes, bytes, marked, n.start_byte, n.end_byte);
+            if block.ends_with('\n') {
+                format!("{label}\n{block}")
+            } else {
+                format!("{label}\n{block}\n")
+            }
+        })
+        .collect();
+    let mut text = bom_prefix(had_bom);
+    text.push_str(&header);
+    text.push('\n');
+    text.push_str(&blocks.join("\n"));
+    Ok(window_output(file, bytes, text))
+}
+
+fn window_output(file: &Path, bytes: &[u8], text: String) -> Output {
+    Output::ok("tree")
+        .file(Some(file.display().to_string()))
+        .file_hash(hashutil::tagged(&hashutil::file_hash(bytes)))
+        .result(serde_json::json!({ "text": text }))
+}
+
+fn bom_prefix(had_bom: bool) -> String {
+    if had_bom {
+        String::from('\u{feff}')
+    } else {
+        String::new()
+    }
+}
+
+/// The windowed human block label: `⟦handle⟧ <label> (lines S–E)` with
+/// the form's TRUE file line range — display context in the --name block
+/// style, the handle staying the edit address.
+fn form_block_label(n: &handle::Node) -> String {
+    format!(
+        "\u{27E6}{}\u{27E7} {} (lines {}\u{2013}{})",
+        n.handle, enclosing_label(n), n.line[0], n.line[1]
+    )
+}
+
+/// The window clause the `--name` header echoes (issue 28 composition): the
+/// name filter applies first, the window filters matches by span, both are
+/// reported.
+fn window_clause(start: usize, end: usize, matches: &[usize], nodes: &[handle::Node]) -> String {
+    if matches.is_empty() {
+        format!(
+            ", forms in lines {}\u{2013}{} (no complete forms intersect the window)",
+            start, end
+        )
+    } else {
+        format!(
+            ", forms in lines {}\u{2013}{} (complete forms span lines {}\u{2013}{})",
+            start,
+            end,
+            nodes[matches[0]].line[0],
+            nodes[matches[matches.len() - 1]].line[1]
+        )
+    }
+}
+
 /// `tree --name X` (SPEC §10.2): exact def-like name equality at any nesting
 /// depth (no substring matching). The matched subtrees are the whole result —
 /// human: a count header, then each match's full-depth annotated source block
 /// (handles inline), sorted by line; JSON: the filtered node table. Zero
 /// matches is an ok empty result, never an error. `--depth`/`--full` are view
 /// concerns the selector overrides: matched blocks are always full depth.
+/// With a line window (issue 28) the name filter applies first and the
+/// window then keeps only matches whose span intersects it; both are echoed.
 fn run_tree_named(
     file: &Path,
     bytes: &[u8],
     name: &str,
     human: bool,
+    window: Option<(usize, usize)>,
 ) -> Result<Output, Fail> {
     let nodes = handle::collect(bytes);
     // Exact name equality against the node table's def-like names. Document
@@ -519,11 +751,19 @@ fn run_tree_named(
         .map(|(i, _)| i)
         .collect();
     matches.sort_by_key(|&i| nodes[i].line[0]);
-    let header = if matches.len() == 1 {
+    // Issue 28: the window filters matches by their span intersecting it;
+    // real file line ranges are preserved throughout.
+    if let Some((s, e)) = window {
+        matches.retain(|&i| nodes[i].line[0] <= e && s <= nodes[i].line[1]);
+    }
+    let mut header = if matches.len() == 1 {
         format!("1 match for name {name:?} in {}", file.display())
     } else {
         format!("{} matches for name {name:?} in {}", matches.len(), file.display())
     };
+    if let Some((s, e)) = window {
+        header.push_str(&window_clause(s, e, &matches, &nodes));
+    }
     if human {
         // Each match: its line range, then the enclosing-context line
         // (issue 27 F14), then the full-depth annotated source block with
@@ -531,19 +771,7 @@ fn run_tree_named(
         let mut blocks: Vec<String> = Vec::with_capacity(matches.len());
         for &i in &matches {
             let node = &nodes[i];
-            let block = handle::annotate_subtree(bytes, i).map_err(|_| {
-                Fail(
-                    errors::exit::PARSE,
-                    ErrorBody::new(
-                        "annotate-conflict",
-                        format!(
-                            "the source already contains marker glyphs ({}/{}) and the view cannot be stripped losslessly",
-                            handle::MARKER_OPEN, handle::MARKER_CLOSE
-                        ),
-                    )
-                    .with_hint("use --json to list the nodes without markers"),
-                )
-            })?;
+            let block = handle::annotate_subtree(bytes, i).map_err(|_| annotate_conflict())?;
             // One line of enclosing context: the enclosing top-level form's
             // handle + label + line range (display context, not an address
             // — the match's own handle stays the only edit address).
@@ -577,7 +805,44 @@ fn run_tree_named(
                 .result(serde_json::json!({ "text": text })),
         );
     }
-    let out_nodes: Vec<serde_json::Value> = matches
+    let mut out: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    out.insert("count".into(), serde_json::json!(matches.len()));
+    out.insert(
+        "nodes".into(),
+        serde_json::to_value(named_nodes(&nodes, &matches, name))
+            .expect("named nodes serialize"),
+    );
+    if let Some((s, e)) = window {
+        let effective = if matches.is_empty() {
+            serde_json::json!([])
+        } else {
+            serde_json::json!([
+                nodes[matches[0]].line[0],
+                nodes[matches[matches.len() - 1]].line[1]
+            ])
+        };
+        out.insert(
+            "window".into(),
+            serde_json::json!({ "requested": [s, e], "effective": effective }),
+        );
+    }
+    Ok(
+        Output::ok("tree")
+            .file(Some(file.display().to_string()))
+            .file_hash(hashutil::tagged(&hashutil::file_hash(bytes)))
+            .result(serde_json::Value::Object(out)),
+    )
+}
+
+/// The `--name` JSON match nodes (SPEC §10.2): the matched node with the
+/// queried name echoed and the enclosing top-level form's handle (issue
+/// 27 F14) as display context. Real file line ranges untouched.
+fn named_nodes(
+    nodes: &[handle::Node],
+    matches: &[usize],
+    name: &str,
+) -> Vec<serde_json::Value> {
+    matches
         .iter()
         .map(|&i| {
             let mut n = nodes[i].clone();
@@ -593,20 +858,14 @@ fn run_tree_named(
             if let serde_json::Value::Object(map) = &mut v {
                 map.insert(
                     "parentHandle".to_string(),
-                    enclosing_top_level(&nodes, i)
+                    enclosing_top_level(nodes, i)
                         .map(|e| serde_json::Value::String(e.handle.clone()))
                         .unwrap_or(serde_json::Value::Null),
                 );
             }
             v
         })
-        .collect();
-    Ok(
-        Output::ok("tree")
-            .file(Some(file.display().to_string()))
-            .file_hash(hashutil::tagged(&hashutil::file_hash(bytes)))
-            .result(serde_json::json!({ "count": matches.len(), "nodes": out_nodes })),
-    )
+        .collect()
 }
 
 /// `tree --name` enclosing context (issue 27 F14): the top-level form

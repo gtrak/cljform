@@ -112,15 +112,21 @@ pub fn annotate(bytes: &[u8], depth: Depth) -> Result<String, AnnotateError> {
         return Err(AnnotateError::MarkerConflict);
     }
     let nodes = collect(bytes);
-    let marked = match depth {
+    let marked = depth_marks(&nodes, depth);
+    Ok(annotate_marked(&nodes, bytes, &marked, 0, bytes.len()))
+}
+
+/// The marking decision for `depth` over the full node table (the depth
+/// flags gate only the view; handles are computed for every node).
+pub fn depth_marks(nodes: &[Node], depth: Depth) -> Vec<bool> {
+    match depth {
         Depth::All => vec![true; nodes.len()],
         Depth::Levels(n) => nodes
             .iter()
             .map(|node| node.depth <= n)
             .collect::<Vec<bool>>(),
-        Depth::Heuristic => heuristic_marks(&nodes),
-    };
-    Ok(annotate_marked(&nodes, bytes, &marked, 0, bytes.len()))
+        Depth::Heuristic => heuristic_marks(nodes),
+    }
 }
 
 /// Annotate one matched node and its whole subtree at full depth — the
@@ -147,9 +153,11 @@ pub fn annotate_subtree(bytes: &[u8], idx: usize) -> Result<String, AnnotateErro
 }
 
 /// The marker insertion itself: copy `bytes[start..end]`, inserting
-/// `⟦handle⟧` after the opening delimiter of each marked node. The marked
-/// set is a view concern only (depth flags, subtree selectors).
-fn annotate_marked(
+/// `⟦handle⟧` after the opening delimiter of each marked node whose start
+/// lies in the region. The marked set is a view concern only (depth flags,
+/// subtree selectors, line windows — the region restricts what is emitted,
+/// the marks decide what is labeled).
+pub fn annotate_marked(
     nodes: &[Node],
     bytes: &[u8],
     marked: &[bool],
@@ -177,7 +185,7 @@ fn annotate_marked(
 /// are recorded in preorder, so a subtree is a contiguous range. One reverse
 /// pass folds each child's end into its parent — O(n), never per-node chain
 /// walks (issue 22).
-fn subtree_end(nodes: &[Node], idx: usize) -> usize {
+pub fn subtree_end(nodes: &[Node], idx: usize) -> usize {
     let mut end: Vec<usize> = (0..nodes.len()).map(|i| i + 1).collect();
     for i in (0..nodes.len()).rev() {
         if let Some(p) = nodes[i].parent {
@@ -500,7 +508,7 @@ fn opening_delimiter_end(bytes: &[u8], start: usize) -> usize {
     pos + 1
 }
 
-fn contains_marker(bytes: &[u8]) -> bool {
+pub fn contains_marker(bytes: &[u8]) -> bool {
     let open = MARKER_OPEN.as_bytes();
     let close = MARKER_CLOSE.as_bytes();
     bytes
