@@ -210,8 +210,9 @@ ln -s "$PWD/extension/agents/clojure-worker.md"  ~/.pi/agent/agents/clojure-work
 
 The `format` engine reimplements parinfer's paren-mode indentation
 semantics; the behavioral reference was
-[parinfer-rust](https://github.com/justinj/parinfer-rust) by Jason Felice
-(ISC), carrying Shaun Lebron's original parinfer design. No code is shared —
+[parinfer-rust](https://github.com/gtrak/parinfer-rust) — Jason
+Felice's Rust implementation (ISC, forked here), carrying Shaun Lebron's
+original parinfer design. No code is shared —
 but if you want battle-tested parinfer as a library rather than a
 form-editing tool, use parinfer-rust.
 
