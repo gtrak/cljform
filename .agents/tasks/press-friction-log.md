@@ -152,3 +152,9 @@ Both reported silent-corruption modes DO NOT reproduce (repros in /tmp/repro17):
   the changed-region diff (r.text embeds it since issue 27; the wrapper's
   `diff (changed region):` block appends it again). -> issue 34, queued
   behind 32.
+- F20 (owner-identified): the inserted-handles list doesn't say which
+  handle is which form (opaque hashes, document-order only; the binding
+  lives in the adjacent affected-rows block). -> issue 35, queued behind 34:
+  labeled insert block (⟦h⟧ head name (lines a–b) per entry), labels from
+  the summary builder's own view (nested inserts included), single-form
+  inserts may collapse to the existing next-handle line.
