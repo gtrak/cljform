@@ -143,3 +143,8 @@ Both reported silent-corruption modes DO NOT reproduce (repros in /tmp/repro17):
   written.
 - Minor: bounded-run prints the timed command on stderr (jq-piping patterns
   can drop it); --recover does not compose with --name (documented).
+- F16/F17/T9-F2 (response scoping family) -> issue 32 in flight: edit --human
+  result-first with affected-row + counts (no whole-file table), get
+  payload-first + formsCount (edit envelope's forms array STAYS — it is the
+  cross-check that caught issue 19's stale-head bug), format unchanged-case
+  one-liner, related-surface audit mandated.
