@@ -206,6 +206,15 @@ ln -s "$PWD/extension/clojure-forms.ts" ~/.pi/agent/extensions/clojure-forms.ts
 ln -s "$PWD/extension/agents/clojure-worker.md"  ~/.pi/agent/agents/clojure-worker.md
 ```
 
+## Acknowledgements
+
+The `format` engine reimplements parinfer's paren-mode indentation
+semantics; the behavioral reference was
+[parinfer-rust](https://github.com/justinj/parinfer-rust) by Jason Felice
+(ISC), carrying Shaun Lebron's original parinfer design. No code is shared —
+but if you want battle-tested parinfer as a library rather than a
+form-editing tool, use parinfer-rust.
+
 ## Development
 
 ```sh
