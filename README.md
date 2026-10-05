@@ -144,7 +144,7 @@ cargo test                          # cli, forms, repair,
 Standard gates (run before reporting any change): `cargo build` ·
 `cargo clippy --all-targets -- -D warnings -W clippy::unwrap_used
 -W clippy::expect_used -W clippy::panic -W clippy::unreachable -D
-clippy::todo` · `cargo test`. The lint gate denies panicking constructs
+clippy::todo` · `cargo test`. Release builds run with `overflow-checks = true`; the lint gate denies panicking constructs
 (`unwrap`/`expect`/`panic!`/`unreachable!`/`todo!`); every remaining site
 is an in-source `#[allow]` carrying a one-line written justification
 (auditable assumptions, issue 30), and a residual panic is converted at

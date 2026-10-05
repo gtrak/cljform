@@ -482,7 +482,7 @@ re-verifies against disk on every operation.
 
 **Guard hook (the reason the wrapper earns its keep even when the agent uses
 plain `edit`/`write`):** on `tool_result` for built-in `edit`/`write` whose
-target matches `\.(clj|cljs|cljc|cljx|edn)$` and the file exists:
+target matches `\.(clj|cljs|cljc|cljx [legacy]|edn)$` and the file exists:
 run `cljform check --json` (time-box 2 s; on timeout, skip with a note) and
 append to the tool result:
 - parse failure → prominent `BLOCKING:` line with line/col from the CLI,
@@ -855,9 +855,9 @@ wide characters.
 
 ## 12. Open questions
 
-1. **Handle length** — shipped at the shortest unique prefix (≥ 6 hex
-   chars). Open: whether a longer default prefix, or a display-length cap in
-   `tree`, is wanted for copy-paste robustness in agent transcripts.
+1. **Handle length** — settled: shortest unique prefix (≥ 6 hex chars).
+   Two dogfoods (T14–T16) used the ≥6-hex affordances with zero copy-paste
+   incidents; revisit only if a transcript incident appears.
 2. **`.edn` handling** — same engine, but `deftest`-style detectors are clj
    only; for `.edn`, run checks + splice with an empty detector set.
 3. **Should the guard hook also run a linter** (scoped, ~10 s)? *Default: no —
