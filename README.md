@@ -34,9 +34,24 @@ bury the source in `⟦handle⟧` glyphs. The line the heuristic draws is also
 the workflow line: a **multi-line nested form** is worth editing as a
 whole unit, so it gets a handle; a **single-line inner expression** is a
 patch target instead — you change it through its *parent's* handle, which
-needs no deep handle at all. When you do want depth: `--full` marks every
-collection, `--name SYM` renders a matched form's entire subtree, and
-`--json` always lists a handle for every node at every depth.
+needs no deep handle at all. When a nested form *is* multi-line, it gets
+its own handle — and its multi-line children get theirs, down the tree:
+
+```console
+$ cljform tree report.clj
+(⟦da51a6⟧defn render-report [rows]
+  (⟦71a7de⟧let [⟦a85514⟧total (reduce + 0 (map :amount rows))
+        lines (⟦f3a214⟧for [r rows]
+                (format "%-20s %8.2f\n" (:name r) (:amount r)))]
+    (⟦83c8ea⟧str "TOTAL: " total "\n"
+         (apply str lines))))
+```
+
+The `let`, the `for`, and the `str` span lines, so they carry handles;
+their single-line children (`(reduce …)`, `(format …)`, the binding
+vectors) do not. When you want every collection regardless:
+`--full` marks all, `--name SYM` renders a matched form's entire subtree,
+and `--json` always lists a handle for every node at every depth.
 
 Every handle is a short content hash, and the **only** edit target. Edit
 by handle:
