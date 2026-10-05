@@ -26,9 +26,10 @@ closer to a solution, but this is a more purpose-built tool for agents' expectat
 built by constant dogfooding between GLM 5.3 flash and my local model, with me nudging the design.
 The original approach came from this article: https://lispmeister.github.io/deeprecursion/posts/2026-02-13-sexp-native-editing.html .
 I started with tree-sitter and the LLM's own retrospective of a session with a
-lot of failed edits.  I care less about conceptual cleanliness than I do about having a
-useful tool with better working tradeoffs, so the implementation details are still
-unstable.
+lot of failed edits.  
+
+I care less about conceptual cleanliness in this project than I do about having a
+useful tool with better working tradeoffs, and the implementation details are unstable.
 
 ## A thirty-second tour
 
