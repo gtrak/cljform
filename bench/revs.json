@@ -1,0 +1,51 @@
+{
+  "starters": {
+    "ring": "f14beaf7d7e261a701c4912be3929e0d5c01a881",
+    "datascript": "34915cf673c02cbc64779fe56e0288d70fea63f8",
+    "clj-kondo": "7917eecfdf7b6fd8c1233803ea660107e6148493"
+  },
+  "revisions": {
+    "head": {
+      "cljformSha": "bee1a7813f3c47f444cd2fbd7d9554b52b1f476a",
+      "ext": "extension/clojure-forms.ts",
+      "bin": "target/release/cljform",
+      "built": true,
+      "note": "working tree / current release build"
+    },
+    "pre-35": {
+      "cljformSha": "9ed41b15e4dfe6862448e82f3de94b234876752f",
+      "label": "pre 35 (labeled inserts)",
+      "ext": "bench/revs/pre-35/extension/clojure-forms.ts",
+      "bin": "bench/revs/pre-35/cljform",
+      "built": false
+    },
+    "pre-32": {
+      "cljformSha": "efaa1c69ecde4f3cf2db8b6f86666f597baa0239",
+      "label": "pre 32 (response scoping)",
+      "ext": "bench/revs/pre-32/extension/clojure-forms.ts",
+      "bin": "bench/revs/pre-32/cljform",
+      "built": false
+    },
+    "pre-28": {
+      "cljformSha": "c78569e807e6f1990dac427a835ff4a1cffbc143",
+      "label": "pre 28 (windows)",
+      "ext": "bench/revs/pre-28/extension/clojure-forms.ts",
+      "bin": "bench/revs/pre-28/cljform",
+      "built": false
+    },
+    "pre-26": {
+      "cljformSha": "615b485751be56aa036c90b74648d2cdebb8701e",
+      "label": "pre 26 (--name)",
+      "ext": "bench/revs/pre-26/extension/clojure-forms.ts",
+      "bin": "bench/revs/pre-26/cljform",
+      "built": false
+    },
+    "pre-15": {
+      "cljformSha": "93997cc3bb3d4987b55798ddd9d0e55e168872c8",
+      "label": "pre 15 (affordances)",
+      "ext": "bench/revs/pre-15/extension/clojure-forms.ts",
+      "bin": "bench/revs/pre-15/cljform",
+      "built": false
+    }
+  }
+}

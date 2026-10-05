@@ -1,1 +1,6 @@
 target/
+# bench: materialized starters (full clones), disposable scratch, and
+# built revision binaries are heavy/local — the pin SHAs live in bench/revs.json
+bench/starter-src/
+bench/work/
+bench/revs/

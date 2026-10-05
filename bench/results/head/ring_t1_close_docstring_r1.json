@@ -1,0 +1,55 @@
+{
+ "task": "ring_t1_close_docstring",
+ "tier": 1,
+ "repo": "ring",
+ "rev": "head",
+ "rep": 1,
+ "success": true,
+ "checks": {
+  "done": {
+   "pass": true,
+   "detail": "docstring ends with 'Returns nil.' (' a stream is closed, swallowing any exceptions. Returns nil.')"
+  },
+  "collateral": {
+   "pass": true,
+   "changedFiles": [
+    "ring-core/src/ring/util/io.clj"
+   ],
+   "detail": "no collateral"
+  },
+  "tests": {
+   "run": false
+  }
+ },
+ "lintDelta": {
+  "newErrors": 0,
+  "newWarnings": 0,
+  "newFindings": []
+ },
+ "diff": "diff --git a/ring-core/src/ring/util/io.clj b/ring-core/src/ring/util/io.clj\nindex d43e48a..4632102 100644\n--- a/ring-core/src/ring/util/io.clj\n+++ b/ring-core/src/ring/util/io.clj\n@@ -34,11 +34,11 @@\n    (ByteArrayInputStream. (.getBytes s)))\n   ([^String s ^String encoding]\n    (ByteArrayInputStream. (.getBytes s encoding))))\n \n (defn close!\n-  \"Ensure a stream is closed, swallowing any exceptions.\"\n+  \"Ensure a stream is closed, swallowing any exceptions. Returns nil.\"\n   {:added \"1.2\"}\n   [stream]\n   (when (instance? java.io.Closeable stream)\n     (try\n       (.close ^java.io.Closeable stream)\n",
+ "taskStatement": "In the file ring-core/src/ring/util/io.clj, the docstring of `close!` does not say what the function returns. Update the docstring so it ends with the sentence: Returns nil.",
+ "metrics": {
+  "tokens": {
+   "input": 17190,
+   "output": 319,
+   "cacheRead": 0,
+   "cacheWrite": 0,
+   "reasoning": 0,
+   "total": 17509
+  },
+  "toolCalls": {
+   "clj_tree": 1,
+   "clj_edit": 1
+  },
+  "turns": 3,
+  "refusals": {
+   "total": 0
+  },
+  "refetches": 0
+ },
+ "wall": 5.0,
+ "run": {
+  "exitCode": 0,
+  "session": "/home/gary/dev/cljform/bench/results/head/ring_t1_close_docstring_r1.session.jsonl"
+ }
+}
