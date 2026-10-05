@@ -71,7 +71,15 @@ The `let`, the `for`, and the `str` span lines, so they carry handles;
 their single-line children (`(reduce …)`, `(format …)`, the binding
 vectors) do not. When you want every collection regardless:
 `--full` marks all, `--name SYM` renders a matched form's entire subtree,
-and `--json` always lists a handle for every node at every depth.
+and `--json` always lists a handle for every node at every depth
+(`--depth N` filters that node table to depth ≤ N).
+
+In the pi extension, a large file (> 300 lines) returns the **form index**
+instead of the source on a default `clj_tree` call: one
+`⟦handle⟧ head name (lines X–Y)` row per top-level form, every handle
+live, no source body — the index scales with form count, the annotated
+view with file size. Page a region with `startLine/endLine` (or select
+with `name`) and the annotated view comes back exactly as the CLI's.
 
 Every handle is a short content hash, and the **only** edit target. Edit
 by handle:
@@ -126,7 +134,7 @@ re-aim, never mis-aim.
 
 | Op | Purpose |
 |----|---------|
-| `tree <file>` | The annotated view — source with `⟦handle⟧` per form. The primary discovery surface. `--name SYM` selects a nested form by name; `--start-line/--end-line` page large files (complete forms only); `--json` emits the node table; `--recover` is the broken-file view (below) |
+| `tree <file>` | The annotated view — source with `⟦handle⟧` per form. The primary discovery surface. `--name SYM` selects a nested form by name; `--start-line/--end-line` page large files (complete forms only); `--json` emits the node table (`--depth N` filters it to depth ≤ N); `--recover` is the broken-file view (below) |
 | `forms <file>` | Flat table: addr, kind, name, lines, blake3, shape summary, warnings |
 | `get <file> --name SYM \| --handle H` | One form's exact bytes + metadata (pass its handle to `edit`); human view is payload-first: the bytes, then one metadata line |
 | `edit <file> --handle H` | Whole-form edit: `--mode replace\|patch\|insert-after\|insert-before\|append\|prepend\|delete`, with `--content`/`--content-file` or patch `--old-text/--new-text`. Returns a unified diff of the changed region. See below for repair/strict |
@@ -195,8 +203,10 @@ discards are inert; reader conditionals are transparent. Detection runs on a
 `clj_get`, `clj_edit`, `clj_forms`, `clj_draft` — that wrap the CLI with
 agent-shaped ergonomics: discovery, exact-byte fetch, handle-targeted
 editing (a four-line change in a 60-line form no longer means
-re-transcribing 60 lines), and the guard hook on built-in edits. See
-SPEC §8 for the full tool contract.
+re-transcribing 60 lines), and the guard hook on built-in edits.
+`clj_tree` on a large file (> 300 lines) returns the form index by
+default — one live-handle row per top-level form, no source — and pages
+with `startLine/endLine`. See SPEC §8 for the full tool contract.
 
 Install (the symlinks make the extension live-track this repo):
 
@@ -219,7 +229,7 @@ form-editing tool, use parinfer-rust.
 ## Development
 
 ```sh
-cargo build && cargo test        # 203 tests across 11 suites
+cargo build && cargo test        # 205 tests across 11 suites
 ```
 
 Standard gates: `cargo build` · `cargo clippy --all-targets -- -D warnings

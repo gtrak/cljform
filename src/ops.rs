@@ -442,6 +442,11 @@ pub fn run_materialize(
 /// rendered in FULL (complete forms only), so the effective region is the
 /// union of the included spans and may be larger than the window — the
 /// echo (human header / JSON `window` key) carries both.
+/// Issue 33 (Part A): `--depth N` gates the machine surface too — the
+/// unwindowed `--json` node table is filtered to `depth <= N`. No flag
+/// (heuristic) and `--depth all`/`--full` keep the unconditional full table
+/// (byte-identical); the windowed JSON table is governed by the window, not
+/// the depth flag.
 /// `tree`'s flag surface is long (selector + depth/full + window +
 /// recover) — one documented allow is clearer than a parameter struct.
 #[allow(clippy::too_many_arguments)]
@@ -558,11 +563,26 @@ pub fn run_tree(
                 })),
         );
     }
+    // Issue 33 (Part A): --depth N filters the node table to depth <= N.
+    // Heuristic (no flag) and --depth all keep the full table — those cells
+    // are byte-identical to the pre-issue-33 output.
+    let shown: Vec<&handle::Node> = match d {
+        handle::Depth::Levels(n) => nodes.iter().filter(|x| x.depth <= n).collect(),
+        _ => nodes.iter().collect(),
+    };
+    let out_nodes: Vec<serde_json::Value> = {
+        let r: Result<Vec<_>, _> = shown.iter().map(serde_json::to_value).collect();
+        // Node's fields are all infallibly serializable (String/usize/ u32/
+        // Option/Vec); the Result cannot be Err (issue 30 L1).
+        #[allow(clippy::expect_used)]
+        let out = r.expect("Node serializes");
+        out
+    };
     Ok(
         Output::ok("tree")
             .file(Some(file.display().to_string()))
             .file_hash(hashutil::tagged(&hashutil::file_hash(&bytes)))
-            .result(serde_json::json!({ "nodes": nodes })),
+            .result(serde_json::json!({ "nodes": out_nodes })),
     )
 }
 

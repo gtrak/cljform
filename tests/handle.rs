@@ -90,6 +90,86 @@ fn tree_depth_1_marks_top_level_only() {
 }
 
 #[test]
+fn tree_depth_json_filters_the_node_table() {
+    // Issue 33 (Part A): --depth N gates the --json node table too (depth <= N).
+    let f = fixture("depth-json.clj", HEURISTIC_FIXTURE);
+    // --depth 1: only the top-level forms remain in the table.
+    let (code, v, stderr) = run_json(&["tree", &f, "--depth", "1", "--json"], None);
+    assert_eq!(code, 0, "{stderr}");
+    let nodes = v["result"]["nodes"].as_array().expect("result.nodes");
+    assert_eq!(nodes.len(), 2, "depth-1 table: {nodes:?}");
+    for n in nodes {
+        assert_eq!(n["depth"], 1, "{n}");
+    }
+
+    // --depth 2: exactly the nodes with depth <= 2.
+    let (code, v, stderr) = run_json(&["tree", &f, "--depth", "2", "--json"], None);
+    assert_eq!(code, 0, "{stderr}");
+    let nodes = v["result"]["nodes"].as_array().expect("result.nodes");
+    assert_eq!(nodes.len(), 4, "depth-2 table: {nodes:?}");
+    for n in nodes {
+        assert!(n["depth"].as_u64().unwrap() <= 2, "{n}");
+    }
+
+    // N beyond the max depth == the full table.
+    let (code, v, stderr) = run_json(&["tree", &f, "--depth", "99", "--json"], None);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(
+        v["result"]["nodes"].as_array().unwrap().len(),
+        9,
+        "N past the max depth is the whole table: {v}"
+    );
+
+    // No flag and --depth all stay the unconditional full table — the two
+    // cells are byte-identical to each other and carry every node.
+    let (code, out_all, stderr) = run_bytes(&["tree", &f, "--depth", "all", "--json"], None);
+    assert_eq!(code, 0, "{stderr}");
+    let (code, out_plain, stderr) = run_bytes(&["tree", &f, "--json"], None);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(
+        out_all, out_plain,
+        "--depth all and no flag are byte-identical"
+    );
+    let v: Value = serde_json::from_slice(&out_plain).expect("json envelope");
+    assert_eq!(
+        v["result"]["nodes"].as_array().unwrap().len(),
+        9,
+        "no-flag table is unfiltered: {v}"
+    );
+}
+
+#[test]
+fn windowed_json_is_not_depth_filtered() {
+    // Issue 33 (Part A): the depth filter applies to the UNwindowed JSON
+    // table only — with a window the table is governed by the window (the
+    // included subtrees are complete, nested nodes and all).
+    let f = fixture("win-depth-json.clj", HEURISTIC_FIXTURE);
+    let (code, v, stderr) = run_json(
+        &["tree", &f, "--json", "--depth", "1", "--start-line", "3", "--end-line", "7"],
+        None,
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let nodes = v["result"]["nodes"].as_array().expect("result.nodes");
+    assert!(
+        nodes.iter().any(|n| n["depth"] == 2),
+        "nested nodes survive a depth-1 windowed cell: {nodes:?}"
+    );
+
+    // The same cell without the window IS filtered — the window is the only
+    // difference.
+    let (code, v2, stderr) = run_json(&["tree", &f, "--json", "--depth", "1"], None);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        v2["result"]["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|n| n["depth"] == 1),
+        "unwindowed cell is depth-filtered: {v2}"
+    );
+}
+
+#[test]
 fn tree_full_marks_all() {
     let f = fixture("full.clj", HEURISTIC_FIXTURE);
     let (code, out, stderr) = run_bytes(&["tree", &f, "--full", "--human"], None);

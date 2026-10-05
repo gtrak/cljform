@@ -97,6 +97,44 @@ interface CljformOutput {
 
 const CLJ_EXT = /\.(clj|cljs|cljc|cljx|edn)$/;
 
+/**
+ * Issue 33 (Part B): the clj_tree large-file default. A DEFAULT call
+ * (no name / json / depth / startLine / endLine / recover) on a file with
+ * MORE than this many lines returns the compressed FORM INDEX (one
+ * live-handle row per top-level form, no source body) instead of the whole
+ * annotated dump: the annotated view scales with file size, the index with
+ * form count — the default picks the right tool instead of the biggest
+ * dump. Explicit calls (window, name, json, depth, recover) are honored
+ * exactly and uncapped; below the threshold the pass-through is
+ * byte-identical to the legacy annotated view. Wrapper constant — the CLI's
+ * own `tree` contract is unchanged (the CLI stays the honest primitive).
+ */
+const TREE_INDEX_THRESHOLD_LINES = 300;
+
+/** 1-based last line number of a file; null when the file cannot be read. */
+async function fileLineCount(path: string): Promise<number | null> {
+	try {
+		const { readFileSync } = await import("node:fs");
+		const src = readFileSync(path, "utf8");
+		if (src.length === 0) return 0;
+		let newlines = 0;
+		for (let i = 0; i < src.length; i++) {
+			if (src.charCodeAt(i) === 10) newlines++;
+		}
+		return newlines + (src.charCodeAt(src.length - 1) === 10 ? 0 : 1);
+	} catch {
+		return null;
+	}
+}
+
+/** The index-row label, mirroring the CLI's --name-block label: head + name ("defn f"), else head, else name, else kind. */
+function formIndexLabel(n: TreeNode): string {
+	if (n.head && n.name) return `${n.head} ${n.name}`;
+	if (n.head) return n.head;
+	if (n.name) return n.name;
+	return n.kind;
+}
+
 /** clj_edit's modes — the single source for the parameter's literal union. */
 const MODES = ["replace", "patch", "insert-after", "insert-before", "append", "prepend", "delete"] as const;
 
@@ -359,15 +397,20 @@ export default function ClojureForms(pi: ExtensionAPI) {
 			"edit targets for clj_edit. Handles are content-addressed: they survive edits elsewhere in the " +
 			"file and refuse (stale-handle) when their own form changed. Pass name to select only the forms " +
 			"that define it (exact def-like name, any nesting depth): each matched subtree renders at full " +
-			"depth with its handles inline; zero matches is an ok empty result, not an error. On large files, " +
-			"page with startLine/endLine: the window expands to COMPLETE forms only (any form intersecting it " +
-			"is returned in full) and the result echoes the effective span with TRUE file line numbers.",
+			"depth with its handles inline; zero matches is an ok empty result, not an error. On large " +
+			"files (> 300 lines), the DEFAULT call returns the FORM INDEX instead of the source — one " +
+			"`⟦handle⟧ head name (lines X–Y)` row per top-level form, every handle live, no source body " +
+			"(the annotated view scales with file size, the index with form count). Page with " +
+			"startLine/endLine or select with name to see source: the window expands to COMPLETE forms " +
+			"only (any form intersecting it is returned in full) and the result echoes the effective " +
+			"span with TRUE file line numbers.",
 		promptSnippet: "Read a Clojure file annotated with ⟦handle⟧ markers (the only edit targets).",
 		promptGuidelines: [
 			"Run clj_tree before any clj_edit; copy the ⟦handle⟧ you want to edit and pass it as handle.",
 			"Two cases for nested content: a NAMED nested form (defn/def/deftest… inside another form) → call with name: <that name> and copy the handle from the full-depth block; ANONYMOUS nested content (let/when bodies, vectors, maps) → patch within the enclosing form's handle (oldText/newText).",
 			"Single-line forms usually have no handle: address them by text (oldText/newText patch) inside their parent form.",
 			"A stale-handle error means the form changed — re-run clj_tree, never retry the old handle.",
+			"Large file (> 300 lines): the default call returns the form index — one live-handle row per top-level form, no source. Edit by a row's handle; page with startLine/endLine (or select with name) to see a region's source.",
 			"On large files, page with startLine/endLine: windows expand to complete forms, and the echo tells you the effective span (real file lines).",
 			"Broken file (git conflict markers or broken brackets): the normal ops refuse (conflict-markers / parse-error). Call with recover: true — it shows the verbatim source, each conflict region's per-side line spans, the parse-error spans, and the intact top-level forms. Resolve the conflict with a TEXT edit (no handles are shown — the write path stays gated); once the file parses, cljform resumes normally.",
 		],
@@ -412,6 +455,24 @@ export default function ClojureForms(pi: ExtensionAPI) {
 		}),
 
 		async execute(_toolCallId, params, _signal, _onUpdate) {
+			// Issue 33 (Part B): a default call (no name/json/depth/window/
+			// recover) on a file above TREE_INDEX_THRESHOLD_LINES returns the
+			// compressed form index instead of the whole annotated dump — one
+			// live-handle row per top-level form, no source body, fetched from
+			// `tree --json --depth 1` (issue 33 Part A makes that a small
+			// payload). Explicit calls are honored exactly and uncapped; below
+			// the threshold the annotated pass-through is byte-identical.
+			const defaulted =
+				params.name === undefined &&
+				params.json !== true &&
+				params.depth === undefined &&
+				params.startLine === undefined &&
+				params.endLine === undefined &&
+				!params.recover;
+			if (defaulted) {
+				const index = await largeFileFormIndex(params.path);
+				if (index) return index;
+			}
 			const args = ["tree", params.path, params.json ? "--json" : "--human"];
 			if (params.name !== undefined) {
 				args.push("--name", params.name);
@@ -487,6 +548,38 @@ export default function ClojureForms(pi: ExtensionAPI) {
 			return { content: [{ type: "text", text: lines.join("\n") }], details: { nodes, window: r.window } };
 		},
 	});
+
+	/**
+	 * Issue 33 (Part B): the large-file form index. Null when the file has at
+	 * most TREE_INDEX_THRESHOLD_LINES lines (or cannot be read — the normal
+	 * path then surfaces the CLI's own error), so the caller's annotated
+	 * pass-through runs unchanged. Above the threshold: `tree --json
+	 * --depth 1` (a small payload since issue 33 Part A) supplies the rows;
+	 * a nonzero exit returns its error result, the same surface as the normal
+	 * path. No source body anywhere — the header says how to get one.
+	 */
+	async function largeFileFormIndex(path: string): Promise<ToolOutcome | null> {
+		const lines = await fileLineCount(path);
+		if (lines === null || lines <= TREE_INDEX_THRESHOLD_LINES) return null;
+		const run = await runClj(["tree", path, "--json", "--depth", "1"], 15_000);
+		if (!run.ok) return run.result;
+		const nodes: TreeNode[] = (run.out.result?.nodes as TreeNode[]) ?? [];
+		const rows = nodes
+			.filter((n) => n.depth === 1)
+			.sort((a, b) => a.line[0] - b.line[0]);
+		const text =
+			`large file: ${lines} lines, ${rows.length} top-level forms — showing the form index (handles are live). Annotated view: pass startLine/endLine; a specific form: name.` +
+			(rows.length === 0
+				? "\n(no top-level forms)"
+				: "\n\n" +
+					rows
+						.map((n) => `\u27E6${n.handle}\u27E7 ${formIndexLabel(n)} (lines ${n.line[0]}–${n.line[1]})`)
+						.join("\n"));
+		return {
+			content: [{ type: "text", text }],
+			details: { lines, formCount: rows.length },
+		};
+	}
 
 	// ─── clj_get ────────────────────────────────────────────────────────────
 

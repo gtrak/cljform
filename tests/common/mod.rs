@@ -163,6 +163,8 @@ pub fn forms(file: &str) -> Vec<Value> {
 }
 
 /// The `tree --json` node table: path, kind, name, line, handle, …
+/// No depth flag, so the table is the unfiltered full table (issue 33 Part A
+/// filters the JSON only when `--depth N` is given).
 pub fn tree_nodes(file: &str) -> Vec<Value> {
     let (code, d, err) = run_json(&["tree", file, "--json"], None);
     assert_eq!(code, 0, "{d} {err}");
@@ -173,9 +175,9 @@ pub fn tree_nodes(file: &str) -> Vec<Value> {
 }
 
 /// The full node table (`tree --full --json`): every collection, top-level
-/// and nested. The default `tree --json` table carries the same nodes (the
-/// depth flags gate only the human view); the explicit `--full` keeps the
-/// full-tree intent of a caller spelled out.
+/// and nested. The default `tree --json` table carries the same nodes; the
+/// explicit `--full` keeps the full-tree intent of a caller spelled out
+/// (only `--depth N` filters the JSON table, issue 33 Part A).
 pub fn tree_full_nodes(file: &str) -> Vec<Value> {
     let (code, out, stderr) = run_json(&["tree", file, "--full", "--json"], None);
     assert_eq!(code, 0, "{stderr}");
