@@ -148,3 +148,7 @@ Both reported silent-corruption modes DO NOT reproduce (repros in /tmp/repro17):
   payload-first + formsCount (edit envelope's forms array STAYS — it is the
   cross-check that caught issue 19's stale-head bug), format unchanged-case
   one-liner, related-surface audit mandated.
+- F19 (owner-found, post-issue-27 builds): wrapper clj_edit double-renders
+  the changed-region diff (r.text embeds it since issue 27; the wrapper's
+  `diff (changed region):` block appends it again). -> issue 34, queued
+  behind 32.
