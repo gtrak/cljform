@@ -123,3 +123,23 @@ Both reported silent-corruption modes DO NOT reproduce (repros in /tmp/repro17):
   insert builds a forms table and a comment is not a form (no handle to
   return). Guidance line if we want it: "comment -> patch the anchor form,
   include the comment in new-text; insert modes splice forms only."
+## T16 (dogfood of issue-31 recovery, REAL git conflicts on clj-kondo) — ALL FOUR PHASES PASS
+- Gate: every op refused conflicted files with structured region spans
+  matching git's marker lines exactly; safety hole (edit on one conflict
+  side) demonstrably closed.
+- View: per-side head/base/incoming spans matched git's diff3 layout
+  line-for-line on a 4766-line file; intact-form count = baseline minus
+  conflict-hosting defns; parse-error spans pre-announced the deliberate
+  trap. Verdict: "I could plan the entire 3-region resolution from the
+  view plus two 25-line source slices, never dumping the whole file."
+- Progressive: 2->1 with correctly re-based spans; count survived edits
+  made by the EXTERNAL (built-in) edit tool; layer flip conflict-markers
+  -> parse-error verified with a deliberately-wrong resolution.
+- Resume: real handles returned, cljform patch landed cleanly, loop closed.
+- CORPUS CAVEAT (important for future dogfoods): "format empty-diff" is
+  NOT a valid acceptance bar on non-parinfer-formatted upstream code —
+  worker proved the diff pre-exists on the pristine baseline. The
+  meaningful invariants: format runs, token stream verified, nothing
+  written.
+- Minor: bounded-run prints the timed command on stderr (jq-piping patterns
+  can drop it); --recover does not compose with --name (documented).
