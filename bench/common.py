@@ -110,13 +110,44 @@ def form_names(file_path: Path) -> list[str]:
 
 
 def docstring_of(form_text: str) -> str | None:
-    """The docstring (second element) of a def-like form, or None."""
-    m = re.match(r"\(\s*(defn|defn-|def|defrecord|defprotocol|defonce|defmulti|deftest|defmethod)\s+([*?\w!]+)",
+    """The docstring (first string literal after the head, skipping ^metadata)."""
+    m = re.match(r"\(\s*(defn|defn-|def|defrecord|defprotocol|defonce|defmulti|deftest|defmethod)\s+([^\s()\[\{}\"]+)",
                  form_text)
     if not m:
         return None
-    dm = re.match(r'\s+"((?:[^"\\]|\\.)*)"', form_text[m.end():])
-    return dm.group(1) if dm else None
+    rest = form_text[m.end():]
+    # Skip whitespace and reader metadata (^String, ^java.io.File, ^:private,
+    # ^{...}) before the docstring — metadata may legally sit between the
+    # name and the docstring.
+    while True:
+        rest = rest.lstrip()
+        if not rest.startswith("^"):
+            break
+        mm = re.match(r"\^[^\s({\[\"]+", rest)  # ^symbol / ^:keyword
+        if mm:
+            rest = rest[mm.end():]
+            continue
+        # ^{...} / ^[...] balanced metadata: scan to the matching closer
+        opener = rest[1]
+        closer = {"{": "}", "[": "]"}[opener]
+        depth = 0
+        i = 1
+        while i < len(rest):
+            if rest[i] == opener:
+                depth += 1
+            elif rest[i] == closer:
+                depth -= 1
+                if depth == 0:
+                    i += 1
+                    break
+            i += 1
+        rest = rest[i:]
+    dm = re.match(r'"((?:[^"\\]|\\.)*)"', rest)
+    if not dm:
+        return None
+    # decode the Clojure string escapes the reader would (" \\ n t) — the
+    # checker compares reader-level content, not source bytes
+    return re.sub(r"\\(.)", lambda m: {"n": "\n", "t": "\t"}.get(m.group(1), m.group(1)), dm.group(1))
 
 
 # ---------------------------------------------------------------- tasks

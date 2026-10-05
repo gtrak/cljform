@@ -1,0 +1,59 @@
+{
+ "task": "ring_t1_rename_piped_locals",
+ "tier": 1,
+ "repo": "ring",
+ "rev": "pre-26",
+ "rep": 1,
+ "success": true,
+ "checks": {
+  "done": {
+   "pass": true,
+   "detail": "piped-input-stream locals renamed to is/os, body consistent"
+  },
+  "collateral": {
+   "pass": true,
+   "changedFiles": [
+    "ring-core/src/ring/util/io.clj"
+   ],
+   "detail": "no collateral"
+  },
+  "tests": {
+   "run": false
+  }
+ },
+ "lintDelta": {
+  "newErrors": 0,
+  "newWarnings": 0,
+  "newFindings": []
+ },
+ "diff": "diff --git a/ring-core/src/ring/util/io.clj b/ring-core/src/ring/util/io.clj\nindex d43e48a..81763ac 100644\n--- a/ring-core/src/ring/util/io.clj\n+++ b/ring-core/src/ring/util/io.clj\n@@ -16,18 +16,18 @@\n     (piped-input-stream\n       (fn [ostream]\n         (spit ostream \\\"Hello\\\")))\"\n   {:added \"1.1\"}\n   [func]\n-  (let [input  (PipedInputStream.)\n-        output (PipedOutputStream.)]\n-    (.connect input output)\n+  (let [is  (PipedInputStream.)\n+        os (PipedOutputStream.)]\n+    (.connect is os)\n     (future\n       (try\n-        (func output)\n-        (finally (.close output))))\n-    input))\n+        (func os)\n+        (finally (.close os))))\n+    is))\n \n (defn string-input-stream\n   \"Returns a ByteArrayInputStream for the given String.\"\n   {:added \"1.1\"}\n   ([^String s]\n",
+ "taskStatement": "In the file ring-core/src/ring/util/io.clj, rename the two local bindings in the `let` form of `piped-input-stream`: `input` to `is`, and `output` to `os`. Update their uses in the function body accordingly. Do not change anything else: the docstring, the stream classes, and the function's parameter stay as they are.",
+ "metrics": {
+  "tokens": {
+   "input": 62515,
+   "output": 2147,
+   "cacheRead": 0,
+   "cacheWrite": 0,
+   "reasoning": 0,
+   "total": 64662
+  },
+  "toolCalls": {
+   "clj_tree": 1,
+   "clj_get": 1,
+   "clj_edit": 2,
+   "read": 2,
+   "edit": 1,
+   "bash": 1
+  },
+  "turns": 9,
+  "refusals": {
+   "total": 0
+  },
+  "refetches": 0
+ },
+ "wall": 26.1,
+ "run": {
+  "exitCode": 0,
+  "session": "/home/gary/dev/cljform/bench/results/pre-26/ring_t1_rename_piped_locals_r1.session.jsonl"
+ }
+}

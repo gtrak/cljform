@@ -1,0 +1,56 @@
+{
+ "task": "kondo_t3_resolve_conflict",
+ "tier": 3,
+ "repo": "clj-kondo",
+ "rev": "pre-28",
+ "rep": 1,
+ "success": true,
+ "checks": {
+  "done": {
+   "pass": true,
+   "detail": "conflict resolved: 3-arity cache-file kept, suffix variant added"
+  },
+  "collateral": {
+   "pass": true,
+   "changedFiles": [
+    "src/clj_kondo/impl/cache.clj"
+   ],
+   "detail": "no collateral"
+  },
+  "tests": {
+   "run": false
+  }
+ },
+ "lintDelta": {
+  "newErrors": 0,
+  "newWarnings": 0,
+  "newFindings": []
+ },
+ "diff": "diff --git a/src/clj_kondo/impl/cache.clj b/src/clj_kondo/impl/cache.clj\nindex 4039bf5..0a45fbb 100644\n--- a/src/clj_kondo/impl/cache.clj\n+++ b/src/clj_kondo/impl/cache.clj\n@@ -15,17 +15,15 @@\n \n (defn built-in-cache-resource [lang ns-sym]\n   (io/resource (str \"clj_kondo/impl/cache/built_in/\"\n                     (name lang) \"/\" ns-sym \".transit.json\")))\n \n-<<<<<<< HEAD\n (defn cache-file ^java.io.File [cache-dir lang ns-sym]\n   (io/file cache-dir (name lang) (str ns-sym \".transit.json\")))\n-=======\n-(defn cache-file ^java.io.File [cache-dir lang ns-sym suffix]\n+\n+(defn cache-file-with-suffix ^java.io.File [cache-dir lang ns-sym suffix]\n   (io/file cache-dir (name lang) (str ns-sym suffix \".transit.json\")))\n->>>>>>> feature/cache-suffix\n \n (defn from-cache-1 [cache-dir lang ns-sym]\n   (when-let [{:keys [resource source]}\n              (or (when cache-dir\n                    (let [f (cache-file cache-dir lang ns-sym)]\n",
+ "taskStatement": "The file src/clj_kondo/impl/cache.clj has unresolved merge-conflict markers. The HEAD side is the existing 3-argument `cache-file`; the incoming feature branch added a 4-argument variant that takes a name suffix. Resolve the conflict so both capabilities survive: keep the 3-argument `cache-file` exactly as on the HEAD side, and add the 4-argument variant under the new name `cache-file-with-suffix`. The file must parse cleanly with no conflict markers left behind.",
+ "metrics": {
+  "tokens": {
+   "input": 29062,
+   "output": 874,
+   "cacheRead": 0,
+   "cacheWrite": 0,
+   "reasoning": 0,
+   "total": 29936
+  },
+  "toolCalls": {
+   "read": 1,
+   "edit": 1,
+   "bash": 1
+  },
+  "turns": 4,
+  "refusals": {
+   "total": 0
+  },
+  "refetches": 0
+ },
+ "wall": 16.5,
+ "run": {
+  "exitCode": 0,
+  "session": "/home/gary/dev/cljform/bench/results/pre-28/kondo_t3_resolve_conflict_r1.session.jsonl"
+ }
+}

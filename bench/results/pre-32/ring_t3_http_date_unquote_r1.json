@@ -1,0 +1,59 @@
+{
+ "task": "ring_t3_http_date_unquote",
+ "tier": 3,
+ "repo": "ring",
+ "rev": "pre-32",
+ "rep": 1,
+ "success": true,
+ "checks": {
+  "done": {
+   "pass": true,
+   "detail": "public helper added and wired into date-header"
+  },
+  "collateral": {
+   "pass": true,
+   "changedFiles": [
+    "ring-core/src/ring/middleware/not_modified.clj",
+    "ring-core/src/ring/util/time.clj"
+   ],
+   "detail": "no collateral"
+  },
+  "tests": {
+   "run": false
+  }
+ },
+ "lintDelta": {
+  "newErrors": 0,
+  "newWarnings": 0,
+  "newFindings": []
+ },
+ "diff": "diff --git a/ring-core/src/ring/middleware/not_modified.clj b/ring-core/src/ring/middleware/not_modified.clj\nindex ed2a2bf..b343d34 100644\n--- a/ring-core/src/ring/middleware/not_modified.clj\n+++ b/ring-core/src/ring/middleware/not_modified.clj\n@@ -1,19 +1,19 @@\n (ns ring.middleware.not-modified\n   \"Middleware that returns a 304 Not Modified response for responses with\n   Last-Modified headers.\"\n-  (:require [ring.util.time :refer [parse-date]]\n+  (:require [ring.util.time :refer [parse-date unquote-http-date]]\n             [ring.util.response :refer [get-header find-header header]]\n             [ring.util.io :refer [close!]]))\n \n (defn- etag-match? [request response]\n   (when-let [etag (get-header response \"ETag\")]\n     (= etag (get-header request \"if-none-match\"))))\n \n (defn- date-header ^java.util.Date [response header]\n   (when-let [http-date (get-header response header)]\n-    (parse-date http-date)))\n+    (parse-date (unquote-http-date http-date))))\n \n (defn- not-modified-since? [request response]\n   (let [modified-date  (date-header response \"Last-Modified\")\n         modified-since (date-header request \"if-modified-since\")]\n     (and modified-date\ndiff --git a/ring-core/src/ring/util/time.clj b/ring-core/src/ring/util/time.clj\nindex 072b24a..3c1b078 100644\n--- a/ring-core/src/ring/util/time.clj\n+++ b/ring-core/src/ring/util/time.clj\n@@ -16,19 +16,22 @@\n (defn- attempt-parse [date format]\n   (try\n     (.parse (formatter format) date)\n     (catch ParseException _ nil)))\n \n-(defn- trim-quotes [s]\n-  (str/replace s #\"^'|'$\" \"\"))\n+(defn unquote-http-date\n+  \"Removes any surrounding single quotes from the HTTP date string.\n+  Returns nil for a nil input.\"\n+  [s]\n+  (when s (str/replace s #\"^'|'$\" \"\")))\n \n (defn parse-date\n   \"Attempt to parse a HTTP date. Returns nil if unsuccessful.\"\n   {:added \"1.2\"}\n   [http-date]\n   (->> (keys http-date-formats)\n-       (map (partial attempt-parse (trim-quotes http-date)))\n+       (map (partial attempt-parse (unquote-http-date http-date)))\n        (remove nil?)\n        (first)))\n \n (defn format-date\n   \"Format a date as RFC1123 format.\"\n",
+ "taskStatement": "Feature request: the quote-stripping helper `trim-quotes` in ring.util.time is private, but the not-modified middleware has the same need for raw header values. Promote that capability to a public function `unquote-http-date` in ring-core/src/ring/util/time.clj: it takes an HTTP date string, returns it with any surrounding single quotes removed, and returns nil for a nil input.\nThen use it in ring-core/src/ring/middleware/not_modified.clj: `date-header` should strip optional surrounding quotes from the raw header value before parsing. The public behavior of `parse-date` must stay identical (dates quoted on the wire still parse).",
+ "metrics": {
+  "tokens": {
+   "input": 248181,
+   "output": 6243,
+   "cacheRead": 0,
+   "cacheWrite": 0,
+   "reasoning": 0,
+   "total": 254424
+  },
+  "toolCalls": {
+   "read": 2,
+   "clj_tree": 2,
+   "clj_edit": 4,
+   "edit": 1,
+   "bash": 13
+  },
+  "turns": 22,
+  "refusals": {
+   "total": 0
+  },
+  "refetches": 0
+ },
+ "wall": 91.4,
+ "run": {
+  "exitCode": 0,
+  "session": "/home/gary/dev/cljform/bench/results/pre-32/ring_t3_http_date_unquote_r1.session.jsonl"
+ }
+}

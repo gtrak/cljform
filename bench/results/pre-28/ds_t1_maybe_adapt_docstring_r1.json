@@ -1,0 +1,55 @@
+{
+ "task": "ds_t1_maybe_adapt_docstring",
+ "tier": 1,
+ "repo": "datascript",
+ "rev": "pre-28",
+ "rep": 1,
+ "success": true,
+ "checks": {
+  "done": {
+   "pass": true,
+   "detail": "docstring added: 'Adapts the :storage value in opts to a StorageAdapter, if there is one.'"
+  },
+  "collateral": {
+   "pass": true,
+   "changedFiles": [
+    "src/datascript/storage.clj"
+   ],
+   "detail": "no collateral"
+  },
+  "tests": {
+   "run": false
+  }
+ },
+ "lintDelta": {
+  "newErrors": 0,
+  "newWarnings": 0,
+  "newFindings": []
+ },
+ "diff": "diff --git a/src/datascript/storage.clj b/src/datascript/storage.clj\nindex b4b2825..0ceabba 100644\n--- a/src/datascript/storage.clj\n+++ b/src/datascript/storage.clj\n@@ -70,11 +70,13 @@\n \n (defn make-storage-adapter [storage opts]\n   (let [settings (@#'set/map->settings opts)]\n     (StorageAdapter. storage settings)))\n \n-(defn maybe-adapt-storage [opts]\n+(defn maybe-adapt-storage\n+  \"Adapts the :storage value in opts to a StorageAdapter, if there is one.\"\n+  [opts]\n   (if-some [storage (:storage opts)]\n     (update opts :storage make-storage-adapter opts)\n     opts))\n \n (defn storage-adapter ^StorageAdapter [db]\n",
+ "taskStatement": "In the file src/datascript/storage.clj, the function `maybe-adapt-storage` has no docstring. Give it one that reads exactly: Adapts the :storage value in opts to a StorageAdapter, if there is one.",
+ "metrics": {
+  "tokens": {
+   "input": 20024,
+   "output": 281,
+   "cacheRead": 0,
+   "cacheWrite": 0,
+   "reasoning": 0,
+   "total": 20305
+  },
+  "toolCalls": {
+   "clj_get": 1,
+   "clj_edit": 1
+  },
+  "turns": 3,
+  "refusals": {
+   "total": 0
+  },
+  "refetches": 0
+ },
+ "wall": 8.8,
+ "run": {
+  "exitCode": 0,
+  "session": "/home/gary/dev/cljform/bench/results/pre-28/ds_t1_maybe_adapt_docstring_r1.session.jsonl"
+ }
+}

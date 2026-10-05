@@ -1,0 +1,59 @@
+{
+ "task": "kondo_t2_insert_cache_helpers",
+ "tier": 2,
+ "repo": "clj-kondo",
+ "rev": "head",
+ "rep": 1,
+ "success": true,
+ "checks": {
+  "done": {
+   "pass": true,
+   "detail": "both helpers present; cache-file intact"
+  },
+  "collateral": {
+   "pass": true,
+   "changedFiles": [
+    "src/clj_kondo/impl/cache.clj"
+   ],
+   "detail": "no collateral"
+  },
+  "tests": {
+   "run": false
+  }
+ },
+ "lintDelta": {
+  "newErrors": 0,
+  "newWarnings": 2,
+  "newFindings": [
+   "src/clj_kondo/impl/cache.clj [warning] Unresolved var x1",
+   "src/clj_kondo/impl/cache.clj [warning] unused binding lang x1"
+  ]
+ },
+ "diff": "diff --git a/src/clj_kondo/impl/cache.clj b/src/clj_kondo/impl/cache.clj\nindex 248548d..2fc7d47 100644\n--- a/src/clj_kondo/impl/cache.clj\n+++ b/src/clj_kondo/impl/cache.clj\n@@ -15,10 +15,16 @@\n \n (defn built-in-cache-resource [lang ns-sym]\n   (io/resource (str \"clj_kondo/impl/cache/built_in/\"\n                     (name lang) \"/\" ns-sym \".transit.json\")))\n \n+(defn cache-file-base [lang ns-sym]\n+  (str ns-sym \".transit.json\"))\n+\n+(defn cache-file-rel-path [lang ns-sym]\n+  (io/join (name lang) (cache-file-base lang ns-sym)))\n+\n (defn cache-file ^java.io.File [cache-dir lang ns-sym]\n   (io/file cache-dir (name lang) (str ns-sym \".transit.json\")))\n \n (defn from-cache-1 [cache-dir lang ns-sym]\n   (when-let [{:keys [resource source]}\n",
+ "taskStatement": "In the file src/clj_kondo/impl/cache.clj, add two small public helpers near `cache-file` that factor out its path building:\n1. `cache-file-base` \u2014 takes a lang and an ns-sym, returns the base cache file name (a string, no directory component), e.g. clojure.core.transit.json for the clojure.core namespace.\n2. `cache-file-rel-path` \u2014 takes a lang and an ns-sym, returns the cache file path relative to the cache directory (the lang name directory joined with the base name).\nImplement them with the same `name`/string building `cache-file` already uses; `cache-file` itself may or may not be refactored to reuse them.",
+ "metrics": {
+  "tokens": {
+   "input": 32417,
+   "output": 1317,
+   "cacheRead": 0,
+   "cacheWrite": 0,
+   "reasoning": 0,
+   "total": 33734
+  },
+  "toolCalls": {
+   "clj_tree": 1,
+   "clj_edit": 1,
+   "read": 2
+  },
+  "turns": 5,
+  "refusals": {
+   "total": 0
+  },
+  "refetches": 0
+ },
+ "wall": 19.1,
+ "run": {
+  "exitCode": 0,
+  "session": "/home/gary/dev/cljform/bench/results/head/kondo_t2_insert_cache_helpers_r1.session.jsonl"
+ }
+}

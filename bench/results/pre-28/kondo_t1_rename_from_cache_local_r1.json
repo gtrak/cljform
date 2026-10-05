@@ -1,0 +1,55 @@
+{
+ "task": "kondo_t1_rename_from_cache_local",
+ "tier": 1,
+ "repo": "clj-kondo",
+ "rev": "pre-28",
+ "rep": 1,
+ "success": true,
+ "checks": {
+  "done": {
+   "pass": true,
+   "detail": "binding renamed to reader, use updated"
+  },
+  "collateral": {
+   "pass": true,
+   "changedFiles": [
+    "src/clj_kondo/impl/cache.clj"
+   ],
+   "detail": "no collateral"
+  },
+  "tests": {
+   "run": false
+  }
+ },
+ "lintDelta": {
+  "newErrors": 0,
+  "newWarnings": 0,
+  "newFindings": []
+ },
+ "diff": "diff --git a/src/clj_kondo/impl/cache.clj b/src/clj_kondo/impl/cache.clj\nindex 248548d..f1d7db1 100644\n--- a/src/clj_kondo/impl/cache.clj\n+++ b/src/clj_kondo/impl/cache.clj\n@@ -29,12 +29,12 @@\n                         :resource f})))\n                  (when-let [resource (built-in-cache-resource lang ns-sym)]\n                    {:source :built-in\n                     :resource resource}))]\n     (assoc\n-     (with-open [is (io/input-stream resource)]\n-       (transit/read (transit/reader is :json)))\n+     (with-open [reader (io/input-stream resource)]\n+       (transit/read (transit/reader reader :json)))\n      :source source)))\n \n (defn skip-write?\n   [^java.io.File config-dir ^String filename]\n   (when filename\n",
+ "taskStatement": "In the file src/clj_kondo/impl/cache.clj, the `with-open` form in `from-cache-1` binds the input stream to the cryptic name `is`. Rename that binding to `reader` and update its use inside the form. Change nothing else in the function.",
+ "metrics": {
+  "tokens": {
+   "input": 16225,
+   "output": 296,
+   "cacheRead": 0,
+   "cacheWrite": 0,
+   "reasoning": 0,
+   "total": 16521
+  },
+  "toolCalls": {
+   "clj_get": 1,
+   "clj_edit": 1
+  },
+  "turns": 3,
+  "refusals": {
+   "total": 0
+  },
+  "refetches": 0
+ },
+ "wall": 9.1,
+ "run": {
+  "exitCode": 0,
+  "session": "/home/gary/dev/cljform/bench/results/pre-28/kondo_t1_rename_from_cache_local_r1.session.jsonl"
+ }
+}

@@ -1,0 +1,61 @@
+{
+ "task": "ring_t3_parse_date_nil",
+ "tier": 3,
+ "repo": "ring",
+ "rev": "pre-26",
+ "rep": 1,
+ "success": false,
+ "checks": {
+  "done": {
+   "pass": true,
+   "detail": "parse-date now guards the http-date argument against nil"
+  },
+  "collateral": {
+   "pass": false,
+   "changedFiles": [
+    "ring-core/src/ring/util/time.clj",
+    "ring-core/test/ring/util/test/time.clj"
+   ],
+   "detail": "out-of-scope changes: ['ring-core/test/ring/util/test/time.clj']"
+  },
+  "tests": {
+   "run": true,
+   "pass": true,
+   "wallSec": 1.2,
+   "detail": "#'check/d\nCHECK-OK\n"
+  }
+ },
+ "lintDelta": {
+  "newErrors": 0,
+  "newWarnings": 0,
+  "newFindings": []
+ },
+ "diff": "diff --git a/ring-core/src/ring/util/time.clj b/ring-core/src/ring/util/time.clj\nindex 072b24a..bb769af 100644\n--- a/ring-core/src/ring/util/time.clj\n+++ b/ring-core/src/ring/util/time.clj\n@@ -23,14 +23,15 @@\n \n (defn parse-date\n   \"Attempt to parse a HTTP date. Returns nil if unsuccessful.\"\n   {:added \"1.2\"}\n   [http-date]\n-  (->> (keys http-date-formats)\n-       (map (partial attempt-parse (trim-quotes http-date)))\n-       (remove nil?)\n-       (first)))\n+  (when http-date\n+    (->> (keys http-date-formats)\n+         (map (partial attempt-parse (trim-quotes http-date)))\n+         (remove nil?)\n+         (first))))\n \n (defn format-date\n   \"Format a date as RFC1123 format.\"\n   {:added \"1.2\"}\n   [^java.util.Date date]\ndiff --git a/ring-core/test/ring/util/test/time.clj b/ring-core/test/ring/util/test/time.clj\nindex a5b5080..6a7d54b 100644\n--- a/ring-core/test/ring/util/test/time.clj\n+++ b/ring-core/test/ring/util/test/time.clj\n@@ -7,6 +7,8 @@\n (deftest test-parse-date\n   (are [x y] (= (parse-date x) (to-date y))\n     \"Sun, 06 Nov 1994 08:49:37 GMT\"   (date-time 1994 11 6 8 49 37)\n     \"Sunday, 06-Nov-94 08:49:37 GMT\"  (date-time 1994 11 6 8 49 37)\n     \"Sun Nov  6 08:49:37 1994\"        (date-time 1994 11 6 8 49 37)\n-    \"'Sun, 06 Nov 1994 08:49:37 GMT'\" (date-time 1994 11 6 8 49 37)))\n+    \"'Sun, 06 Nov 1994 08:49:37 GMT'\" (date-time 1994 11 6 8 49 37))\n+  (is (nil? (parse-date nil)))\n+  (is (nil? (parse-date \"not a date\"))))\n",
+ "taskStatement": "Bug report (from a downstream user):\n`ring.util.time/parse-date` is documented to return nil when parsing fails, but passing `nil` as the HTTP date value crashes with an exception instead of returning nil. A couple of servlet adapters pass nil through when a date header is absent, which makes the not-modified middleware blow up on otherwise-fine requests.\nFix `parse-date` so that a nil input returns nil. Valid date strings must keep parsing exactly as before, and garbage strings must keep returning nil.",
+ "metrics": {
+  "tokens": {
+   "input": 237920,
+   "output": 5446,
+   "cacheRead": 0,
+   "cacheWrite": 0,
+   "reasoning": 0,
+   "total": 243366
+  },
+  "toolCalls": {
+   "bash": 19,
+   "clj_tree": 2,
+   "clj_edit": 3,
+   "read": 1
+  },
+  "turns": 26,
+  "refusals": {
+   "total": 0
+  },
+  "refetches": 0
+ },
+ "wall": 76.8,
+ "run": {
+  "exitCode": 0,
+  "session": "/home/gary/dev/cljform/bench/results/pre-26/ring_t3_parse_date_nil_r1.session.jsonl"
+ }
+}

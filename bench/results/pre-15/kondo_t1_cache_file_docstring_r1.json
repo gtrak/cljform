@@ -1,0 +1,58 @@
+{
+ "task": "kondo_t1_cache_file_docstring",
+ "tier": 1,
+ "repo": "clj-kondo",
+ "rev": "pre-15",
+ "rep": 1,
+ "success": false,
+ "checks": {
+  "done": {
+   "pass": false,
+   "detail": "still no docstring"
+  },
+  "collateral": {
+   "pass": true,
+   "changedFiles": [
+    "src/clj_kondo/impl/cache.clj"
+   ],
+   "detail": "no collateral"
+  },
+  "tests": {
+   "run": false
+  }
+ },
+ "lintDelta": {
+  "newErrors": 0,
+  "newWarnings": 2,
+  "newFindings": [
+   "src/clj_kondo/impl/cache.clj [warning] Misplaced docstring. x1",
+   "src/clj_kondo/impl/cache.clj [warning] Unused value: \"Returns the on-disk cache file path for the given language and namespace.\" x1"
+  ]
+ },
+ "diff": "diff --git a/src/clj_kondo/impl/cache.clj b/src/clj_kondo/impl/cache.clj\nindex 248548d..16ff6f1 100644\n--- a/src/clj_kondo/impl/cache.clj\n+++ b/src/clj_kondo/impl/cache.clj\n@@ -16,10 +16,11 @@\n (defn built-in-cache-resource [lang ns-sym]\n   (io/resource (str \"clj_kondo/impl/cache/built_in/\"\n                     (name lang) \"/\" ns-sym \".transit.json\")))\n \n (defn cache-file ^java.io.File [cache-dir lang ns-sym]\n+  \"Returns the on-disk cache file path for the given language and namespace.\"\n   (io/file cache-dir (name lang) (str ns-sym \".transit.json\")))\n \n (defn from-cache-1 [cache-dir lang ns-sym]\n   (when-let [{:keys [resource source]}\n              (or (when cache-dir\n",
+ "taskStatement": "In the file src/clj_kondo/impl/cache.clj, the function `cache-file` has no docstring. Give it one that reads exactly: Returns the on-disk cache file path for the given language and namespace.",
+ "metrics": {
+  "tokens": {
+   "input": 21038,
+   "output": 448,
+   "cacheRead": 0,
+   "cacheWrite": 0,
+   "reasoning": 0,
+   "total": 21486
+  },
+  "toolCalls": {
+   "clj_get": 1,
+   "clj_edit": 2
+  },
+  "turns": 4,
+  "refusals": {
+   "total": 0
+  },
+  "refetches": 0
+ },
+ "wall": 6.0,
+ "run": {
+  "exitCode": 0,
+  "session": "/home/gary/dev/cljform/bench/results/pre-15/kondo_t1_cache_file_docstring_r1.session.jsonl"
+ }
+}

@@ -1,0 +1,57 @@
+{
+ "task": "ds_t1_max_addr",
+ "tier": 1,
+ "repo": "datascript",
+ "rev": "pre-35",
+ "rep": 1,
+ "success": true,
+ "checks": {
+  "done": {
+   "pass": true,
+   "detail": "*max-addr now initialized to 10000000"
+  },
+  "collateral": {
+   "pass": true,
+   "changedFiles": [
+    "src/datascript/storage.clj"
+   ],
+   "detail": "no collateral"
+  },
+  "tests": {
+   "run": false
+  }
+ },
+ "lintDelta": {
+  "newErrors": 0,
+  "newWarnings": 0,
+  "newFindings": []
+ },
+ "diff": "diff --git a/src/datascript/storage.clj b/src/datascript/storage.clj\nindex b4b2825..72985fa 100644\n--- a/src/datascript/storage.clj\n+++ b/src/datascript/storage.clj\n@@ -41,11 +41,11 @@\n \n (def ^:private tail-addr\n   1)\n \n (defonce ^:private *max-addr\n-  (volatile! 1000000))\n+  (volatile! 10000000))\n \n (defn- gen-addr []\n   (vswap! *max-addr inc))\n \n (defrecord StorageAdapter [storage ^Settings settings]\n",
+ "taskStatement": "In the file src/datascript/storage.clj, raise the initial value of the `*max-addr` volatile from 1,000,000 to 10,000,000. Nothing else in the file changes.",
+ "metrics": {
+  "tokens": {
+   "input": 36196,
+   "output": 513,
+   "cacheRead": 0,
+   "cacheWrite": 0,
+   "reasoning": 0,
+   "total": 36709
+  },
+  "toolCalls": {
+   "bash": 1,
+   "read": 1,
+   "clj_get": 1,
+   "clj_edit": 1
+  },
+  "turns": 5,
+  "refusals": {
+   "total": 0
+  },
+  "refetches": 0
+ },
+ "wall": 12.0,
+ "run": {
+  "exitCode": 0,
+  "session": "/home/gary/dev/cljform/bench/results/pre-35/ds_t1_max_addr_r1.session.jsonl"
+ }
+}

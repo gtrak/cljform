@@ -1,0 +1,54 @@
+{
+ "task": "ds_t2_rename_store_impl",
+ "tier": 2,
+ "repo": "datascript",
+ "rev": "pre-15",
+ "rep": 1,
+ "success": true,
+ "checks": {
+  "done": {
+   "pass": true,
+   "detail": "renamed consistently; store() still calls write-db!"
+  },
+  "collateral": {
+   "pass": true,
+   "changedFiles": [
+    "src/datascript/storage.clj"
+   ],
+   "detail": "no collateral"
+  },
+  "tests": {
+   "run": false
+  }
+ },
+ "lintDelta": {
+  "newErrors": 0,
+  "newWarnings": 0,
+  "newFindings": []
+ },
+ "diff": "diff --git a/src/datascript/storage.clj b/src/datascript/storage.clj\nindex b4b2825..7c36e21 100644\n--- a/src/datascript/storage.clj\n+++ b/src/datascript/storage.clj\n@@ -89,11 +89,11 @@\n   (ArrayList.))\n \n (defn- remember-db [db]\n   (.add stored-dbs (WeakReference. db)))\n \n-(defn store-impl! [db adapter force?]\n+(defn write-db! [db adapter force?]\n   (locking (:storage adapter)\n     (remember-db db)\n     (binding [*store-buffer* (volatile! (transient []))]\n       (let [eavt-addr (set/store (:eavt db) adapter)\n             aevt-addr (set/store (:aevt db) adapter)\n@@ -114,21 +114,21 @@\n         db))))\n \n (defn store\n   ([db]\n    (if-some [adapter (storage-adapter db)]\n-     (store-impl! db adapter false)\n+     (write-db! db adapter false)\n      (throw (ex-info \"Database has no associated storage\" {}))))\n   ([db storage]\n    (if-some [adapter (storage-adapter db)]\n      (let [current-storage (:storage adapter)]\n        (if (identical? current-storage storage)\n-         (store-impl! db adapter false)\n+         (write-db! db adapter false)\n          (throw (ex-info \"Database is already stored with another IStorage\" {:storage current-storage}))))\n      (let [settings (.-_settings ^PersistentSortedSet (:eavt db))\n            adapter  (StorageAdapter. storage settings)]\n-       (store-impl! db adapter false)))))\n+       (write-db! db adapter false)))))\n \n (defn store-tail [db tail]\n   (-store (storage db) [[tail-addr (mapv #(mapv serializable-datom %) tail)]]))\n \n (defn restore-impl [storage opts]\n",
+ "taskStatement": "In the file src/datascript/storage.clj, rename the private function `store-impl!` to `write-db!`: update the definition and every call site in the file. Change nothing else.",
+ "metrics": {
+  "tokens": {
+   "input": 25785,
+   "output": 383,
+   "cacheRead": 0,
+   "cacheWrite": 0,
+   "reasoning": 0,
+   "total": 26168
+  },
+  "toolCalls": {
+   "bash": 3
+  },
+  "turns": 4,
+  "refusals": {
+   "total": 0
+  },
+  "refetches": 0
+ },
+ "wall": 7.9,
+ "run": {
+  "exitCode": 0,
+  "session": "/home/gary/dev/cljform/bench/results/pre-15/ds_t2_rename_store_impl_r1.session.jsonl"
+ }
+}

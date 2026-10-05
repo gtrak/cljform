@@ -1,0 +1,57 @@
+{
+ "task": "ring_t2_delete_dead_helper",
+ "tier": 2,
+ "repo": "ring",
+ "rev": "head",
+ "rep": 1,
+ "success": true,
+ "checks": {
+  "done": {
+   "pass": true,
+   "detail": "dead helper + comment removed; other forms intact"
+  },
+  "collateral": {
+   "pass": true,
+   "changedFiles": [
+    "ring-core/src/ring/util/time.clj"
+   ],
+   "detail": "no collateral"
+  },
+  "tests": {
+   "run": false
+  }
+ },
+ "lintDelta": {
+  "newErrors": 0,
+  "newWarnings": 0,
+  "newFindings": []
+ },
+ "diff": "diff --git a/ring-core/src/ring/util/time.clj b/ring-core/src/ring/util/time.clj\nindex 37d8b3f..072b24a 100644\n--- a/ring-core/src/ring/util/time.clj\n+++ b/ring-core/src/ring/util/time.clj\n@@ -33,11 +33,5 @@\n (defn format-date\n   \"Format a date as RFC1123 format.\"\n   {:added \"1.2\"}\n   [^java.util.Date date]\n   (.format (formatter :rfc1123) date))\n-\n-; legacy probe epoch from the old RFC9110 date check, kept since the 1.3 port\n-(defn- legacy-rfc9110-epoch\n-  \"Epoch seconds of the last legacy RFC9110 probe run.\"\n-  []\n-  0)\n",
+ "taskStatement": "The file ring-core/src/ring/util/time.clj still carries a leftover private helper `legacy-rfc9110-epoch` that nothing uses any more. Delete that function, and the stale comment line directly above it. Leave every other form in the file untouched.",
+ "metrics": {
+  "tokens": {
+   "input": 31522,
+   "output": 629,
+   "cacheRead": 0,
+   "cacheWrite": 0,
+   "reasoning": 0,
+   "total": 32151
+  },
+  "toolCalls": {
+   "clj_tree": 1,
+   "clj_edit": 1,
+   "bash": 1,
+   "edit": 1
+  },
+  "turns": 5,
+  "refusals": {
+   "total": 0
+  },
+  "refetches": 0
+ },
+ "wall": 10.1,
+ "run": {
+  "exitCode": 0,
+  "session": "/home/gary/dev/cljform/bench/results/head/ring_t2_delete_dead_helper_r1.session.jsonl"
+ }
+}

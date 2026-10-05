@@ -1,0 +1,61 @@
+{
+ "task": "ring_t3_parse_date_nil",
+ "tier": 3,
+ "repo": "ring",
+ "rev": "head",
+ "rep": 1,
+ "success": true,
+ "checks": {
+  "done": {
+   "pass": true,
+   "detail": "parse-date now guards the http-date argument against nil"
+  },
+  "collateral": {
+   "pass": true,
+   "changedFiles": [
+    "ring-core/src/ring/util/time.clj"
+   ],
+   "detail": "no collateral"
+  },
+  "tests": {
+   "run": true,
+   "pass": true,
+   "wallSec": 1.2,
+   "detail": "#'check/d\nCHECK-OK\n"
+  }
+ },
+ "lintDelta": {
+  "newErrors": 0,
+  "newWarnings": 0,
+  "newFindings": []
+ },
+ "diff": "diff --git a/ring-core/src/ring/util/time.clj b/ring-core/src/ring/util/time.clj\nindex 072b24a..bb769af 100644\n--- a/ring-core/src/ring/util/time.clj\n+++ b/ring-core/src/ring/util/time.clj\n@@ -23,14 +23,15 @@\n \n (defn parse-date\n   \"Attempt to parse a HTTP date. Returns nil if unsuccessful.\"\n   {:added \"1.2\"}\n   [http-date]\n-  (->> (keys http-date-formats)\n-       (map (partial attempt-parse (trim-quotes http-date)))\n-       (remove nil?)\n-       (first)))\n+  (when http-date\n+    (->> (keys http-date-formats)\n+         (map (partial attempt-parse (trim-quotes http-date)))\n+         (remove nil?)\n+         (first))))\n \n (defn format-date\n   \"Format a date as RFC1123 format.\"\n   {:added \"1.2\"}\n   [^java.util.Date date]\n",
+ "taskStatement": "Bug report (from a downstream user):\n`ring.util.time/parse-date` is documented to return nil when parsing fails, but passing `nil` as the HTTP date value crashes with an exception instead of returning nil. A couple of servlet adapters pass nil through when a date header is absent, which makes the not-modified middleware blow up on otherwise-fine requests.\nFix `parse-date` so that a nil input returns nil. Valid date strings must keep parsing exactly as before, and garbage strings must keep returning nil.",
+ "metrics": {
+  "tokens": {
+   "input": 81580,
+   "output": 2810,
+   "cacheRead": 0,
+   "cacheWrite": 0,
+   "reasoning": 0,
+   "total": 84390
+  },
+  "toolCalls": {
+   "bash": 5,
+   "read": 1,
+   "clj_tree": 1,
+   "clj_edit": 1,
+   "write": 3
+  },
+  "turns": 11,
+  "refusals": {
+   "total": 0
+  },
+  "refetches": 0
+ },
+ "wall": 46.9,
+ "run": {
+  "exitCode": 0,
+  "session": "/home/gary/dev/cljform/bench/results/head/ring_t3_parse_date_nil_r1.session.jsonl"
+ }
+}

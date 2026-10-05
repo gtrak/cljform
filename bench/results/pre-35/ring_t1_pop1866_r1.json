@@ -1,0 +1,55 @@
+{
+ "task": "ring_t1_pop1866",
+ "tier": 1,
+ "repo": "ring",
+ "rev": "pre-35",
+ "rep": 1,
+ "success": true,
+ "checks": {
+  "done": {
+   "pass": true,
+   "detail": "http-date-formats has :pop1866 with the POP 1866 pattern, existing entries kept"
+  },
+  "collateral": {
+   "pass": true,
+   "changedFiles": [
+    "ring-core/src/ring/util/time.clj"
+   ],
+   "detail": "no collateral"
+  },
+  "tests": {
+   "run": false
+  }
+ },
+ "lintDelta": {
+  "newErrors": 0,
+  "newWarnings": 0,
+  "newFindings": []
+ },
+ "diff": "diff --git a/ring-core/src/ring/util/time.clj b/ring-core/src/ring/util/time.clj\nindex 072b24a..fa81493 100644\n--- a/ring-core/src/ring/util/time.clj\n+++ b/ring-core/src/ring/util/time.clj\n@@ -5,11 +5,12 @@\n            [java.util Locale TimeZone]))\n \n (def ^:no-doc http-date-formats\n   {:rfc1123 \"EEE, dd MMM yyyy HH:mm:ss zzz\"\n    :rfc1036 \"EEEE, dd-MMM-yy HH:mm:ss zzz\"\n-   :asctime \"EEE MMM d HH:mm:ss yyyy\"})\n+   :asctime \"EEE MMM d HH:mm:ss yyyy\"\n+   :pop1866 \"ddd, dd-mmm-yy hh:mm:ss zzz\"})\n \n (defn- formatter ^SimpleDateFormat [format]\n   (doto (SimpleDateFormat. ^String (http-date-formats format) Locale/US)\n     (.setTimeZone (TimeZone/getTimeZone \"GMT\"))))\n \n",
+ "taskStatement": "In the file ring-core/src/ring/util/time.clj, the `http-date-formats` map covers RFC1123, RFC1036 and ASCTIME formats only. Add the POP 1866 format to it: key `:pop1866`, value the pattern string ddd, dd-mmm-yy hh:mm:ss zzz (lowercase tokens, as POP 1866 defines them). Keep the existing entries.",
+ "metrics": {
+  "tokens": {
+   "input": 17375,
+   "output": 415,
+   "cacheRead": 0,
+   "cacheWrite": 0,
+   "reasoning": 0,
+   "total": 17790
+  },
+  "toolCalls": {
+   "clj_tree": 1,
+   "clj_edit": 1
+  },
+  "turns": 3,
+  "refusals": {
+   "total": 0
+  },
+  "refetches": 0
+ },
+ "wall": 4.6,
+ "run": {
+  "exitCode": 0,
+  "session": "/home/gary/dev/cljform/bench/results/pre-35/ring_t1_pop1866_r1.session.jsonl"
+ }
+}

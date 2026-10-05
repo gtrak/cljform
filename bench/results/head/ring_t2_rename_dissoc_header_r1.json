@@ -1,0 +1,56 @@
+{
+ "task": "ring_t2_rename_dissoc_header",
+ "tier": 2,
+ "repo": "ring",
+ "rev": "head",
+ "rep": 1,
+ "success": true,
+ "checks": {
+  "done": {
+   "pass": true,
+   "detail": "defn renamed, call site updated, no stale occurrences"
+  },
+  "collateral": {
+   "pass": true,
+   "changedFiles": [
+    "ring-core/src/ring/middleware/not_modified.clj"
+   ],
+   "detail": "no collateral"
+  },
+  "tests": {
+   "run": false
+  }
+ },
+ "lintDelta": {
+  "newErrors": 0,
+  "newWarnings": 0,
+  "newFindings": []
+ },
+ "diff": "diff --git a/ring-core/src/ring/middleware/not_modified.clj b/ring-core/src/ring/middleware/not_modified.clj\nindex ed2a2bf..0eba1a1 100644\n--- a/ring-core/src/ring/middleware/not_modified.clj\n+++ b/ring-core/src/ring/middleware/not_modified.clj\n@@ -33,11 +33,11 @@\n       (and (not-modified-since? request response)\n            (etag-match? request response))\n       (or (not-modified-since? request response)\n           (etag-match? request response)))))\n \n-(defn- dissoc-header [response header]\n+(defn- strip-header [response header]\n   (if-some [[k _] (find-header response header)]\n     (update response :headers dissoc k)\n     response))\n \n (defn not-modified-response\n@@ -49,11 +49,11 @@\n            (ok-response? response)\n            (cached-response? request response))\n     (do (close! (:body response))\n         (-> response\n             (assoc :status 304)\n-            (dissoc-header \"Content-Length\")\n+            (strip-header \"Content-Length\")\n             (assoc :body nil)))\n     response))\n \n (defn wrap-not-modified\n   \"Middleware that returns a 304 Not Modified from the wrapped handler if the\n",
+ "taskStatement": "In the file ring-core/src/ring/middleware/not_modified.clj, rename the private function `dissoc-header` to `strip-header`: update the definition and every call site in the file. Change nothing else.",
+ "metrics": {
+  "tokens": {
+   "input": 50338,
+   "output": 1122,
+   "cacheRead": 0,
+   "cacheWrite": 0,
+   "reasoning": 0,
+   "total": 51460
+  },
+  "toolCalls": {
+   "clj_tree": 2,
+   "clj_edit": 3,
+   "bash": 2
+  },
+  "turns": 7,
+  "refusals": {
+   "total": 0
+  },
+  "refetches": 1
+ },
+ "wall": 16.9,
+ "run": {
+  "exitCode": 0,
+  "session": "/home/gary/dev/cljform/bench/results/head/ring_t2_rename_dissoc_header_r1.session.jsonl"
+ }
+}
