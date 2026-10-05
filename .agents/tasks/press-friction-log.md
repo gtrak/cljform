@@ -158,3 +158,25 @@ Both reported silent-corruption modes DO NOT reproduce (repros in /tmp/repro17):
   labeled insert block (⟦h⟧ head name (lines a–b) per entry), labels from
   the summary builder's own view (nested inserts included), single-form
   inserts may collapse to the existing next-handle line.
+## T17 (dogfood of the response-shape generation, issues 32/33/34/35, clj-kondo)
+- ISSUES 32/34/35: ADOPTED. Result-first edits confirmed (no whole-file
+  table; diff first; counts line pointing at tree); single-diff verified
+  with grep -c; labeled inserts + the ambiguity-kill passed in a live
+  session (edit by the SECOND listed handle hit the middle form);
+  payload-first get confirmed. "Materially better for a working agent."
+- F1 CORRECTED IN REVIEW: the worker's "issue 33 partially — the index
+  lives on forms" finding is a layer confusion. The form-index default is
+  on the WRAPPER's clj_tree tool BY DESIGN (the CLI stays the honest
+  primitive); the worker tested raw `cljform tree` (violating the task's
+  clj-tools-only constraint) and never invoked clj_tree. Harness
+  re-verification: large-default index cells all PASS (header, 11 rows,
+  no source, every handle resolves via clj_get). Issue 33 works as spec'd.
+- F2 (inherent, not a defect): editing a form rotates its handle; the
+  stale-handle refusals + returned-handle threading are the designed
+  behavior. The worker's 3 forced refetches were from reusing old handles.
+- F3 (cosmetic): JSON result.text order (summary-then-diff) vs human
+  render (diff-then-summary) differ; both result-first. Candidate future
+  nit, not fixed.
+- POSITIVE: refusal shapes called out as the standout win — patch-not-found
+  exact bytes, unbalanced-content inline candidate — "removes the
+  guess-retry loop."
