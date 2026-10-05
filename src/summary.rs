@@ -142,6 +142,19 @@ pub(crate) fn build_handle_summary(
                 .filter(|n| n.start_byte >= anchor && n.start_byte < anchor + content_len)
                 .collect();
             let handles: Vec<String> = inserted.iter().map(|n| n.handle.clone()).collect();
+            // Issue 35: the insert response is self-describing — the bare
+            // `handles` array (opaque hashes, document order, no binding to
+            // WHICH inserted form each names) is replaced by labeled
+            // entries, one per TOP-LEVEL form of the inserted content (the
+            // inner sub-forms are content of the insert, not the forms the
+            // caller asked about — and labeling them would just move the
+            // ambiguity one level down). Each entry is labeled from THIS
+            // builder's own view of the inserted nodes: a nested insert's
+            // forms are not in the post-edit top-level forms table, so the
+            // labels can only come from here. `head`/`name` are omitted
+            // when absent (the same convention as the node table); the
+            // wrapper is the sole consumer and falls back to a generic
+            // label.
             // Line span of the inserted content (min start .. max end over the
             // inserted nodes); internal to the human/JSON view, not a path.
             // Checked form: an empty `inserted` falls back to the anchor's
@@ -160,10 +173,40 @@ pub(crate) fn build_handle_summary(
                 "wasHandle": node.handle,
                 "line": line,
             });
-            if handles.is_empty() {
+            let mut entries: Vec<serde_json::Value> = Vec::new();
+            if !handles.is_empty() {
+                // Document order over the inserted nodes, restricted to the
+                // ones whose parent is outside the inserted span (the
+                // top-level forms of the content).
+                let span: std::collections::HashSet<usize> = new_nodes
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, n)| n.start_byte >= anchor && n.start_byte < anchor + content_len)
+                    .map(|(i, _)| i)
+                    .collect();
+                entries = new_nodes
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, n)| span.contains(i) && !n.parent.is_some_and(|p| span.contains(&p)))
+                    .map(|(_, n)| {
+                        let mut entry = serde_json::json!({
+                            "handle": n.handle,
+                            "line": n.line,
+                        });
+                        if let Some(h) = &n.head {
+                            entry["head"] = serde_json::json!(h);
+                        }
+                        if let Some(name) = &n.def_name {
+                            entry["name"] = serde_json::json!(name);
+                        }
+                        entry
+                    })
+                    .collect();
+            }
+            if entries.is_empty() {
                 notes.push("could not compute handles for the inserted form(s)".to_string());
             } else {
-                summary["handles"] = serde_json::json!(handles);
+                summary["inserted"] = serde_json::json!(entries);
             }
             (summary, notes)
         }

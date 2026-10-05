@@ -16,6 +16,13 @@
  * new binary (diff embedded in r.text -> wrapper block suppressed) and the
  * pre-issue-27 binary (real one via CLJFORM_BIN_OLD, else simulated with
  * the diff stripped from r.text -> containment guard keeps it to one).
+ * Issue 35 cells: the insert summary is self-describing — multi-form
+ * inserts render one labeled row per top-level inserted form (handles
+ * cross-checked against the affected rows; the SECOND listed handle edits
+ * the MIDDLE form — the ambiguity is dead); single-entry inserts collapse
+ * to the established next-handle line; nested-insert labels come from the
+ * CLI's own node view (the inserted forms are not in the post-edit forms
+ * table, so clj_get proves the labels).
  */
 import { execFile, execFileSync } from "node:child_process";
 import { realpathSync, writeFileSync, mkdtempSync } from "node:fs";
@@ -372,6 +379,147 @@ await run("edit-old-binary-single-diff", async () => {
 		countHunks(t) === 1 && countDiffHeads(t) === 1,
 		`hunks=${countHunks(t)} heads=${countDiffHeads(t)}\n${t}`,
 	);
+});
+
+// ─── issue 35 (labeled inserted handles): clj_edit cells ────────────────────
+// Three visually similar inserted forms: the block must bind each handle to
+// its form (labels), name the anchor, and the second listed handle must
+// target the MIDDLE form.
+const INS3_FIXTURE = `(ns ins3)
+
+(defn keep-one [x]
+  (* x 1))
+
+(def tail 7)
+`;
+const SIMILAR3 = `(defn similar-a [x]
+  (x 1))
+
+(defn similar-b [x]
+  (x 2))
+
+(defn similar-c [x]
+  (x 3))
+`;
+const NESTED_INS_FIXTURE = `(ns ins-nested)
+
+(defn outer [x]
+  (let [a x]
+    (inc a)))
+
+(def tail 1)
+`;
+const NESTED_INS2 = `(defn g [y]
+  (y 1))
+
+(def h 2)
+`;
+
+await run("insert-multi-labeled", async () => {
+	const file = writeEditFixture("ins-multi.clj");
+	writeFileSync(file, INS3_FIXTURE);
+	const h = await handleFor(tools, file, /\(\u27E6([0-9a-f]+)\u27E7defn keep-one/);
+	// Dry-run on the PRE-EDIT state (deterministic handles + rows — the same
+	// insert the wrapper run performs below, with the file untouched).
+	const dry = execFileSync(
+		BIN,
+		["edit", file, "--handle", h, "--mode", "insert-after", "--content", SIMILAR3, "--dry-run", "--human"],
+	).toString("utf8");
+	const out = await tools.get("clj_edit").execute("h", { path: file, handle: h, mode: "insert-after", content: SIMILAR3 }, null, () => {});
+	check("insert-multi: not an error", !out.isError, text(out));
+	const t = text(out);
+	check("insert-multi: anchor-named header line", t.includes(`inserted after \u27E6${h}\u27E7:`), t);
+	check("insert-multi: the use-these instruction", t.includes("— use these for the next edit"), t);
+	// One labeled row per top-level inserted form, in document order.
+	const labels = [...t.matchAll(/^  \u27E6([0-9a-f]+)\u27E7 (defn similar-[abc]) \(lines \d+–\d+\)$/gm)].map((m) => [m[1], m[2]]);
+	check("insert-multi: exactly 3 labeled rows", labels.length === 3, JSON.stringify(labels));
+	check(
+		"insert-multi: rows in document order (a, b, c)",
+		labels.map((l) => l[1]).join(",") === "defn similar-a,defn similar-b,defn similar-c",
+		JSON.stringify(labels),
+	);
+	// Each listed handle is also the handle on that form's AFFECTED ROW (the
+	// issue-32 block — CLI `--human` surface; a dry-run cross-check, since
+	// the JSON envelope's result.text carries summary line + diff only).
+	let rowsMatch = true;
+	for (const [handle, label] of labels) {
+		const re = new RegExp(`^ +\\d+ +${label.split(" ").join(" +")} +lines \\d+–\\d+ +\\u27E6${handle}\\u27E7$`);
+		if (!dry.split("\n").some((l) => re.test(l))) {
+			rowsMatch = false;
+			break;
+		}
+	}
+	check("insert-multi: listed handles match the affected rows", rowsMatch, t);
+	// AMBIGUITY KILL: edit by the SECOND listed handle — it must target the
+	// MIDDLE form (similar-b), leaving the neighbors intact.
+	const hMid = labels[1]?.[0];
+	check("insert-multi: a second listed handle exists", !!hMid, JSON.stringify(labels));
+	if (hMid) {
+		const out2 = await tools.get("clj_edit").execute("h", { path: file, handle: hMid, mode: "replace", content: "(defn similar-b [x]\n  (x 20))" }, null, () => {});
+		check("insert-multi: replace by the second listed handle ok", !out2.isError, text(out2));
+		const t2 = text(out2);
+		check("insert-multi: the second listed handle names the middle form", t2.includes("replaced form") && t2.includes("similar-b"), t2);
+		const a = text(await tools.get("clj_tree").execute("h", { path: file, name: "similar-a" }, null, () => {}));
+		const b = text(await tools.get("clj_tree").execute("h", { path: file, name: "similar-b" }, null, () => {}));
+		const c = text(await tools.get("clj_tree").execute("h", { path: file, name: "similar-c" }, null, () => {}));
+		check("insert-multi: the middle form carries the new body", b.includes("x 20)"), b);
+		check("insert-multi: the first form is intact", a.includes("x 1)"), a);
+		check("insert-multi: the third form is intact", c.includes("x 3)"), c);
+	}
+});
+
+await run("insert-single-next-handle", async () => {
+	const file = writeEditFixture("ins-single.clj");
+	writeFileSync(file, INS3_FIXTURE);
+	const h = await handleFor(tools, file, /\(\u27E6([0-9a-f]+)\u27E7defn keep-one/);
+	const out = await tools.get("clj_edit").execute("h", { path: file, handle: h, mode: "insert-after", content: "(def solo 9)" }, null, () => {});
+	check("insert-single: not an error", !out.isError, text(out));
+	const t = text(out);
+	// A single-entry insert collapses to the established next-handle line —
+	// no 3-line block for one handle (the anchor + label stay in the CLI
+	// summary line and the affected rows).
+	check("insert-single: collapses to the next-handle line", /next handle: \u27E6[0-9a-f]+\u27E7 — use it for the next edit to this form/.test(t), t);
+	check("insert-single: no multi-entry block", !t.includes("inserted after \u27E6") && !t.includes("— use these for the next edit"), t);
+	const hSolo = t.match(/next handle: \u27E6([0-9a-f]+)\u27E7/)?.[1];
+	if (hSolo) {
+		const g = await tools.get("clj_get").execute("h", { path: file, handle: hSolo }, null, () => {});
+		check("insert-single: the next handle resolves to the inserted form", !g.isError && text(g).includes("(def solo 9)"), text(g));
+	} else {
+		check("insert-single: a next-handle line exists", false, t);
+	}
+});
+
+await run("insert-nested-labeled", async () => {
+	const file = writeEditFixture("ins-nested.clj");
+	writeFileSync(file, NESTED_INS_FIXTURE);
+	// The anchor is a MULTI-LINE NESTED collection (marked at the default
+	// depth): the inserted forms are NOT in the post-edit top-level forms
+	// table, so the labels can only come from the CLI's own node view.
+	const h = await handleFor(tools, file, /\(\u27E6([0-9a-f]+)\u27E7let \[a x\]/);
+	const out = await tools.get("clj_edit").execute("h", { path: file, handle: h, mode: "insert-after", content: NESTED_INS2 }, null, () => {});
+	check("insert-nested: not an error", !out.isError, text(out));
+	const t = text(out);
+	check("insert-nested: anchor-named header line", t.includes(`inserted after \u27E6${h}\u27E7:`), t);
+	const s = out.details?.result?.summary ?? {};
+	const ins = Array.isArray(s.inserted) ? s.inserted : [];
+	check("insert-nested: JSON carries 2 labeled entries", ins.length === 2, JSON.stringify(s));
+	const labels = ins.map((e) => [e.head, e.name, e.handle]);
+	check(
+		"insert-nested: labels are defn g and def h (from the builder's own view)",
+		labels[0]?.[0] === "defn" && labels[0]?.[1] === "g" && labels[1]?.[0] === "def" && labels[1]?.[1] === "h",
+		JSON.stringify(labels),
+	);
+	check("insert-nested: the inserted names are NOT in the post-edit forms table", !(out.details?.forms ?? []).some((f) => f.name === "g" || f.name === "h"), JSON.stringify(out.details?.forms));
+	check(
+		"insert-nested: the rendered block carries the labels",
+		/^  \u27E6[0-9a-f]+\u27E7 defn g \(lines \d+–\d+\)$/m.test(t) && /^  \u27E6[0-9a-f]+\u27E7 def h \(lines \d+–\d+\)$/m.test(t),
+		t,
+	);
+	// The labels are CORRECT: each listed handle resolves to its form.
+	for (const [head, name, handle] of labels) {
+		const g = await tools.get("clj_get").execute("h", { path: file, handle }, null, () => {});
+		check(`insert-nested: the ${head} ${name} handle resolves to its form`, !g.isError && text(g).includes(`(${head} ${name}`), text(g));
+	}
 });
 
 // ─── report ──────────────────────────────────────────────────────────────────

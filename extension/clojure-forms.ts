@@ -866,15 +866,40 @@ export default function ClojureForms(pi: ExtensionAPI) {
 		} else {
 			// Next-handle affordance: source from the JSON envelope (never re-parse the
 			// human text). replace/patch point at the target's new handle; insert-
-			// after/before list the inserted forms' handles; delete prints nothing.
+			// after/before point at the inserted form(s) (issue 35: one labeled
+			// row per top-level inserted form, or the next-handle line for a
+			// single form); delete prints nothing.
 			const s: any = r.summary ?? {};
 			if (s.action === "replaced" || s.action === "patched") {
 				const h = s.handle ?? s.wasHandle;
 				if (h) lines.push(`next handle: ⟦${h}⟧ — use it for the next edit to this form`);
-			} else if (s.action === "inserted" && Array.isArray(s.handles) && s.handles.length > 0) {
-				const handles = s.handles.map((hh: string) => `⟦${hh}⟧`).join(", ");
-				const anchor = s.wasHandle ? ` (anchor ⟦${s.wasHandle}⟧)` : "";
-				lines.push(`inserted handles: ${handles}${anchor} — use these for the next edit`);
+			} else if (s.action === "inserted") {
+				// Issue 35: the insert summary is self-describing — one labeled
+				// row per TOP-LEVEL inserted form, from `summary.inserted` (the
+				// CLI's own node view: nested inserts are not in the post-edit
+				// forms table, so the labels can only come from there). A
+				// single-entry insert collapses to the established next-handle
+				// line (the anchor + label stay in the CLI summary line and the
+				// affected rows).
+				const inserted: any[] = Array.isArray(s.inserted) ? s.inserted : [];
+				if (inserted.length === 1) {
+					const h = inserted[0]?.handle;
+					if (h) lines.push(`next handle: ⟦${h}⟧ — use it for the next edit to this form`);
+				} else if (inserted.length > 1) {
+					const anchor = s.wasHandle ? `⟦${s.wasHandle}⟧` : "";
+					lines.push(`inserted ${s.side ?? "after"} ${anchor}:`);
+					for (const e of inserted) {
+						const label = [e.head, e.name].filter(Boolean).join(" ") || "form";
+						lines.push(`  ⟦${e.handle}⟧ ${label} (lines ${e.line[0]}–${e.line[1]})`);
+					}
+					lines.push("— use these for the next edit");
+				} else if (Array.isArray(s.handles) && s.handles.length > 0) {
+					// Old-binary envelope (pre-issue-35: `handles` instead of
+					// `inserted`): render the bare list the way it used to.
+					const handles = s.handles.map((hh: string) => `⟦${hh}⟧`).join(", ");
+					const anchor = s.wasHandle ? ` (anchor ⟦${s.wasHandle}⟧)` : "";
+					lines.push(`inserted handles: ${handles}${anchor} — use these for the next edit`);
+				}
 			}
 		}
 		return { content: [{ type: "text", text: lines.join("\n") }], details: { forms: out.forms, result: r } };

@@ -1222,3 +1222,132 @@ fn edit_json_still_carries_full_forms_array() {
     assert_eq!(d["forms"].as_array().unwrap().len(), 5, "edit keeps forms: {d}");
     assert!(d.get("formsCount").is_none(), "no formsCount on edit: {d}");
 }
+
+// ─── insert response contract (issue 35) ───────────────────────────────────
+
+#[test]
+fn insert_summary_labels_top_level_inserted_forms() {
+    // Three visually similar inserted forms: the summary's `inserted`
+    // entries are one per TOP-LEVEL inserted form, in document order,
+    // labeled head+name+line, cross-checked against the post-edit forms
+    // table — and the bare `handles` array is gone.
+    let content = "(defn sim-a [x]\n  (x 1))\n\n(def delta 2)\n\n(defn sim-c [x]\n  (x 3))";
+    let f = fresh("i35-multi.clj");
+    let h = handle_of(&f, "helper");
+    let (code, d, err) = run_json(
+        &[
+            "edit", &f, "--handle", &h, "--mode", "insert-after", "--content", content, "--json",
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "{d} {err}");
+    let s = &d["result"]["summary"];
+    assert_eq!(s["action"], "inserted");
+    assert_eq!(s["side"], "after");
+    assert_eq!(s["wasHandle"], h, "the anchor stays named");
+    assert!(s.get("handles").is_none(), "issue 35: bare `handles` replaced: {d}");
+    let ins = s["inserted"].as_array().unwrap();
+    assert_eq!(ins.len(), 3, "one entry per top-level inserted form: {d}");
+    // Document order + labels.
+    assert_eq!(ins[0]["head"], "defn");
+    assert_eq!(ins[0]["name"], "sim-a");
+    assert_eq!(ins[1]["head"], "def");
+    assert_eq!(ins[1]["name"], "delta");
+    assert_eq!(ins[2]["head"], "defn");
+    assert_eq!(ins[2]["name"], "sim-c");
+    // Cross-check against the post-edit top-level forms table (addresses 4, 5, 6).
+    let forms = d["forms"].as_array().unwrap();
+    for (i, e) in ins.iter().enumerate() {
+        let form = &forms[3 + i];
+        assert_eq!(e["line"], form["line"], "entry {i} line matches its form: {d}");
+        assert!(
+            form["hash"].as_str().unwrap().starts_with(e["handle"].as_str().unwrap()),
+            "entry {i} handle prefixes its form hash: {d}"
+        );
+    }
+    // The span key is min start .. max end over the entries.
+    assert_eq!(s["line"], serde_json::json!([ins[0]["line"][0], ins[2]["line"][1]]));
+
+    // The ambiguity is dead: editing by the SECOND listed handle targets
+    // the MIDDLE form (delta), leaving the neighbors intact.
+    let h_mid = ins[1]["handle"].as_str().unwrap().to_string();
+    let (code, d2, err) =
+        run_json(&["edit", &f, "--handle", &h_mid, "--content", "(def delta 20)", "--json"], None);
+    assert_eq!(code, 0, "{d2} {err}");
+    let s2 = &d2["result"]["summary"];
+    assert_eq!(s2["action"], "replaced");
+    assert_eq!(s2["wasHandle"], h_mid);
+    assert_eq!(s2["name"], "delta", "the second listed handle names the middle form: {d2}");
+    let forms2 = d2["forms"].as_array().unwrap();
+    assert_eq!(forms2[3]["name"], "sim-a", "first form intact: {d2}");
+    assert_eq!(forms2[5]["name"], "sim-c", "third form intact: {d2}");
+}
+
+#[test]
+fn insert_summary_labels_nested_insert_from_own_view() {
+    // NESTED insert: the inserted forms are not in the post-edit top-level
+    // forms table, so the labels can only come from the summary builder's
+    // own node view.
+    let src = "(ns t)\n\n(defn f [x]\n  (let [a 1]\n    (when x\n      (inner x))))\n\n(def last 1)\n";
+    let f = fixture("i35-nested.clj", src.as_bytes());
+    let h = handle_at_full(&f, 5, 3); // (when x …)
+    let content = "(defn g [y]\n  (y 1))\n\n(def h 2)";
+    let (code, d, err) = run_json(
+        &[
+            "edit", &f, "--handle", &h, "--mode", "insert-after", "--content", content, "--json",
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "{d} {err}");
+    let s = &d["result"]["summary"];
+    assert_eq!(s["wasHandle"], h);
+    // The inserted names are NOT in the post-edit forms table.
+    let names: Vec<&str> = d["forms"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|x| x["name"].as_str())
+        .collect();
+    assert!(!names.contains(&"g") && !names.contains(&"h"), "nested forms absent from the table: {d}");
+    let ins = s["inserted"].as_array().unwrap();
+    assert_eq!(ins.len(), 2, "the two top-level forms of the content: {d}");
+    assert_eq!(ins[0]["head"], "defn");
+    assert_eq!(ins[0]["name"], "g", "label from the builder's own view: {d}");
+    assert_eq!(ins[1]["head"], "def");
+    assert_eq!(ins[1]["name"], "h");
+
+    // The nested labels are correct: the second listed handle edits `h`.
+    let h_h = ins[1]["handle"].as_str().unwrap().to_string();
+    let (code, d2, err) =
+        run_json(&["edit", &f, "--handle", &h_h, "--content", "(def h 20)", "--json"], None);
+    assert_eq!(code, 0, "{d2} {err}");
+    assert_eq!(d2["result"]["summary"]["action"], "replaced");
+    assert_eq!(d2["result"]["summary"]["wasHandle"], h_h);
+    // The diff proves the SECOND listed handle edits `h` (the post-edit
+    // summary's `name` is top-level-only — the nested def's label is `def`).
+    let diff = d2["result"]["diff"].as_str().unwrap();
+    assert!(diff.contains("-(def h 2)") && diff.contains("+(def h 20)"), "second listed handle edits `h`: {diff}");
+    assert!(!diff.contains("g"), "the second listed handle is not `g`: {diff}");
+}
+
+#[test]
+fn insert_summary_single_form_is_one_entry() {
+    // A single-form insert: exactly one labeled entry (the wrapper
+    // collapses it to the next-handle line; the JSON shape is uniform).
+    let f = fresh("i35-single.clj");
+    let h = handle_of(&f, "helper");
+    let (code, d, err) = run_json(
+        &[
+            "edit", &f, "--handle", &h, "--mode", "insert-after", "--content", "(def solo 9)", "--json",
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "{d} {err}");
+    let s = &d["result"]["summary"];
+    let ins = s["inserted"].as_array().unwrap();
+    assert_eq!(ins.len(), 1, "one entry: {d}");
+    assert_eq!(ins[0]["head"], "def");
+    assert_eq!(ins[0]["name"], "solo");
+    assert!(ins[0]["handle"].as_str().unwrap().len() >= 6);
+    assert!(s.get("handles").is_none(), "bare `handles` replaced: {d}");
+}

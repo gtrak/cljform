@@ -25,8 +25,10 @@ You are the single writer thread. Execute the assigned task with narrow, coheren
   sequences, and indentation must match the file byte-for-byte; for multi-line patches
   prefer the smallest sub-form whose handle you have.
 - For sequential edits to the same form, use the handle returned by the previous `clj_edit`
-  (the `next handle:` line); do not re-fetch (`clj_tree`/`clj_get`) between patches. Insert
-  results list the `inserted handles:` instead. Only re-run `clj_tree` after a `stale-handle`
+  (the `next handle:` line); do not re-fetch (`clj_tree`/`clj_get`) between patches. Multi-form
+  insert results list the inserted forms as a labeled block (`inserted after ⟦anchor⟧:` /
+  `⟦handle⟧ head name (lines a–b)` / `— use these for the next edit`); a single-form insert
+  shows the `next handle:` line. Only re-run `clj_tree` after a `stale-handle`
   refusal.
 - **On any `patch-not-found`/`patch-ambiguous`: re-run `clj_get` and build the patch from
   those exact bytes.** Never re-type form content from a `bash`/`sed` read — that is the

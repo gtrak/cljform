@@ -304,8 +304,20 @@ fn edit_handle_patch_delete_insert() {
     ], None);
     assert_eq!(code, 0, "{d} {stderr}");
     assert_eq!(d["result"]["summary"]["action"], "inserted");
-    let handles = d["result"]["summary"]["handles"].as_array().expect("handles");
-    assert!(!handles.is_empty(), "inserted form(s) report handles: {d}");
+    // Issue 35: the bare `handles` array is replaced by labeled `inserted`
+    // entries (this is a NESTED insert — the entry's label comes from the
+    // summary builder's own node view, not the post-edit forms table).
+    let inserted = d["result"]["summary"]["inserted"].as_array().expect("inserted");
+    assert_eq!(inserted.len(), 1, "one top-level inserted form: {d}");
+    let e = &inserted[0];
+    assert!(!e["handle"].as_str().unwrap().is_empty(), "{d}");
+    assert_eq!(e["head"], "def", "labeled from the builder's own node view: {d}");
+    assert_eq!(e["name"], "marker", "nested def name is labeled: {d}");
+    assert!(e["line"].is_array(), "{d}");
+    assert!(
+        d["result"]["summary"].get("handles").is_none(),
+        "issue 35: the bare `handles` array is gone: {d}"
+    );
     let text = std::fs::read_to_string(&f).unwrap();
     assert!(text.contains("(def config (def marker :ok){:a 1})"), "{text}");
     // Every top-level form still parses and the count is unchanged.
