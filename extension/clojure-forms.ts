@@ -835,17 +835,20 @@ export default function ClojureForms(pi: ExtensionAPI) {
 		const r = out.result ?? {};
 		// Issue 32 (A/D): result.text keeps the CLI's issue-27 composition
 		// (summary line + repair diff + changed-region diff); the wrapper
-		// renders it as-is. KNOWN defect (owner-reported, queued as issue
-		// 34 — this audit hit it too): the changed-region diff then rides in
-		// BOTH r.text and r.diff, so the wrapper prints it twice. Fix belongs
-		// to issue 34 (both issues touch the wrapper — one writer).
+		// renders it as-is.
 		const lines: string[] = [r.text ?? "done"];
 		if (r.repaired) {
 			lines.push("");
 			lines.push("content was REPAIRED (brackets inferred from indentation) — verify the result:");
 			if (r.repairDiff) lines.push(r.repairDiff);
 		}
-		if (r.diff) {
+		// Issue 34: the changed-region diff renders EXACTLY ONCE. Since issue 27
+		// r.text already carries it (run_edit appends it; patch always did), so
+		// the separate block only renders when r.text does NOT contain it — the
+		// pre-issue-27 envelope (r.text without the diff) still gets its block.
+		// r.repairDiff is a DIFFERENT artifact (the pre-repair candidate diff) and
+		// stays unconditional above.
+		if (r.diff && !(r.text ?? "").includes(r.diff)) {
 			lines.push("");
 			lines.push("diff (changed region):");
 			lines.push(r.diff);

@@ -11,7 +11,11 @@
  * exits 1. Issue 33 (Part B) cells: large-file default -> form index with
  * live handles + hint, no source body; small-file default -> byte-identical
  * pass-through; explicit window/name/json/depth honored; threshold boundary;
- * edit-by-an-index-handle proof.
+ * edit-by-an-index-handle proof. Issue 34 cells: clj_edit patch/replace/
+ * insert/delete each return EXACTLY ONE changed-region diff, for both the
+ * new binary (diff embedded in r.text -> wrapper block suppressed) and the
+ * pre-issue-27 binary (real one via CLJFORM_BIN_OLD, else simulated with
+ * the diff stripped from r.text -> containment guard keeps it to one).
  */
 import { execFile, execFileSync } from "node:child_process";
 import { realpathSync, writeFileSync, mkdtempSync } from "node:fs";
@@ -231,6 +235,143 @@ await run("edit-by-index-handle", async () => {
 	// The OTHER forms' handles are untouched and still live (snapshot tokens).
 	const other = text(await treeCall({ path: largePath, name: "large-a5" }));
 	check("edit-by-index-handle: sibling form intact", other.includes("def local-5-0 5 0"), other.slice(0, 300));
+});
+
+// ─── issue 34 (double diff): clj_edit cells ────────────────────────────────────────
+// New binary + new wrapper: r.text already carries the changed-region diff
+// (issue 27), so the wrapper's `diff (changed region):` block must be
+// suppressed and the tool text holds EXACTLY ONE diff. Old binary + new
+// wrapper (r.text WITHOUT the diff, simulated by stripping it from the
+// envelope): the block renders, still exactly one diff.
+const EDIT_FIXTURE = `(ns edit-demo)
+
+(def config {:a 1})
+
+(defn calc [x]
+  (+ x 1))
+`;
+
+function writeEditFixture(name) {
+	const p = join(tmp, name);
+	writeFileSync(p, EDIT_FIXTURE);
+	return p;
+}
+
+/** Number of unified-diff hunks (`@@ …`) in the tool text. */
+function countHunks(t) {
+	return (t.match(/^@@ /gm) || []).length;
+}
+
+/** Number of unified-diff file headers (`--- …`) in the tool text. */
+function countDiffHeads(t) {
+	return (t.match(/^--- /gm) || []).length;
+}
+
+async function handleFor(tools, file, pattern) {
+	const t = text(await tools.get("clj_tree").execute("h", { path: file }, null, () => {}));
+	const m = t.match(pattern);
+	if (!m) throw new Error(`handle not found in:\n${t}`);
+	return m[1];
+}
+
+async function assertSingleDiff(name, tools, file, params) {
+	const out = await tools.get("clj_edit").execute("h", { path: file, ...params }, null, () => {});
+	check(`${name}: not an error`, !out.isError, text(out));
+	const t = text(out);
+	check(
+		`${name}: exactly ONE diff occurrence (hunk bodies)`,
+		countHunks(t) === 1 && countDiffHeads(t) === 1,
+		`hunks=${countHunks(t)} heads=${countDiffHeads(t)}\n${t}`,
+	);
+	// New binary: the diff rides in r.text, so the wrapper's labeled block
+	// must be suppressed (the double-diff defect) — it renders only for old
+	// envelopes where r.text does not carry the diff.
+	check(
+		`${name}: no duplicate "diff (changed region):" label (new binary: diff rides in r.text)`,
+		!t.includes("diff (changed region):"),
+		t,
+	);
+}
+
+/**
+ * Pre-ISSUE-27 binary + new wrapper. If CLJFORM_BIN_OLD points at a built
+ * pre-issue-27 cljform, spawn that real binary (its patch-mode r.text
+ * already carried the diff — "patch always did" — and its whole-form ops
+ * had no diff at all). Otherwise SIMULATE the old envelope shape: the edit
+ * result.text without the embedded diff, the diff only in r.diff.
+ * Either way the wrapper's containment guard must keep the diff to a
+ * single occurrence.
+ */
+function makeOldBinaryPi() {
+	const pi = makePi();
+	const oldBin = process.env.CLJFORM_BIN_OLD;
+	if (oldBin) {
+		const realBin = oldBin;
+		const realExec = pi.api.exec;
+		pi.api.exec = (cmd, args, opts) => realExec(realBin, args, opts);
+		return pi;
+	}
+	const realExec = pi.api.exec;
+	pi.api.exec = async (cmd, args, opts) => {
+		const res = await realExec(cmd, args, opts);
+		if (res.code === 0 && args.includes("edit")) {
+			try {
+				const start = res.stdout.indexOf("{");
+				if (start !== -1) {
+					const env = JSON.parse(res.stdout.slice(start));
+					if (env.result?.diff && env.result.text?.includes(env.result.diff)) {
+						env.result.text = env.result.text.replace("\n" + env.result.diff, "");
+						res.stdout = JSON.stringify(env);
+					}
+				}
+			} catch {
+				/* not an edit envelope — leave as-is */
+			}
+		}
+		return res;
+	};
+	return pi;
+}
+
+await run("edit-patch-single-diff", async () => {
+	const file = writeEditFixture("edit-patch.clj");
+	const h = await handleFor(tools, file, /\(\u27E6([0-9a-f]+)\u27E7defn calc \[x\]/);
+	await assertSingleDiff("edit-patch", tools, file, { handle: h, mode: "patch", oldText: "(+ x 1)", newText: "(+ x 2)" });
+});
+
+await run("edit-replace-single-diff", async () => {
+	const file = writeEditFixture("edit-replace.clj");
+	const h = await handleFor(tools, file, /\(\u27E6([0-9a-f]+)\u27E7def config \{:a 1\}\)/);
+	await assertSingleDiff("edit-replace", tools, file, { handle: h, mode: "replace", content: "(def config {:a 2})" });
+});
+
+await run("edit-insert-single-diff", async () => {
+	const file = writeEditFixture("edit-insert.clj");
+	const h = await handleFor(tools, file, /\(\u27E6([0-9a-f]+)\u27E7def config \{:a 1\}\)/);
+	await assertSingleDiff("edit-insert", tools, file, { handle: h, mode: "insert-after", content: "(def inserted 99)" });
+});
+
+await run("edit-delete-single-diff", async () => {
+	const file = writeEditFixture("edit-delete.clj");
+	const h = await handleFor(tools, file, /\(\u27E6([0-9a-f]+)\u27E7def config \{:a 1\}\)/);
+	await assertSingleDiff("edit-delete", tools, file, { handle: h, mode: "delete" });
+});
+
+await run("edit-old-binary-single-diff", async () => {
+	// Old binary, both patch shapes (real pre-issue-27 binary via
+	// CLJFORM_BIN_OLD, else the simulated envelope): exactly one diff.
+	const oldPi = makeOldBinaryPi();
+	ext(oldPi.api);
+	const file = writeEditFixture("edit-old.clj");
+	const h = await handleFor(tools, file, /\(\u27E6([0-9a-f]+)\u27E7defn calc \[x\]/);
+	const out = await oldPi.tools.get("clj_edit").execute("h", { path: file, handle: h, mode: "patch", oldText: "(+ x 1)", newText: "(+ x 2)" }, null, () => {});
+	check("edit-old-binary: not an error", !out.isError, text(out));
+	const t = text(out);
+	check(
+		"edit-old-binary: exactly ONE diff occurrence (containment guard, old envelope)",
+		countHunks(t) === 1 && countDiffHeads(t) === 1,
+		`hunks=${countHunks(t)} heads=${countDiffHeads(t)}\n${t}`,
+	);
 });
 
 // ─── report ──────────────────────────────────────────────────────────────────
