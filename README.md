@@ -14,16 +14,21 @@ and a "balanced" edit can silently swallow the forms after it. cljform
 makes those failures either impossible or loud.
 
 ## Why build this? (human-written)
-I use local models for the bulk of my code generation. They have gotten good
-enough that line edits mostly work, but clojure is consistently a painful 
-experience. I might walk away and come back to python scripts being made for
-unbalanced parens and just endless looping and context bloat from failed edits.
-Parinfer-rust got me closer to a solution, but this is a more purpose-built
-tool for how agents expect, built by constant dogfooding between GLM 5.3 flash 
-and my local model, with me nudging the design.  The original approach came from 
-this article: https://lispmeister.github.io/deeprecursion/posts/2026-02-13-sexp-native-editing.html .
+
+The way I prefer to work is with LLM assistance, queueing up a batch of tasks
+with a smarter planner model, then walking away and thinking about something else, 
+and reviewing the output.  I use local models (Qwen 3.8 27b as of this writing) 
+for the bulk of my code generation. They have gotten good enough that line edits
+mostly work, but clojure is consistently a painful experience. I might walk away
+and come back to python scripts being made for unbalanced parens and just endless
+looping and context bloat from failed edits. Parinfer-rust got me closer to a solution,
+but this is a more purpose-built tool for agents' expectations, built by constant
+dogfooding between GLM 5.3 flash and my local model, with me nudging the design.
+The original approach came from this article: https://lispmeister.github.io/deeprecursion/posts/2026-02-13-sexp-native-editing.html .
 I started with tree-sitter and the LLM's own retrospective of a session with a
-lot of failed edits.
+lot of failed edits.  I care less about conceptual cleanliness than I do about having a
+useful tool with better working tradeoffs, so the implementation details are still
+unstable.
 
 ## A thirty-second tour
 
