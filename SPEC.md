@@ -100,8 +100,26 @@ cljform [--json|--human] <op> [args]
   - `1` — parse/structure error: `parse-error`, `not-one-form`,
     `truncated-content`, `shape-violation`, `detector-fatal` (under
     `--strict`), `annotate-conflict` (`tree` view), `materialize-error`,
-    `format-error` — plus `internal-error` (a residual panic caught at
-    the dispatch boundary; see the backstop below)
+    `format-error`, `conflict-markers` (a broken file: git conflict
+    markers present — the gate that closes the markers-as-symbols hole,
+    §6), `not-supported-broken` (`tree --name` on a broken file) — plus
+    `internal-error` (a residual panic caught at the dispatch boundary;
+    see the backstop below)
+
+  **The broken-file state (issue 31).** A file is BROKEN iff it has
+  (a) tree-sitter parse errors or (b) conflict markers; both are
+  diagnostics. Because tree-sitter reads `<<<<<<<` as a legal symbol, a
+  conflicted file *parses* — so the parse gate runs the line-anchored
+  conflict scan BEFORE parsing, and markers win over parse errors
+  (layered diagnostics: markers first, brackets after the markers are
+  resolved by a text edit). Broken: writes REFUSED by every gated op
+  (`conflict-markers` or `parse-error`); reads: `check` reports the
+  structured `error.diagnostics`, and `tree --recover` renders the
+  recovery view (§10.2). `strip` is gated by the markers too (its output
+  would carry marker lines as content) but stays a pure byte filter for
+  bracket-broken input. Healthy files: the scan finds nothing and every
+  envelope stays byte-identical (`error.diagnostics` is an additive key,
+  present only when non-empty).
   - `2` — usage error: `usage` (bad args, unknown op, target required but
     missing, `--handle` shorter than 6 hex chars, `--handle` with
     append/prepend)
@@ -136,13 +154,22 @@ cljform [--json|--human] <op> [args]
   { "ok": false, "op": "edit",
     "error": { "code": "stale-handle" | "form-not-found" | "usage" | "io" | …,
                "line": 46, "col": 1, "message": "…",
-               "hint": "…" } }
+               "hint": "…",
+               "diagnostics": [ … ] } }  // issue 31: broken-file diagnostics, additive
   ```
   Lookup and patch-mismatch errors carry a recovery payload —
   `suggestions` (did-you-mean candidates) on `--name` lookups, and the
   target form's exact bytes on `patch-not-found` — so the agent can re-aim
   without a second round-trip; every other error re-aims via `tree` or
   `forms`.
+
+  **`error.diagnostics` (issue 31).** Broken-file failures carry the full
+  diagnostic list — conflict regions (per-side line spans: `head` /
+  `base` (diff3 only) / `incoming`, plus `malformed` for unpaired /
+  unterminated regions) and, after the markers are resolved, ALL
+  parse-error spans (not just the first — the `parse-error` message
+  itself stays the first-error text, byte-identical). Additive key:
+  absent on every healthy-file envelope.
 
 ### 4.2 Form table (the `forms` array)
 
@@ -175,7 +202,7 @@ not serialized — it is not addressable).
 | Op | Purpose | Mutates | Key args |
 |----|---------|---------|----------|
 | `forms <file>` | top-level form table (§4.2) | no | — |
-| `tree <file>` | annotated view: source with `⟦handle⟧` after each marked collection's opening delimiter (§10.2) | no | `--depth N\|all`, `--full`, `--json` (flat node table), `--name SYM` (selector, §10.2), `--start-line N` / `--end-line N` (line window, §10.2) |
+| `tree <file>` | annotated view: source with `⟦handle⟧` after each marked collection's opening delimiter (§10.2); `--recover` renders the recovery view for a broken file instead (verbatim source + diagnostics + intact forms, no handles) | no | `--depth N\|all`, `--full`, `--json` (flat node table), `--name SYM` (selector, §10.2), `--start-line N` / `--end-line N` (line window, §10.2), `--recover` (broken-file recovery view, §10.2) |
 | `strip [file]` | delete every `⟦…⟧` marker → the exact original bytes; pure stdout filter, no envelope (§10.2) | no | file or stdin |
 | `get <file>` | one form's exact bytes + metadata, including its handle | no | `--name sym` \| `--handle H` |
 | `check [file]` | parse + form table + nesting warnings | no | file or stdin |
@@ -342,6 +369,16 @@ host set is wide: all executable-scope heads matched by base name, so
 `clojure.test/deftest` is caught too; D2 fires on any definition-like `def…`
 head, not just the four listed. §14.)
 
+**Broken-file recovery workflow (issue 31).** git conflict -> `check`
+names the regions (`conflict-markers`, per-side spans in
+`error.diagnostics`) -> `tree --recover` shows both sides (verbatim
+source + per-side spans + the intact top-level forms) -> resolve with a
+TEXT edit (built-in edit/shell; cljform's write path stays gated by
+design) -> `check` ok (or `parse-error` if the resolution broke
+brackets — layered diagnostics: markers first, then brackets) ->
+cljform flow resumes. cljform never automates the semantic merge and
+never writes a broken file.
+
 Detector config is a data-driven list `(host-sym, forbidden-sym)` so v2 can
 extend per-repo without code changes (e.g. repo rules via a `.cljform.toml` —
 out of scope for v1, flag only).
@@ -431,7 +468,7 @@ session.
 | Tool | Params | Maps to |
 |------|--------|---------|
 | `clj_forms` | `{path}` | `cljform forms --json`; refreshes the fingerprint cache |
-| `clj_tree` | `{path, name?, depth?, json?, startLine?, endLine?}` | `cljform tree` — the primary handle-discovery view (`--depth N\|all`); `name` maps to `--name SYM` (the §10.2 selector: matched subtrees at full depth, zero matches is an ok empty result); `json` returns the structured node list; `startLine`/`endLine` map to `--start-line`/`--end-line` (the §10.2 line window: complete forms only, real file line numbers, the effective span echoed — page large files; the window header/echo passes through unchanged). **Human path (default, `--human`) is a pass-through:** the annotated source is not a JSON envelope, so on exit 0 the wrapper returns `stdout` directly (BOM-stripped, `trimEnd`) with no `isError` — a successful default `clj_tree` is never an error and is never prefixed `cljform failed:`. Only a nonzero exit (or, in `json` mode, an unparseable/`ok:false` envelope) yields `isError`, using `errorText` when the output parses as an error envelope, else the `cljform failed: ${stderr \|\| stdout}` fallback |
+| `clj_tree` | `{path, name?, depth?, json?, startLine?, endLine?, recover?}` | `cljform tree` — the primary handle-discovery view (`--depth N\|all`); `name` maps to `--name SYM` (the §10.2 selector: matched subtrees at full depth, zero matches is an ok empty result); `json` returns the structured node list; `startLine`/`endLine` map to `--start-line`/`--end-line` (the §10.2 line window: complete forms only, real file line numbers, the effective span echoed — page large files; the window header/echo passes through unchanged); `recover` maps to `--recover` (the §10.2 broken-file recovery view: on a broken file the JSON path renders the diagnostics + intact-form labels + window echo — no handles; on a healthy file the normal view). **Human path (default, `--human`) is a pass-through:** the annotated source is not a JSON envelope, so on exit 0 the wrapper returns `stdout` directly (BOM-stripped, `trimEnd`) with no `isError` — a successful default `clj_tree` is never an error and is never prefixed `cljform failed:`. Only a nonzero exit (or, in `json` mode, an unparseable/`ok:false` envelope) yields `isError`, using `errorText` when the output parses as an error envelope, else the `cljform failed: ${stderr \|\| stdout}` fallback |
 | `clj_get` | `{path, name? / handle?}` | `cljform get --json` — exact bytes + the form's `⟦handle⟧` |
 | `clj_edit` | `{path, handle?, mode?, content? / oldText? + newText?, dryRun?, strict?, repair?, autoFormat?}` | `cljform edit --handle …` — mode auto-selects `patch` when `oldText` is present; append/prepend take no handle; `dryRun` ⇒ `--dry-run`, `strict` ⇒ `--strict`, `repair` ⇒ `--repair`; `autoFormat` (default true) maps to the in-edit content reindent: `false` passes `--no-format-content`, `true` (the default) passes nothing and lets `cljform edit` reindent the content itself in parinfer paren mode (§10.3/§10.5; a refused reindent is reported by the CLI as a note, the edit never fails for it); the wrapper no longer runs a separate `cljform format` call; `oldText`/`newText` are exact patch text and are never reformatted. **Next-handle affordance:** on every successful (non-dry-run) edit the wrapper appends a final line sourced from the JSON envelope (`result.summary`), never from re-parsing the human text — `replace`/`patch` append `next handle: ⟦H⟧ — use it for the next edit to this form` (from `summary.handle`; falls back to `summary.wasHandle` only when `handle` is absent) so the agent chases the returned handle instead of re-fetching; `insert-after`/`insert-before` append `inserted handles: ⟦…⟧, ⟦…⟧ (anchor ⟦…⟧) — use these for the next edit` (from `summary.handles`, plus `summary.wasHandle` when present); `delete` appends nothing (the form is gone — no stale handle) |
 | `clj_draft` | `{content}` | `cljform materialize --content-file …` — returns candidate + diff; never writes |
@@ -448,7 +485,12 @@ plain `edit`/`write`):** on `tool_result` for built-in `edit`/`write` whose
 target matches `\.(clj|cljs|cljc|cljx|edn)$` and the file exists:
 run `cljform check --json` (time-box 2 s; on timeout, skip with a note) and
 append to the tool result:
-- parse failure → prominent `BLOCKING:` line with line/col from the CLI;
+- parse failure → prominent `BLOCKING:` line with line/col from the CLI,
+  followed by one line per `error.diagnostics` entry (issue 31):
+  `conflict region lines 30–41 (head lines 28–32 · base lines 33–35 ·
+  incoming lines 36–41)` / `parse error lines 7–9: unclosed open-paren
+  (form reaches end of file)` — progressive multi-conflict feedback:
+  after each built-in edit the hook restates the remaining regions;
 - otherwise a one-line shape summary: `forms: 13→12, lost: deftest
   test-retry-then-success` or `shape ok (13 forms: 1 ns, 2 defn-, 10
   deftest)` + any detector warnings.
@@ -630,6 +672,55 @@ collection delimiter:
   first and the window then filters matches by span, both reported in the
   echo. With no window given the output is byte-identical to the unflagged
   views (no header, no `window` key).
+- **`--recover` — the broken-file recovery view (issue 31).** Opt-in. A
+  file is BROKEN iff it has parse errors or conflict markers (§6); plain
+  `tree` on a broken file keeps erroring with the gate's envelope.
+  `--recover` on a HEALTHY file renders the normal tree view (documented;
+  the output is byte-identical with or without the flag). On a broken
+  file it renders, deliberately, VERBATIM source + tables — not
+  in-source marker insertion: line-true tables are the payload, there is
+  no marker-glyph conflict, no annotate complexity, and the source block
+  is byte-verbatim (assertable against the on-disk bytes, BOM
+  re-prepended for windowed line 1):
+  - **Human:** header `file does not parse — N conflict region(s), M
+    parse error(s); handles appear when the file is repaired` → the
+    verbatim source (composable with `--start-line`/`--end-line` exactly
+    as the healthy window path; the effective span echoes as usual — the
+    slice IS the window, so requested == effective) → the diagnostics
+    table (one line per diagnostic: kind, true line span, message;
+    conflict regions show the per-side spans) → the intact-forms table:
+    `head/name (lines X–Y)` for every top-level form whose span does NOT
+    overlap any diagnostic span (side-region forms inside conflicts are
+    CANDIDATES, not agreed content — the region rows carry them
+    implicitly via line spans; they are never labeled intact).
+  - **JSON:** `result: {diagnostics: [...], forms: [labels],
+    window: {requested, effective}}` (the window key only when windowed);
+    diagnostics serialize with `kind`, the line spans, `message`, and the
+    per-side spans (`head`/`base`/`incoming`, `malformed` when the
+    region could not be paired or terminated).
+  - **NO handles anywhere (design note, owner-confirmed).** (1) The
+    broken region is the edit target and the write path is gated, so
+    handles would be inert decoration inviting a doomed edit call. (2)
+    Issue 13's "never show a coordinate the tool cannot accept" applies
+    literally in the broken state. (3) Content-addressing makes omission
+    free: the clean forms' post-repair handles are IDENTICAL to anything
+    this view could have shown (unique forms; the position-folded
+    duplicates that would move go stale — omission is actively safer).
+    The post-repair `tree` returns the same addresses for free.
+  - **Composition:** composes with `--start-line`/`--end-line` (the
+    source slice + the intact-form labels are windowed) and `--json`;
+    `--depth`/`--full` are accepted as a documented no-op (the intact
+    list is top-level only; the nested structure lives in the verbatim
+    source), but a bad `--depth` value is still a usage error. Does NOT
+    compose with `--name` on a broken file: `not-supported-broken`, exit
+    1 — the broken file's name table is unreliable (deliberately not a
+    usage error); on a healthy file `--name` + `--recover` is the normal
+    name view.
+  - **Accepted false positive:** a marker-exact line inside a multi-line
+    string is treated as a conflict marker — the standard editor
+    heuristic (line-anchored, git's exact 7-char convention, optional
+    ` <label>`; eight-or-more marker chars or a label without the space
+    are NOT markers).
 
 ### 10.3 Edit contract
 

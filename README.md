@@ -29,7 +29,7 @@ cljform [--json|--human] <op> …
 | Op | Purpose |
 |----|---------|
 | `forms <file>` | Top-level form table: addr, kind, name, lines, blake3, `contains` shape summary, D-warnings |
-| `tree <file> [--depth N\|all \| --full] [--json] [--name SYM]` | Annotated view: the source with `⟦handle⟧` after each marked collection's opening delimiter (default: top-level + multi-line forms). Handles are the only edit targets; every emitted handle resolves. `--json` emits the flat node table. Refuses sources that already contain the marker glyphs (`annotate-conflict`, exit 1). `--name SYM` selects only the forms that define `SYM` (exact def-like name, any nesting depth): a count header, then each matched source block at full depth with its handles inline, sorted by line; zero matches is an ok empty result |
+| `tree <file> [--depth N\|all \| --full] [--json] [--name SYM] [--start-line N \| --end-line N] [--recover]` | Annotated view: the source with `⟦handle⟧` after each marked collection's opening delimiter (default: top-level + multi-line forms). Handles are the only edit targets; every emitted handle resolves. `--json` emits the flat node table. Refuses sources that already contain the marker glyphs (`annotate-conflict`, exit 1). `--name SYM` selects only the forms that define `SYM` (exact def-like name, any nesting depth): a count header, then each matched source block at full depth with its handles inline, sorted by line; zero matches is an ok empty result. `--start-line/--end-line` page to a line window (complete forms only, real file line numbers, the effective span echoed). `--recover` renders the broken-file recovery view: verbatim source + per-side conflict spans + parse-error spans + the intact top-level forms, NO handles (SPEC §10.2) — on a healthy file it is the normal view |
 | `strip [file]` | Delete every `⟦…⟧` marker span → recovers the exact original bytes (BOM/CRLF preserved). Pure filter on stdout, no envelope; file or stdin |
 | `get <file> [--name sym\|--handle H]` | One form's exact bytes + metadata, including its `⟦handle⟧` (pass it to `edit`). `--name` is a top-level read lookup — names are extracted for var-defining `def…` heads (`defn`, `defapifn`, …; not `defmethod`, which extends an existing multimethod); `--handle` reads any collection node |
 | `check [file]` | Parse + table + nesting warnings (file or stdin) |
@@ -39,9 +39,12 @@ cljform [--json|--human] <op> …
 | `format [file]` | Reformat indentation the way parinfer paren mode does — the only op that imposes a style on a whole file (the edit path reindents its submitted content with the same pass, by default, then base-shifts it). Candidate-first: candidate + unified diff vs the input + note, never writes. The candidate must re-parse clean and keep the input's token stream (only whitespace and closing-delimiter position may move); otherwise `format-error`, exit 1, nothing emitted |
 
 Exit codes: `0` ok · `1` parse/structure failure or `annotate-conflict`
-(nothing written), or `internal-error` (a residual panic caught at the
-dispatch boundary — a tool bug; nothing was written) · `2` usage ·
-`3` targeting failure or refused content /
+(nothing written) — including `conflict-markers` (git conflict markers in
+the file: the gate that refuses every op on a conflicted file, whose
+markers otherwise parse as legal symbols) and `not-supported-broken`
+(`tree --name` on a broken file) — or `internal-error` (a residual panic
+caught at the dispatch boundary — a tool bug; nothing was written) ·
+`2` usage · `3` targeting failure or refused content /
 repair (`form-not-found` / `ambiguous` / `stale-handle` / `ambiguous-handle`
 / `unbalanced-content` / `repair-refused`) · `4` I/O.
 
@@ -103,8 +106,11 @@ Lives in this repo at `extension/clojure-forms.ts` (with the
 - **Guard hook** — after *any* built-in `edit`/`write` touching
   `*.clj|cljs|cljc|cljx|edn`, appends a shape report to the tool result:
   form-count delta, lost/gained named forms, D-warnings, or a `BLOCKING:`
-  line when the file no longer parses. This is what catches F1 even when the
-  agent skips the clj tools.
+  line when the file no longer parses — plus, on a broken file, one line
+  per diagnostic (conflict regions with per-side line spans, parse-error
+  spans), so each edit restates what is still broken. This is what catches
+  F1 even when the agent skips the clj tools, and a conflicted file even
+  though its markers parse as legal symbols (`conflict-markers`).
 - **System-prompt note** — injected only when the project contains
   Clojure-ish files.
 
