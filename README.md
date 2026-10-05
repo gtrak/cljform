@@ -26,8 +26,20 @@ $ cljform tree todos.clj
   (swap! todos (fn [t] (map #(assoc % :done true) t))))
 ```
 
-Every form has a `⟦handle⟧` — a short content hash, and the **only** edit
-target. Edit by handle:
+Notice which forms got handles: every top-level form, plus nested forms
+**large enough to span multiple lines** (here, none). That is the default
+view's readability heuristic — a Clojure file is dense with small
+collections (`(assoc …)`, `[x y]`, `{:k v}`), and marking each one would
+bury the source in `⟦handle⟧` glyphs. The line the heuristic draws is also
+the workflow line: a **multi-line nested form** is worth editing as a
+whole unit, so it gets a handle; a **single-line inner expression** is a
+patch target instead — you change it through its *parent's* handle, which
+needs no deep handle at all. When you do want depth: `--full` marks every
+collection, `--name SYM` renders a matched form's entire subtree, and
+`--json` always lists a handle for every node at every depth.
+
+Every handle is a short content hash, and the **only** edit target. Edit
+by handle:
 
 ```console
 $ cljform edit todos.clj --handle a2fbf8 --mode patch \
