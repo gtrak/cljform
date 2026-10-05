@@ -230,6 +230,12 @@ pub struct Output {
     pub file_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub forms: Option<Vec<Form>>,
+    /// `get` envelope only (issue 32): the top-level form count in place of
+    /// the whole-file `forms` array — the payload (result.form) is what the
+    /// caller asked for. The EDIT envelope keeps its `forms` array (the
+    /// summary-vs-table cross-check; SPEC §4.2).
+    #[serde(skip_serializing_if = "Option::is_none", rename = "formsCount")]
+    pub forms_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -238,6 +244,12 @@ pub struct Output {
     pub notes: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ErrorBody>,
+    /// Human-only edit-result block (issue 32): the affected form's row(s)
+    /// with handle + the counts line. Never serialized — the JSON contract
+    /// stays byte-identical (Form already uses this skip-field pattern for
+    /// its byte offsets).
+    #[serde(skip)]
+    pub human_rows: Option<String>,
 }
 
 impl Output {
@@ -250,10 +262,12 @@ impl Output {
             file: None,
             file_hash: None,
             forms: None,
+            forms_count: None,
             result: None,
             warnings: None,
             notes: None,
             error: None,
+            human_rows: None,
         }
     }
 
@@ -280,6 +294,16 @@ impl Output {
 
     pub fn forms(mut self, forms: Vec<Form>) -> Self {
         self.forms = Some(forms);
+        self
+    }
+
+    pub fn forms_count(mut self, forms_count: usize) -> Self {
+        self.forms_count = Some(forms_count);
+        self
+    }
+
+    pub fn human_rows(mut self, human_rows: String) -> Self {
+        self.human_rows = Some(human_rows);
         self
     }
 

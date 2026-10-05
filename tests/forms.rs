@@ -94,6 +94,27 @@ fn get_by_handle_prints_bytes_and_metadata() {
 }
 
 #[test]
+fn get_json_carries_forms_count_not_forms() {
+    // Issue 32 (B): the GET envelope replaces the whole-file `forms` array
+    // with a `formsCount` integer (both lookup paths); the payload
+    // (result.form) is unchanged.
+    let f = fresh("i32-get-count.clj");
+    let h = handle_of(&f, "helper");
+    for (code, d, err) in [
+        run_json(&["get", &f, "--name", "helper", "--json"], None),
+        run_json(&["get", &f, "--handle", &h, "--json"], None),
+    ] {
+        assert_eq!(code, 0, "{d} {err}");
+        assert_eq!(d["formsCount"], 5, "formsCount on a 5-form file: {d}");
+        assert!(d.get("forms").is_none(), "no whole-file forms array: {d}");
+        assert!(d["result"]["form"]
+            .as_str()
+            .unwrap()
+            .contains("(* x 2)"));
+    }
+}
+
+#[test]
 fn name_lookup_not_found_gives_suggestions_ambiguous_gives_candidates() {
     let f = fresh("names.clj");
     let (code, d, _) = run_json(&["get", &f, "--name", "hlp", "--json"], None);

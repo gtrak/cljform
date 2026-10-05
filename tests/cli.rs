@@ -76,6 +76,40 @@ fn human_get_shows_form_bytes() {
 }
 
 #[test]
+fn human_get_is_payload_first() {
+    // Issue 32 (B): the form's exact bytes LEAD the human output, then one
+    // compact metadata line (handle, kind, name, lines) — no header first,
+    // no forms-table dump.
+    let f = fresh("human-get-first.clj");
+    let out = Command::new(env!("CARGO_BIN_EXE_cljform"))
+        .args(["get", &f, "--name", "helper", "--human"])
+        .output()
+        .unwrap();
+    let s = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = s.lines().collect();
+    assert_eq!(
+        lines.first(),
+        Some(&"(defn helper [x]"),
+        "form bytes lead the output: {s}"
+    );
+    assert_eq!(
+        lines.get(1),
+        Some(&"  (* x 2))"),
+        "payload completes before the metadata line: {s}"
+    );
+    let meta = lines.get(2).map_or("", |v| *v);
+    assert!(meta.starts_with('\u{27E6}'), "handle leads the metadata line: {s}");
+    assert!(meta.contains("defn helper"), "kind + name: {s}");
+    assert!(meta.contains("lines 5–6"), "line range: {s}");
+    assert!(meta.contains("blake3:"), "hash: {s}");
+    assert_eq!(
+        lines.len(),
+        3,
+        "payload + one metadata line, nothing else: {s}"
+    );
+}
+
+#[test]
 fn human_mode_goes_to_stdout_stderr_without_json() {
     let f = fresh("human.clj");
     let out = Command::new(env!("CARGO_BIN_EXE_cljform"))

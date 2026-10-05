@@ -303,7 +303,11 @@ pub fn run_get(file: &Path, name: &Option<String>, handle: &Option<String>) -> R
             Output::ok("get")
                 .file(Some(file.display().to_string()))
                 .file_hash(hashutil::tagged(&hashutil::file_hash(&bytes)))
-                .forms(parsed.forms)
+                // Issue 32 (B): payload-first — the whole-file `forms`
+                // array is replaced by a `formsCount` integer (breaking:
+                // consumers audit in the issue; the EDIT envelope keeps
+                // its array — SPEC §4.2).
+                .forms_count(parsed.forms.len())
                 .result(serde_json::json!({
                     "kind": node.kind,
                     "head": node.head,
@@ -336,7 +340,7 @@ pub fn run_get(file: &Path, name: &Option<String>, handle: &Option<String>) -> R
         Output::ok("get")
             .file(Some(file.display().to_string()))
             .file_hash(hashutil::tagged(&hashutil::file_hash(&bytes)))
-            .forms(parsed.forms)
+            .forms_count(parsed.forms.len())
             .result(serde_json::json!({
                 "addr": f.addr,
                 "kind": f.kind,

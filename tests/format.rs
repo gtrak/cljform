@@ -12,7 +12,7 @@
 
 mod common;
 
-use common::{fixture, run_json, FRESH_FIXTURE, GOLDEN_FIXTURE};
+use common::{fixture, run_bytes, run_json, FRESH_FIXTURE, GOLDEN_FIXTURE};
 use std::io::Write;
 use std::process::{Command, Stdio};
 
@@ -415,4 +415,33 @@ fn format_token_stream_unchanged() {
         let (code, d, err) = run_json(&["check"], Some(candidate.as_bytes()));
         assert_eq!(code, 0, "{name}: candidate does not parse: {d} {err}");
     }
+}
+
+// ─── issue 32 (C): the unchanged case is one line ───────────────────────
+
+#[test]
+fn format_human_unchanged_is_one_line() {
+    // Already-canonical input: one line, no candidate dump, no diff
+    // headers (the T9 misread — an empty-diff candidate dump looked like
+    // "changed everything").
+    let (code, out, err) = run_bytes(
+        &["format", "--human"],
+        Some(b"(defn f [x]\n  (inc x))\n"),
+    );
+    assert_eq!(code, 0, "{err}");
+    let s = String::from_utf8(out).unwrap();
+    assert_eq!(s, "already canonical (no changes)\n", "{s:?}");
+}
+
+#[test]
+fn format_human_changed_stays_candidate_first() {
+    // The changed case keeps today's shape: candidate, then the diff.
+    let (code, out, err) = run_bytes(&["format", "--human"], Some(b"(defn f [x]\n(inc x))\n"));
+    assert_eq!(code, 0, "{err}");
+    let s = String::from_utf8(out).unwrap();
+    assert!(
+        s.starts_with("(defn f [x]\n (inc x))\n"),
+        "candidate leads: {s:?}"
+    );
+    assert!(s.contains("--- input"), "diff follows the candidate: {s}");
 }

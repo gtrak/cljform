@@ -9,7 +9,7 @@
 
 mod common;
 
-use common::{edit_content, edit_content_extra, fixture, handle_at, handle_of, run_json};
+use common::{edit_content, edit_content_extra, fixture, handle_at, handle_of, run_bytes, run_json};
 use std::process::Command;
 
 const FIXTURE: &str = "(ns r)\n\n(defn target [x]\n  (inc x))\n";
@@ -601,4 +601,16 @@ fn human_materialize_shows_candidate() {
         "diff marker present: {s}"
     );
     assert!(!s.starts_with('{'), "must not be json");
+}
+
+// ─── issue 32 (D): materialize's unchanged case gets the C rule ─────────
+
+#[test]
+fn materialize_human_unchanged_is_one_line() {
+    // A well-formed draft: nothing to infer — the candidate IS the draft,
+    // so dumping it is redundant; one line instead.
+    let (code, out, err) = run_bytes(&["materialize", "--human"], Some(b"(def a 1)\n"));
+    assert_eq!(code, 0, "{err}");
+    let s = String::from_utf8(out).unwrap();
+    assert_eq!(s, "already canonical (no changes)\n", "{s:?}");
 }

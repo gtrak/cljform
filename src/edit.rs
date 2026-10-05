@@ -794,13 +794,35 @@ pub fn run_edit(
         }
     }
 
-    // Summary of what sits at the target after the op.
+    // The POST-edit changed window (issue 27 F12 seam + issue 32 A
+    // affected rows): the diff seam and the human block both range over it.
+    let (lo, hi) = bound;
+    let content_len = new_bytes.len() - lo - (bytes.len() - hi);
+    let post_window = (lo, lo + content_len);
+
+    // Summary of what sits at the target after the op. The post-edit node
+    // table is collected ONCE here and shared with the summary builder and
+    // the human affected-rows block (issue 32 A) — one extra O(n) walk,
+    // never a second.
+    let new_nodes = handle::collect(&new_bytes);
     let (summary_val, summary_notes) = if let Some(node) = handle_node.as_ref() {
-        summary::build_handle_summary(mode, node, &bytes, &new_bytes, &payload, bound)
+        summary::build_handle_summary(mode, node, &bytes, &new_bytes, &new_nodes, &payload, bound)
     } else {
         (summary::append_prepend_summary(&after_parsed, &allowed), Vec::new())
     };
     notes.extend(summary_notes);
+    // Issue 32 (A): the human affected-rows block (computed before the
+    // Output takes ownership of after_parsed.forms).
+    let human_rows = summary::human_affected_block(
+        file,
+        &after_parsed.forms,
+        &before_forms,
+        &new_nodes,
+        &summary_val,
+        &shape,
+        post_window,
+        handle_node.as_ref(),
+    );
 
     // Issue 27 (F12): every mutating op carries a unified diff of its
     // changed region in the result — patch already scopes its diff to
@@ -813,8 +835,6 @@ pub fn run_edit(
         Some(content::Payload::Patch { diff, .. }) => diff.clone(),
         _ if new_bytes == bytes => String::new(),
         _ => {
-            let (lo, hi) = bound;
-            let content_len = new_bytes.len() - lo - (bytes.len() - hi);
             let old = String::from_utf8_lossy(&bytes[lo..hi]).to_string();
             let new = String::from_utf8_lossy(&new_bytes[lo..lo + content_len]).to_string();
             materialize::unified_diff(&old, &new, "before", "after")
@@ -871,7 +891,8 @@ pub fn run_edit(
             .forms(after_parsed.forms)
             .result(result)
             .warnings(warnings)
-            .notes(notes),
+            .notes(notes)
+            .human_rows(human_rows),
     )
 }
 

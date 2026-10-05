@@ -38,6 +38,24 @@ use errors::{ErrorBody, Fail, Output};
 #[cfg(test)]
 static PANIC_HOOK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Serialization for the two hook tests (issue 32 D audit): the flag is
+/// process-global, so the injection window (flag set → dispatch → flag
+/// reset) must not overlap the normal-path test's dispatch, or that
+/// dispatch observes the flag and flakes. Each test holds the guard across
+/// its dispatch call; the flag check in `dispatch` stays lock-free (the
+/// injecting thread must not re-take the guard inside the same call).
+#[cfg(test)]
+static HOOK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+fn hook_guard() -> std::sync::MutexGuard<'static, ()> {
+    // Poison-tolerant: a poisoned guard means an earlier test panicked
+    // while holding it (its own failure); recover rather than cascade.
+    HOOK_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Resets the injection flag on drop (also when a test assert panics mid-
+/// window, so the flag can never leak into a later test).
 #[cfg(test)]
 struct PanicHookReset;
 #[cfg(test)]
@@ -111,7 +129,10 @@ fn internal_error_body(payload: String) -> ErrorBody {
 
 fn dispatch(cli: &Cli) -> Result<Output, Fail> {
     // L3 test hook (issue 30): fires inside the catch_unwind region so the
-    // conversion test exercises the real boundary.
+    // conversion test exercises the real boundary. Deliberately lock-free:
+    // the injection window is serialized by the tests' HOOK_LOCK guards,
+    // not by this check (the injecting thread holds the guard across its
+    // dispatch call).
     #[cfg(test)]
     if PANIC_HOOK.load(std::sync::atomic::Ordering::Relaxed) {
         test_panic_hook()
@@ -195,7 +216,10 @@ mod tests {
     /// L3 (issue 30): a residual panic at the dispatch boundary becomes the
     /// `internal-error` envelope — ok:false, exit 1 — and the file is NOT
     /// written (the hook panics before the op runs; the write step is the
-    /// last thing `run_edit` does, after all fallible computation).
+    /// last thing `run_edit` does, after all fallible computation). The
+    /// HOOK_LOCK guard serializes the injection window against the
+    /// normal-path test's dispatch (issue 32 D: the shared flag used to
+    /// race across test threads).
     #[test]
     fn injected_panic_becomes_internal_error_and_writes_nothing() {
         let dir = tempfile::tempdir().unwrap();
@@ -204,6 +228,7 @@ mod tests {
         std::fs::write(&file, before).unwrap();
         let cli = edit_append_cli(&file);
 
+        let _guard = hook_guard();
         PANIC_HOOK.store(true, std::sync::atomic::Ordering::Relaxed);
         let _reset = PanicHookReset;
         match run_dispatch(&cli) {
@@ -226,9 +251,12 @@ mod tests {
     }
 
     /// The hook must not disturb the normal path: with it unset the same
-    /// dispatch runs the op to completion and writes the file.
+    /// dispatch runs the op to completion and writes the file. Holds the
+    /// same HOOK_LOCK guard the injection test uses, so the two dispatch
+    /// windows cannot overlap (issue 32 D).
     #[test]
     fn dispatch_without_hook_runs_normally() {
+        let _guard = hook_guard();
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("f.clj");
         std::fs::write(&file, "(def x 1)\n").unwrap();

@@ -9,8 +9,8 @@
 mod common;
 
 use common::{
-    assert_untouched, check_ok, edit_args, fixture, fresh, forms, handle_at_full, handle_of,
-    run_bytes, run_json, FRESH_FIXTURE, HEDIT_FIXTURE,
+    assert_untouched, check_ok, edit_args, edit_content, fixture, fresh, forms, handle_at_full,
+    handle_of, run_bytes, run_json, FRESH_FIXTURE, HEDIT_FIXTURE,
 };
 
 #[test]
@@ -555,8 +555,9 @@ fn whole_form_no_ops_keep_empty_diff() {
 
 #[test]
 fn whole_form_ops_show_diff_in_human_output() {
-    // Human output matches patch parity (issue 27 F12): the summary line
-    // and forms table stay as-is; the diff block rides underneath.
+    // Result-first (issue 32 A): the diff rides at the top of the human
+    // output, above the summary line; the whole-file forms table is gone
+    // (affected row + counts line instead).
     let f = fixture("diff-human.clj", b"(ns d)\n\n(def a 1)\n\n(def b 2)\n");
     let h = handle_of(&f, "a");
     let (code, out, err) = run_bytes(
@@ -576,6 +577,11 @@ fn whole_form_ops_show_diff_in_human_output() {
     assert!(out.contains("--- before"), "diff shown like patch: {out}");
     assert!(out.contains("-(def a 1)"), "old form in the diff: {out}");
     assert!(out.contains("+(def a 7)"), "new form in the diff: {out}");
+    // The diff comes BEFORE the summary line (result-first, issue 32 A).
+    assert!(
+        out.find("--- before").unwrap() < out.find("replaced form").unwrap(),
+        "diff leads the human output: {out}"
+    );
 }
 
 // ─── EOF delete seam (issue 27 F13) ──────────────────────────────────────
@@ -996,4 +1002,223 @@ fn mutations_leave_untouched_forms_identical() {
             }
         }
     }
+}
+
+// ─── issue 32 (A): result-first human edit, no whole-file table ───────────
+
+/// The affected-row line of the human edit output: the forms-table row
+/// format (two leading spaces) carrying the handle — the summary line
+/// never starts with a space, and no diff line carries `lines N–M ⟦`.
+fn affected_row(s: &str) -> &str {
+    s.lines()
+        .find(|l| l.starts_with("  ") && l.contains("lines ") && l.contains('\u{27E6}'))
+        .unwrap()
+}
+
+#[test]
+fn edit_human_is_result_first() {
+    // 5-form fixture (the acceptance's 5+): replace form 3, assert the new
+    // order — diff, summary line, affected row, counts line — and that the
+    // summary line text is unchanged (issue 27 shape).
+    let f = fresh("i32-result-first.clj");
+    let h = handle_of(&f, "helper");
+    let (code, out, _err) = run_bytes(
+        &[
+            "edit",
+            &f,
+            "--handle",
+            &h,
+            "--content",
+            "(defn helper [x]\n  (* x 4))",
+            "--human",
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "{:?}", String::from_utf8_lossy(&out));
+    let s = String::from_utf8(out).unwrap();
+    let diff_i = s.find("--- before").unwrap();
+    let summary_i = s.find("replaced form").unwrap();
+    let row_i = s.find(affected_row(&s)).unwrap();
+    let counts_i = s
+        .find("5 forms; 1 changed, 4 untouched — tree")
+        .unwrap();
+    let file_tail_i = s.find("for the full table").unwrap();
+    assert!(diff_i < summary_i, "diff before summary: {s}");
+    assert!(summary_i < row_i, "summary before affected row: {s}");
+    assert!(row_i < counts_i, "affected row before counts line: {s}");
+    assert!(counts_i < file_tail_i, "counts line points at tree: {s}");
+    assert!(
+        s.lines().any(|l| l.starts_with("replaced form \u{27E6}") && l.contains("helper")),
+        "summary line: {s}"
+    );
+}
+
+#[test]
+fn edit_human_affected_rows_no_full_table() {
+    // Replace: the NEW form's row only (label + line span + handle); no
+    // other top-level form's row leaks into the human output.
+    let f = fresh("i32-row-replace.clj");
+    let h = handle_of(&f, "helper");
+    let (code, out, err) = run_bytes(
+        &[
+            "edit",
+            &f,
+            "--handle",
+            &h,
+            "--content",
+            "(defn helper [x]\n  (* x 8))",
+            "--human",
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "{err}");
+    let s = String::from_utf8(out).unwrap();
+    let row = affected_row(&s);
+    assert!(row.contains("helper"), "new form's label: {row}");
+    assert!(row.contains("lines 5–6"), "new form's line span: {row}");
+    assert!(!s.contains("last-one"), "no full table: {s}");
+    assert!(!s.contains("helper-test"), "no full table: {s}");
+
+    // Patch: the enclosing top-level form's row.
+    let f = fresh("i32-row-patch.clj");
+    let h = handle_of(&f, "helper");
+    let (code, out, err) = run_bytes(
+        &[
+            "edit",
+            &f,
+            "--handle",
+            &h,
+            "--mode",
+            "patch",
+            "--old-text",
+            "(* x 2)",
+            "--new-text",
+            "(* x 5)",
+            "--human",
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "{err}");
+    let s = String::from_utf8(out).unwrap();
+    assert!(s.contains("patched form \u{27E6}"), "patch summary line: {s}");
+    let row = affected_row(&s);
+    assert!(row.contains("helper"), "enclosing form's row: {s}");
+    assert!(!s.contains("last-one"), "no full table: {s}");
+
+    // Insert-after: the inserted form's row AND the anchor's row.
+    let f = fresh("i32-row-insert.clj");
+    let h = handle_of(&f, "config");
+    let (code, out, err) = run_bytes(
+        &[
+            "edit",
+            &f,
+            "--handle",
+            &h,
+            "--mode",
+            "insert-after",
+            "--content",
+            "(def new-thing 1)",
+            "--dry-run",
+            "--human",
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "{err}");
+    let s = String::from_utf8(out).unwrap();
+    let rows: Vec<&str> = s
+        .lines()
+        .filter(|l| l.starts_with("  ") && l.contains("lines ") && l.contains('\u{27E6}'))
+        .collect();
+    assert!(
+        rows.iter().any(|l| l.contains("new-thing")),
+        "inserted row: {s}"
+    );
+    assert!(rows.iter().any(|l| l.contains("config")), "anchor row: {s}");
+    assert!(s.contains("inserted form(s) after"), "insert summary: {s}");
+    assert!(
+        s.contains("6 forms; 1 changed, 5 untouched"),
+        "counts line: {s}"
+    );
+    assert!(!s.contains("last-one"), "no full table: {s}");
+
+    // Delete: the deleted form's label + `was lines` row (no post-edit
+    // table row — the form is gone).
+    let f = fresh("i32-row-delete.clj");
+    let h = handle_of(&f, "helper");
+    let (code, out, err) = run_bytes(
+        &[
+            "edit",
+            &f,
+            "--handle",
+            &h,
+            "--mode",
+            "delete",
+            "--dry-run",
+            "--human",
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "{err}");
+    let s = String::from_utf8(out).unwrap();
+    let was_row = s
+        .lines()
+        .find(|l| l.starts_with("  ") && l.contains("was lines ") && l.contains('\u{27E6}'))
+        .unwrap();
+    assert!(was_row.contains("helper"), "deleted form's label: {s}");
+    assert!(was_row.contains("was lines 5–6"), "was-lines span: {s}");
+    assert!(s.contains("deleted form \u{27E6}"), "delete summary: {s}");
+    // The counts line reports the POST-edit file (4 forms now).
+    assert!(
+        s.contains("4 forms; 0 changed, 4 untouched"),
+        "counts line: {s}"
+    );
+    assert!(!s.contains("last-one"), "no full table: {s}");
+}
+
+#[test]
+fn edit_human_notes_before_warnings() {
+    // D audit (issue 32): result, then notes, then warnings — a dry-run
+    // (note) on a D1 file (warning) pins the order.
+    let f = fixture(
+        "i32-note-warn.clj",
+        b"(defn host [x]\n  (deftest inner (is true)))\n\n(def other 1)\n",
+    );
+    let h = handle_of(&f, "host");
+    let (code, out, err) = run_bytes(
+        &[
+            "edit",
+            &f,
+            "--handle",
+            &h,
+            "--mode",
+            "patch",
+            "--old-text",
+            "(is true)",
+            "--new-text",
+            "(is false)",
+            "--dry-run",
+            "--human",
+        ],
+        None,
+    );
+    assert_eq!(code, 0, "{err}");
+    let s = String::from_utf8(out).unwrap();
+    let note_i = s.find("note: dry run").unwrap();
+    let warn_i = s.find("warning D1").unwrap();
+    let summary_i = s.find("patched form").unwrap();
+    assert!(summary_i < note_i, "result before notes: {s}");
+    assert!(note_i < warn_i, "notes before warnings: {s}");
+}
+
+#[test]
+fn edit_json_still_carries_full_forms_array() {
+    // Issue 32: the EDIT envelope keeps the whole-file `forms` array (the
+    // summary-vs-table cross-check, SPEC §4.2) — only the GET envelope
+    // moved to formsCount.
+    let f = fresh("i32-edit-forms.clj");
+    let h = handle_of(&f, "helper");
+    let (code, d, err) = edit_content(&f, &h, "(defn helper [x]\n  (* x 9))");
+    assert_eq!(code, 0, "{d} {err}");
+    assert_eq!(d["forms"].as_array().unwrap().len(), 5, "edit keeps forms: {d}");
+    assert!(d.get("formsCount").is_none(), "no formsCount on edit: {d}");
 }

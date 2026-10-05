@@ -49,17 +49,17 @@ pub(crate) fn build_handle_summary(
     node: &handle::Node,
     bytes: &[u8],
     new_bytes: &[u8],
+    new_nodes: &[handle::Node],
     payload: &Option<Payload>,
     bound: (usize, usize),
 ) -> (serde_json::Value, Vec<String>) {
     let mut notes: Vec<String> = Vec::new();
-    let new_nodes = handle::collect(new_bytes);
     // Same-position lookup by parent chain (issue 22): the pre-edit
     // target's chain was filled at resolution (resolve_at).
     let at_path = new_nodes
         .iter()
         .enumerate()
-        .find(|(i, _)| handle::at_chain(&new_nodes, *i, &node.path_chain))
+        .find(|(i, _)| handle::at_chain(new_nodes, *i, &node.path_chain))
         .map(|(_, n)| n);
     match mode {
         Mode::Replace | Mode::Patch => {
@@ -260,6 +260,165 @@ pub(crate) fn human_summary(summary: &serde_json::Value, shape: &invariants::Sha
         ),
         _ => String::new(),
     }
+}
+/// Issue 32 (A): the human-only edit-result block — the AFFECTED form's
+/// row(s) in the forms-table row format, with the handle, plus the counts
+/// line. No whole-file table at any size:
+/// - replaced/patched: the post-edit top-level form(s) intersecting the
+///   changed window (the new form at top level; the enclosing form for a
+///   nested edit);
+/// - inserted: the inserted form(s) in the changed window, then the
+///   anchor's row (deduplicated — a nested insert shares the enclosing
+///   form with its anchor);
+/// - deleted: the deleted form's label + `was lines a–b` (top level — the
+///   form is gone from the post-edit table), or the enclosing changed form
+///   (nested);
+/// - appended/prepended: the inserted form(s) at the file edge (same
+///   window rule as inserts).
+///
+/// `window` is the POST-edit changed region [lo, hi); `pre_node` is the
+/// pre-edit target (None for append/prepend).
+// Eight parameters (mode-adjacent view data + post/pre form tables + the
+// post-edit node table): a parameter struct is clearer than dropping any
+// of them — one documented allow, same convention as `run_edit`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn human_affected_block(
+    file: &Path,
+    forms: &[Form],
+    pre_forms: &[Form],
+    new_nodes: &[handle::Node],
+    summary: &serde_json::Value,
+    shape: &invariants::ShapeCheck,
+    window: (usize, usize),
+    pre_node: Option<&handle::Node>,
+) -> String {
+    let (lo, hi) = window;
+    let intersects = |f: &Form| f.start_byte < hi && f.end_byte > lo;
+    // Zero-length window (a patch whose --new-text is empty): contain the
+    // position instead — the enclosing form's span covers it.
+    let contains = |f: &Form| f.start_byte <= lo && lo < f.end_byte;
+    let rows: Vec<String> = match summary["action"].as_str().unwrap_or("") {
+        "replaced" | "patched" => forms
+            .iter()
+            .filter(|f| intersects(f) || (lo == hi && contains(f)))
+            .map(|f| form_row(f, top_level_handle(new_nodes, f.addr).as_deref()))
+            .collect(),
+        "inserted" => {
+            let matched: Vec<&Form> = forms
+                .iter()
+                .filter(|f| intersects(f) || (lo == hi && contains(f)))
+                .collect();
+            let mut rows: Vec<String> = matched
+                .iter()
+                .map(|f| form_row(f, top_level_handle(new_nodes, f.addr).as_deref()))
+                .collect();
+            // The anchor's row (issue 32 A: inserted form(s) + anchor). The
+            // anchor is unchanged, so its handle still resolves post-edit;
+            // walk to its top-level form and add the row if the window did
+            // not already cover it (top-level insert: the anchor is the
+            // neighbor; nested insert: same enclosing form).
+            if let Some(was) = summary.get("wasHandle").and_then(|v| v.as_str()) {
+                if let Some(ai) = new_nodes.iter().position(|n| n.handle == was) {
+                    let mut idx = ai;
+                    while let Some(p) = new_nodes[idx].parent {
+                        idx = p;
+                    }
+                    let addr = new_nodes[idx].top_level;
+                    if !matched.iter().any(|f| f.addr == addr) {
+                        if let Some(f) = forms.iter().find(|f| f.addr == addr) {
+                            rows.push(form_row(f, top_level_handle(new_nodes, addr).as_deref()));
+                        }
+                    }
+                }
+            }
+            rows
+        }
+        "deleted" => match pre_node {
+            Some(n) if n.depth > 1 => {
+                // Nested delete: the deleted node is gone, but its enclosing
+                // top-level form changed — show that form's current row.
+                forms
+                    .iter()
+                    .filter(|f| contains(f))
+                    .map(|f| form_row(f, top_level_handle(new_nodes, f.addr).as_deref()))
+                    .collect()
+            }
+            Some(n) => vec![deleted_row(
+                n.top_level,
+                // The table kind (defn/def/…) for the kind column — the
+                // summary's wasKind is the tree-sitter kind (list_lit).
+                pre_forms
+                    .iter()
+                    .find(|f| f.addr == n.top_level)
+                    .map(|f| f.kind.as_str())
+                    .unwrap_or(&n.kind),
+                summary.get("name").and_then(|v| v.as_str()),
+                summary.get("head").and_then(|v| v.as_str()),
+                &n.line,
+                &n.handle,
+            )],
+            None => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
+    let counts = format!(
+        "{} forms; {} changed, {} untouched — tree {} for the full table",
+        forms.len(),
+        shape.changed,
+        shape.untouched,
+        file.display()
+    );
+    if rows.is_empty() {
+        counts
+    } else {
+        format!("{}\n{}", rows.join("\n"), counts)
+    }
+}
+
+/// One post-edit top-level form as a table row (the forms-table format)
+/// plus its handle.
+fn form_row(f: &Form, handle: Option<&str>) -> String {
+    let name = f.name.clone().unwrap_or_default();
+    match handle {
+        Some(h) => format!(
+            "  {:>3}  {:<12} {:<24} lines {}–{}  \u{27E6}{h}\u{27E7}",
+            f.addr, f.kind, name, f.line[0], f.line[1]
+        ),
+        None => format!(
+            "  {:>3}  {:<12} {:<24} lines {}–{}",
+            f.addr, f.kind, name, f.line[0], f.line[1]
+        ),
+    }
+}
+
+/// The top-level form's handle (a depth-1 node's child_idx is its form
+/// addr — the same lookup the `get --name` path uses).
+fn top_level_handle(nodes: &[handle::Node], addr: u32) -> Option<String> {
+    nodes
+        .iter()
+        .find(|n| n.depth == 1 && n.child_idx == addr)
+        .map(|n| n.handle.clone())
+}
+
+/// The deleted top-level form's row: its label (name, else head) +
+/// `was lines a–b` + the handle it had (the form is gone from the
+/// post-edit table, so the row is synthesized from the pre-edit node).
+fn deleted_row(
+    addr: u32,
+    kind: &str,
+    name: Option<&str>,
+    head: Option<&str>,
+    line: &[usize; 2],
+    handle: &str,
+) -> String {
+    let label = name
+        .or(head)
+        .unwrap_or(kind)
+        .to_string();
+    format!(
+        "  {:>3}  {:<12} {:<24} was lines {}–{}  \u{27E6}{handle}\u{27E7}",
+        addr, kind, label, line[0], line[1]
+    )
 }
 fn label(summary: &serde_json::Value) -> String {
     let kind = summary["kind"].as_str().unwrap_or("form");

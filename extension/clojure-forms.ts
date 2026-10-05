@@ -64,6 +64,12 @@ interface CljformOutput {
 	file?: string;
 	file_hash?: string;
 	forms?: FormRow[];
+	/**
+	 * `get` envelope only (issue 32): the top-level form count, in place of
+	 * the whole-file `forms` array (the payload is result.form). The edit
+	 * envelope keeps `forms` (summary-vs-table cross-check, SPEC §4.2).
+	 */
+	formsCount?: number;
 	warnings?: DetectorWarning[];
 	notes?: string[];
 	result?: {
@@ -203,8 +209,14 @@ function errorText(out: CljformOutput): string {
 		}
 	}
 	if (e.hint) lines.push(`hint: ${e.hint}`);
-	lines.push("current form table (re-aim without another round-trip):");
-	if (out.forms) lines.push(formTableText(out.forms));
+	// Error envelopes carry no form table (the `forms` key exists only on
+	// success envelopes — including `get`'s, which now carries formsCount);
+	// render the header only when a table is actually present (issue 32 D:
+	// the header used to print above an empty table).
+	if (out.forms) {
+		lines.push("current form table (re-aim without another round-trip):");
+		lines.push(formTableText(out.forms));
+	}
 	return lines.join("\n");
 }
 
@@ -508,7 +520,10 @@ export default function ClojureForms(pi: ExtensionAPI) {
 			const run = await runClj(args, 15_000);
 			if (!run.ok) return run.result;
 			const out = run.out;
-			remember(params.path, out.forms);
+			// Issue 32 (B): `get` no longer ships the whole-file table
+			// (formsCount instead), so the fingerprint cache is NOT
+			// refreshed here — only clj_forms / the edit result / the guard
+			// hook's check do. Correctness never depends on the cache.
 			const r = out.result ?? {};
 			const handleLine = r.handle
 				? ` · handle ⟦${r.handle}⟧ — pass it to clj_edit as handle`
@@ -520,7 +535,7 @@ export default function ClojureForms(pi: ExtensionAPI) {
 			];
 			return {
 				content: [{ type: "text", text: lines.join("\n") }],
-				details: { forms: out.forms, form: r },
+				details: { formsCount: out.formsCount, form: r },
 			};
 		},
 	});
@@ -725,6 +740,12 @@ export default function ClojureForms(pi: ExtensionAPI) {
 		if (!params.dryRun) remember(params.path, out.forms);
 
 		const r = out.result ?? {};
+		// Issue 32 (A/D): result.text keeps the CLI's issue-27 composition
+		// (summary line + repair diff + changed-region diff); the wrapper
+		// renders it as-is. KNOWN defect (owner-reported, queued as issue
+		// 34 — this audit hit it too): the changed-region diff then rides in
+		// BOTH r.text and r.diff, so the wrapper prints it twice. Fix belongs
+		// to issue 34 (both issues touch the wrapper — one writer).
 		const lines: string[] = [r.text ?? "done"];
 		if (r.repaired) {
 			lines.push("");
@@ -739,8 +760,10 @@ export default function ClojureForms(pi: ExtensionAPI) {
 		if (out.forms) {
 			lines.push(`file now: ${out.forms.length} forms · ${shapeSummary(out.forms)}`);
 		}
-		lines.push(...warningsText(out.warnings ?? []));
+		// Notes then warnings (issue 32 D: result, notes, warnings — the
+		// same order as the CLI's human view).
 		for (const n of out.notes ?? []) lines.push(`note: ${n}`);
+		lines.push(...warningsText(out.warnings ?? []));
 		if (r.changed !== undefined) lines.push(`changed: ${r.changed}, untouched: ${r.untouched}`);
 		if (params.dryRun) {
 			lines.push("(dry run — nothing written)");

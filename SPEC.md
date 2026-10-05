@@ -149,6 +149,11 @@ cljform [--json|--human] <op> [args]
     "file_hash": "blake3:…", "forms": [ … ],
     "result": { … }, "warnings": [ … ], "notes": [ … ] }
   ```
+  Exception (issue 32, payload-first): the `get` envelope replaces the
+  whole-file `forms` array with a `formsCount` integer — the result object
+  is what the caller asked for; the count is cheap context. Every other
+  envelope (forms, check, edit, …) keeps the `forms` array (the edit
+  array's rationale: §4.2). Breaking change, per the house rule.
 - **JSON envelope** (error):
   ```json
   { "ok": false, "op": "edit",
@@ -196,6 +201,17 @@ not serialized — it is not addressable).
   (top body level), keyed by base (unqualified) head name. This is the cheap
   shape summary the agent eyeballs ("13 forms: 1 ns, 2 defn-, 10 deftest" —
   expected 11 deftests, so something is wrong).
+
+**Which envelopes carry the table (issue 32).** The `forms` array rides
+every success envelope EXCEPT `get` — payload-first: a single requested
+form's bytes beside the whole-file table was the F16/F17 friction; `get`
+carries `formsCount` instead. The **EDIT envelope deliberately keeps the
+array**: it is the summary-vs-table cross-check. A summary line that
+contradicted the post-edit table (issue 19's stale-head bug, where the
+summary reported a pre-edit head as the current identity) is caught by
+any consumer diffing the summary against the table; `get`'s result carries
+no derived summary that needs the cross-check, so only `get` drops it.
+`tree` (the node table) and `strip` are unaffected.
 
 ### 4.3 Operations
 
@@ -264,8 +280,16 @@ target form's before/after bytes (as before), the whole-form ops
 the splice window the pipeline already computes (the node range for
 replace/delete, the insert position for inserts, the file edge for
 append/prepend). The no-op case — the file bytes come back unchanged —
-keeps the empty diff. The human output shows the diff for every mutating
-op (as `patch` did); the summary line and forms table are unchanged.
+keeps the empty diff. **The human output is result-first (issue 32):**
+the changed-region diff (when present), then the summary line (text
+unchanged), then the AFFECTED form's table row(s) with handle — the new
+form for replace/patch, the inserted form(s) + the anchor's row for
+inserts, the deleted form's label + `was lines a–b` for delete — then the
+counts line (`N forms; C changed, U untouched — tree <file> for the full
+table`), then notes, then warnings. NO whole-file table in human mode, at
+any file size (`forms` / `tree` are the full-table surfaces). The JSON
+envelope is unchanged (the `result.text` field keeps its issue-27
+composition: summary line + repair diff + changed-region diff).
 
 **Marker auto-strip on ingest (§10.4):** `⟦…⟧` markers in `--content`,
 `--old-text`, and `--new-text` are stripped before use (lossless, with a
@@ -470,7 +494,7 @@ session.
 | `clj_forms` | `{path}` | `cljform forms --json`; refreshes the fingerprint cache |
 | `clj_tree` | `{path, name?, depth?, json?, startLine?, endLine?, recover?}` | `cljform tree` — the primary handle-discovery view (`--depth N\|all`); `name` maps to `--name SYM` (the §10.2 selector: matched subtrees at full depth, zero matches is an ok empty result); `json` returns the structured node list; `startLine`/`endLine` map to `--start-line`/`--end-line` (the §10.2 line window: complete forms only, real file line numbers, the effective span echoed — page large files; the window header/echo passes through unchanged); `recover` maps to `--recover` (the §10.2 broken-file recovery view: on a broken file the JSON path renders the diagnostics + intact-form labels + window echo — no handles; on a healthy file the normal view). **Human path (default, `--human`) is a pass-through:** the annotated source is not a JSON envelope, so on exit 0 the wrapper returns `stdout` directly (BOM-stripped, `trimEnd`) with no `isError` — a successful default `clj_tree` is never an error and is never prefixed `cljform failed:`. Only a nonzero exit (or, in `json` mode, an unparseable/`ok:false` envelope) yields `isError`, using `errorText` when the output parses as an error envelope, else the `cljform failed: ${stderr \|\| stdout}` fallback |
 | `clj_get` | `{path, name? / handle?}` | `cljform get --json` — exact bytes + the form's `⟦handle⟧` |
-| `clj_edit` | `{path, handle?, mode?, content? / oldText? + newText?, dryRun?, strict?, repair?, autoFormat?}` | `cljform edit --handle …` — mode auto-selects `patch` when `oldText` is present; append/prepend take no handle; `dryRun` ⇒ `--dry-run`, `strict` ⇒ `--strict`, `repair` ⇒ `--repair`; `autoFormat` (default true) maps to the in-edit content reindent: `false` passes `--no-format-content`, `true` (the default) passes nothing and lets `cljform edit` reindent the content itself in parinfer paren mode (§10.3/§10.5; a refused reindent is reported by the CLI as a note, the edit never fails for it); the wrapper no longer runs a separate `cljform format` call; `oldText`/`newText` are exact patch text and are never reformatted. **Next-handle affordance:** on every successful (non-dry-run) edit the wrapper appends a final line sourced from the JSON envelope (`result.summary`), never from re-parsing the human text — `replace`/`patch` append `next handle: ⟦H⟧ — use it for the next edit to this form` (from `summary.handle`; falls back to `summary.wasHandle` only when `handle` is absent) so the agent chases the returned handle instead of re-fetching; `insert-after`/`insert-before` append `inserted handles: ⟦…⟧, ⟦…⟧ (anchor ⟦…⟧) — use these for the next edit` (from `summary.handles`, plus `summary.wasHandle` when present); `delete` appends nothing (the form is gone — no stale handle) |
+| `clj_edit` | `{path, handle?, mode?, content? / oldText? + newText?, dryRun?, strict?, repair?, autoFormat?}` | `cljform edit --handle …` — mode auto-selects `patch` when `oldText` is present; append/prepend take no handle; `dryRun` ⇒ `--dry-run`, `strict` ⇒ `--strict`, `repair` ⇒ `--repair`; `autoFormat` (default true) maps to the in-edit content reindent: `false` passes `--no-format-content`, `true` (the default) passes nothing and lets `cljform edit` reindent the content itself in parinfer paren mode (§10.3/§10.5; a refused reindent is reported by the CLI as a note, the edit never fails for it); the wrapper no longer runs a separate `cljform format` call; `oldText`/`newText` are exact patch text and are never reformatted. **Known defect (queued as issue 34, out of scope for issue 32):** the changed-region diff is currently rendered twice in the wrapper's `clj_edit` text (once inside the CLI's `result.text`, once in the explicit `diff (changed region):` block). **Next-handle affordance:** on every successful (non-dry-run) edit the wrapper appends a final line sourced from the JSON envelope (`result.summary`), never from re-parsing the human text — `replace`/`patch` append `next handle: ⟦H⟧ — use it for the next edit to this form` (from `summary.handle`; falls back to `summary.wasHandle` only when `handle` is absent) so the agent chases the returned handle instead of re-fetching; `insert-after`/`insert-before` append `inserted handles: ⟦…⟧, ⟦…⟧ (anchor ⟦…⟧) — use these for the next edit` (from `summary.handles`, plus `summary.wasHandle` when present); `delete` appends nothing (the form is gone — no stale handle) |
 | `clj_draft` | `{content}` | `cljform materialize --content-file …` — returns candidate + diff; never writes |
 
 **Fingerprint cache:** in-memory `Map<realpath, forms>`. Refreshed on every
@@ -1056,3 +1080,35 @@ design):
   old-vs-new battery). The wrapper's `clj_tree` gains `startLine`/`endLine`
   (pass-through, real ranges preserved; guidance: page large files, windows
   expand to complete forms).
+- **Response scoping (issue 32).** Human-mode outputs are result-first and
+  never dump the whole file: `edit --human` is diff → summary line → the
+  affected form's table row(s) with handle → counts line
+  (`N forms; C changed, U untouched — tree <file> for the full table`) →
+  notes → warnings (the whole-file table is gone at every size; the rows
+  are pre-composed in `run_edit` via `summary::human_affected_block` from
+  the post-edit changed window + the post-edit node table, and ride the
+  envelope in a `serde(skip)` field so the JSON stays byte-identical);
+  `get --human` prints the form's exact bytes first, then one compact
+  metadata line (handle, kind, name, lines, hash, file); `get --json`
+  replaces the `forms` array with `formsCount` (the EDIT envelope keeps
+  its array — the summary-vs-table cross-check, §4.2); `format`/
+  `materialize --human` print `already canonical (no changes)` when the
+  candidate is unchanged (no redundant dump, no diff headers). D audit:
+  notes/warnings were warnings-first in every human op — normalized to
+  result → notes → warnings (CLI + wrapper); the wrapper's `errorText`
+  printed a "current form table" header over an always-empty table —
+  now conditional; the wrapper's clj_edit double-renders the
+  changed-region diff — owner-reported, QUEUED as issue 34 (both issues
+  touch the wrapper; not fixed here); and a pre-existing base-suite flake
+  (the issue-30 L3 hook tests shared a process-global flag across test
+  threads) was fixed with a test-only serialization guard. New tests:
+  `edit_human_is_result_first`, `edit_human_affected_rows_no_full_table`,
+  `edit_human_notes_before_warnings`, `edit_json_still_carries_full_forms_array`,
+  `get_json_carries_forms_count_not_forms`, `human_get_is_payload_first`,
+  `format_human_unchanged_is_one_line`, `format_human_changed_stays_candidate_first`,
+  `materialize_human_unchanged_is_one_line`. Old-vs-new battery (serial,
+  bounded, 63 scenarios × read/JSON/human/exit/stderr): JSON byte-identical
+  EXCEPT the four get envelopes' `forms` → `formsCount`; human edit/get/
+  format/materialize-unchanged outputs = the intended reshapes; everything
+  else (forms/check/tree/strip/broken-file views, error envelopes, all
+  other JSON, exit codes) identical.

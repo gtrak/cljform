@@ -247,13 +247,18 @@ fn print_human(out: &Output) {
         return;
     }
     if out.op == "get" {
-        // The requested form is the payload: print a one-line header then its
-        // exact bytes, not the whole table.
+        // Issue 32 (B): the form's EXACT bytes are the payload — print them
+        // first, then one compact metadata line (handle, kind, name,
+        // lines), never a forms-table dump.
         if let Some(r) = &out.result {
+            if let Some(form) = r.get("form").and_then(|v| v.as_str()) {
+                print_payload(form);
+            }
             let file = out.file.as_deref().unwrap_or("<stdin>");
             let kind = r.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-            let label = match r.get("name").and_then(|v| v.as_str()) {
-                Some(n) => format!("{kind} [{n}]"),
+            let name = r.get("name").and_then(|v| v.as_str());
+            let label = match name {
+                Some(n) => format!("{kind} {n}"),
                 None => kind.to_string(),
             };
             let lines = r.get("line").and_then(|v| v.as_array());
@@ -262,30 +267,64 @@ fn print_human(out: &Output) {
                 _ => String::new(),
             };
             let hash = r.get("hash").and_then(|v| v.as_str()).unwrap_or("");
-            let mut header = if line_range.is_empty() {
-                format!("{file} · {label} · {hash}")
-            } else {
-                format!("{file} · {label} · {line_range} · {hash}")
+            let handle = r.get("handle").and_then(|v| v.as_str());
+            // The handle is the actionable follow-up (edit --handle H); it
+            // leads the metadata line when present.
+            let mut meta = match handle {
+                Some(h) => format!("⟦{h}⟧ {label}"),
+                None => label,
             };
-            // The handle is the actionable follow-up (edit --handle H).
-            if let Some(h) = r.get("handle").and_then(|v| v.as_str()) {
-                header.push_str(&format!(" · handle {h}"));
+            if !line_range.is_empty() {
+                meta.push_str(&format!(" · {line_range}"));
             }
-            println!("{header}");
-            if let Some(form) = r.get("form").and_then(|v| v.as_str()) {
-                print_payload(form);
-            }
+            meta.push_str(&format!(" · {hash} · {file}"));
+            println!("{meta}");
         }
-    } else if out.op == "materialize" || out.op == "format" {
-        // The candidate (and its diff) are the payload; the note goes in notes.
+    } else if out.op == "edit" {
+        // Issue 32 (A): result-first — the changed-region diff (when
+        // present), the summary line, the repair diff (when repaired), the
+        // affected form's row(s) + counts line (human_rows), then notes and
+        // warnings. NO full-table dump in human mode, at any file size.
         if let Some(r) = &out.result {
-            if let Some(cand) = r.get("candidate").and_then(|v| v.as_str()) {
-                print_payload(cand);
-            }
             if let Some(diff) = r.get("diff").and_then(|v| v.as_str()) {
                 if !diff.is_empty() {
                     print_payload(diff);
                 }
+            }
+            // The summary line is the first line of result.text (the JSON
+            // field keeps its issue-27 composition; the human view is the
+            // reshaped one).
+            if let Some(text) = r.get("text").and_then(|t| t.as_str()) {
+                if let Some(line) = text.lines().next() {
+                    println!("{line}");
+                }
+            }
+            if r.get("repaired").and_then(|v| v.as_bool()) == Some(true) {
+                if let Some(repair_diff) = r.get("repairDiff").and_then(|v| v.as_str()) {
+                    if !repair_diff.is_empty() {
+                        print_payload(repair_diff);
+                    }
+                }
+            }
+            if let Some(block) = &out.human_rows {
+                print_payload(block);
+            }
+        }
+    } else if out.op == "materialize" || out.op == "format" {
+        // The candidate (and its diff) are the payload; the note goes in
+        // notes. Issue 32 (C): the unchanged case (empty diff) is one line
+        // — no redundant candidate dump, no diff headers. (Applied to
+        // materialize too: its unchanged case dumped the draft verbatim.)
+        if let Some(r) = &out.result {
+            // The unified_diff of equal inputs still emits its two header
+            // lines — the "no change" signal is the absence of a hunk
+            // (`@@`), not an empty string.
+            let diff = r.get("diff").and_then(|v| v.as_str()).unwrap_or("");
+            if !diff.contains("@@") {
+                println!("already canonical (no changes)");
+            } else if let Some(cand) = r.get("candidate").and_then(|v| v.as_str()) {
+                print_payload(cand);
+                print_payload(diff);
             }
         }
     } else {
@@ -312,14 +351,15 @@ fn print_human(out: &Output) {
             }
         }
     }
-    if let Some(ws) = &out.warnings {
-        for w in ws {
-            println!("warning {}: {}", w.id, w.message);
-        }
-    }
+    // Issue 32 (D): result, then notes, then warnings — every human op.
     if let Some(ns) = &out.notes {
         for n in ns {
             println!("note: {n}");
+        }
+    }
+    if let Some(ws) = &out.warnings {
+        for w in ws {
+            println!("warning {}: {}", w.id, w.message);
         }
     }
 }

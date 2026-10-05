@@ -80,10 +80,16 @@ by handle:
 $ cljform edit todos.clj --handle a2fbf8 --mode patch \
     --old-text '(map #(assoc % :done true) t)' \
     --new-text '(map (fn [todo] (assoc todo :done true :completed-at (now))) todo)'
-todos.clj: 4 forms
-patched form ⟦b36464⟧ complete-all (lines 8–9) — 1 changed, 3 untouched
 --- before / +++ after …
+patched form ⟦b36464⟧ complete-all (lines 8–9) — 1 changed, 3 untouched
+    4  defn         complete-all             lines 8–9  ⟦b36464⟧
+4 forms; 1 changed, 3 untouched — tree todos.clj for the full table
 ```
+
+The response is **result-first**: the changed-region diff, the summary
+line, the affected form's row (with its new handle — your next edit
+target), and the counts line. The whole-file table is never dumped here
+— `tree` and `forms` are its home, and the counts line points you there.
 
 Mistype the target text and the refusal hands you the form's exact bytes to
 copy from — recovery is one retry, not a re-read:
@@ -122,7 +128,7 @@ re-aim, never mis-aim.
 |----|---------|
 | `tree <file>` | The annotated view — source with `⟦handle⟧` per form. The primary discovery surface. `--name SYM` selects a nested form by name; `--start-line/--end-line` page large files (complete forms only); `--json` emits the node table; `--recover` is the broken-file view (below) |
 | `forms <file>` | Flat table: addr, kind, name, lines, blake3, shape summary, warnings |
-| `get <file> --name SYM \| --handle H` | One form's exact bytes + metadata (pass its handle to `edit`) |
+| `get <file> --name SYM \| --handle H` | One form's exact bytes + metadata (pass its handle to `edit`); human view is payload-first: the bytes, then one metadata line |
 | `edit <file> --handle H` | Whole-form edit: `--mode replace\|patch\|insert-after\|insert-before\|append\|prepend\|delete`, with `--content`/`--content-file` or patch `--old-text/--new-text`. Returns a unified diff of the changed region. See below for repair/strict |
 | `check <file>` | Parse + form table + detector warnings (file or stdin) |
 | `materialize --content C` | Indent-mode bracket completion → candidate + diff, never writes |
@@ -203,7 +209,7 @@ ln -s "$PWD/extension/agents/clojure-worker.md"  ~/.pi/agent/agents/clojure-work
 ## Development
 
 ```sh
-cargo build && cargo test        # 194 tests across 11 suites
+cargo build && cargo test        # 203 tests across 11 suites
 ```
 
 Standard gates: `cargo build` · `cargo clippy --all-targets -- -D warnings
