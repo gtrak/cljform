@@ -180,3 +180,18 @@ Both reported silent-corruption modes DO NOT reproduce (repros in /tmp/repro17):
 - POSITIVE: refusal shapes called out as the standout win — patch-not-found
   exact bytes, unbalanced-content inline candidate — "removes the
   guess-retry loop."
+## T18 (dogfood of batch edit, issue 36) — the motivating failure replayed and closed
+- 11-op single batch call (1 replace + 10 patches) on cache.clj incl. a
+  same-form sequence: op 10 rotated the form's handle, op 11 passed the SAME
+  pre-batch handle and the batch re-anchored via wasHandle — the one-op-per-
+  call world would have forced stale-handle + refetch. 0 forced refetches.
+- Atomicity lived: deliberate op-4 typo -> patch-not-found, "op 4 of 11",
+  file hash unchanged, empty diff; the other 10 handles survived the
+  resubmit (content-addressing); attempt 2 -> 11 ops applied, exit 0.
+- Target-loss verified clean on a scratch file.
+- VERDICT: the batch closes the tool-choice gap — the call-count reason to
+  reach for the unguarded built-in edit is gone. What still favors raw text
+  editing is narrow and intentional: pure-whitespace seam fixes, free
+  comment insertion in non-form regions, whole-file reindent (format is
+  candidate-only).
+- Zero built-in edit usage all session.
