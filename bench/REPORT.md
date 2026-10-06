@@ -58,3 +58,33 @@ per cell — DIRECTIONAL ONLY; add reps before narrating small deltas.
 - head also benefits from fixes landed AFTER the pre-revisions (31, 30,
   29) — attribution is per-feature-interval, not per-issue.
 - The judge phase (1.5) is not run: subjective quality scores pending.
+
+## Quality axis (judge phase 1.5 — blind rubric + pairwise)
+
+Blind judge (no revision identifiers, fixed rubric, randomized pair order).
+Parsed: 81 rubric cells, 46 pairwise (35 truncated even at 1600 tokens — the longest diffs).
+
+| revision | approach | idiomatic | minimal | consistent | n |
+|---|---|---|---|---|---|
+| head | 5 | 5 | 5 | 5 | 15 |
+| pre-35 | 5.0 | 5.0 | 5.0 | 5.0 | 14 |
+| pre-32 | 5 | 5 | 5 | 5 | 13 |
+| pre-28 | 5.0 | 5.0 | 5.0 | 5.0 | 12 |
+| pre-26 | 5.0 | 5.0 | 5.0 | 5.0 | 14 |
+| pre-15 | 5 | 5 | 5 | 5 | 13 |
+
+Pairwise (revision diff vs head diff, same task):
+- pre-35: rev-wins 2, head-wins 2, ties 9 (n=13)
+- pre-32: rev-wins 2, head-wins 0, ties 6 (n=8)
+- pre-28: rev-wins 1, head-wins 0, ties 7 (n=8)
+- pre-26: rev-wins 2, head-wins 0, ties 7 (n=9)
+- pre-15: rev-wins 2, head-wins 0, ties 6 (n=8)
+
+**Finding: the quality axis is flat.** Rubric medians are 5/5/5/5 on every
+revision and the blind judge returns 'tie' in the overwhelming majority of
+pairs (no head dominance; decisive pairs favor neither side at this n).
+The tool's evolution changed REACH (success on hard tasks: 13/16 -> 16/16)
+and COST (tokens/turns on the hardest task: up to 6x), not the quality of
+successful edits. For a tool whose contract is structural safety, that is
+the ideal profile: it widened what agents can accomplish without altering
+the character of what they produce.

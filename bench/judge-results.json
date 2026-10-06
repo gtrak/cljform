@@ -1,0 +1,1371 @@
+{
+ "rubric": [
+  {
+   "rev": "head",
+   "task": "ds_t1_max_addr",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff makes exactly the requested numeric change with no unrelated edits."
+   }
+  },
+  {
+   "rev": "head",
+   "task": "ds_t1_maybe_adapt_docstring",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff adds the exact requested docstring using standard Clojure defn formatting."
+   }
+  },
+  {
+   "rev": "head",
+   "task": "ds_t2_rename_store_impl",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff renames the definition and all call sites exactly as requested with no unrelated changes."
+   }
+  },
+  {
+   "rev": "head",
+   "task": "kondo_t1_cache_file_docstring",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff adds the exact requested docstring in the correct Clojure defn position with minimal changes."
+   }
+  },
+  {
+   "rev": "head",
+   "task": "kondo_t1_docstring_quotes",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff adds the exact required docstring with escaped double quotes in the correct position."
+   }
+  },
+  {
+   "rev": "head",
+   "task": "kondo_t1_rename_from_cache_local",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 4,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The rename is exact and minimal, though naming an input stream reader is slightly misleading."
+   }
+  },
+  {
+   "rev": "head",
+   "task": "kondo_t3_resolve_conflict",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff cleanly resolves the conflict by preserving the original 3-argument cache-file and introducing the new 4-argument cache-file-with-suffix without leaving conflict markers."
+   }
+  },
+  {
+   "rev": "head",
+   "task": "ring_t1_close_docstring",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff makes the exact requested docstring change with no unrelated edits."
+   }
+  },
+  {
+   "rev": "head",
+   "task": "ring_t2_delete_dead_helper",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff removes the unused private helper and its stale comment without changing any other forms."
+   }
+  },
+  {
+   "rev": "head",
+   "task": "ring_t2_rename_dissoc_header",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff renames the private function and its call site exactly as requested without unrelated changes."
+   }
+  },
+  {
+   "rev": "head",
+   "task": "ring_t3_parse_date_nil",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The change wraps the existing parsing logic in a when guard so nil input returns nil while preserving prior behavior for non-nil dates."
+   }
+  },
+  {
+   "rev": "pre-35",
+   "task": "ds_t1_max_addr",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff makes exactly the requested one-line change to the initial volatile value."
+   }
+  },
+  {
+   "rev": "pre-35",
+   "task": "ds_t1_maybe_adapt_docstring",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff adds the exact requested docstring in a standard Clojure defn style with no unrelated changes."
+   }
+  },
+  {
+   "rev": "pre-35",
+   "task": "ds_t2_rename_store_impl",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff correctly renames the private function and all shown call sites without unrelated changes."
+   }
+  },
+  {
+   "rev": "pre-35",
+   "task": "kondo_t1_cache_file_docstring",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 4,
+    "minimal": 4,
+    "consistent": 4,
+    "note": "Adds the exact requested docstring, but the multi-line defn with a separate return-type annotation is slightly less minimal and less consistent with the surrounding one-line style."
+   }
+  },
+  {
+   "rev": "pre-35",
+   "task": "kondo_t1_docstring_quotes",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff adds the exact required docstring with escaped quotes in the standard Clojure position."
+   }
+  },
+  {
+   "rev": "pre-35",
+   "task": "kondo_t1_rename_from_cache_local",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff precisely renames the binding and its use as requested without any unrelated changes."
+   }
+  },
+  {
+   "rev": "pre-35",
+   "task": "kondo_t3_resolve_conflict",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff cleanly removes the conflict markers, preserves the 3-argument cache-file, and adds the 4-argument cache-file-with-suffix in the same style."
+   }
+  },
+  {
+   "rev": "pre-35",
+   "task": "ring_t1_close_docstring",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff adds the required sentence to the docstring with no unnecessary changes."
+   }
+  },
+  {
+   "rev": "pre-35",
+   "task": "ring_t1_pop1866",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff adds the requested :pop1866 entry with the exact lowercase pattern while preserving existing entries."
+   }
+  },
+  {
+   "rev": "pre-35",
+   "task": "ring_t2_rename_dissoc_header",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff renames the private function and its call site exactly as requested with no unrelated changes."
+   }
+  },
+  {
+   "rev": "pre-35",
+   "task": "ring_t3_parse_date_nil",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff adds a simple nil guard while preserving existing parsing behavior."
+   }
+  },
+  {
+   "rev": "pre-32",
+   "task": "ds_t1_max_addr",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff makes exactly the requested one-line numeric change without altering anything else."
+   }
+  },
+  {
+   "rev": "pre-32",
+   "task": "ds_t1_maybe_adapt_docstring",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff adds the exact requested docstring in the standard Clojure defn position with no unrelated changes."
+   }
+  },
+  {
+   "rev": "pre-32",
+   "task": "ds_t2_rename_store_impl",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff correctly renames the private function and all visible call sites without unrelated changes."
+   }
+  },
+  {
+   "rev": "pre-32",
+   "task": "kondo_t1_rename_from_cache_local",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff renames the binding and its use exactly as requested without any unrelated changes."
+   }
+  },
+  {
+   "rev": "pre-32",
+   "task": "kondo_t3_resolve_conflict",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff cleanly resolves the conflict by preserving the 3-argument function and introducing the 4-argument variant under the requested name."
+   }
+  },
+  {
+   "rev": "pre-32",
+   "task": "ring_t1_close_docstring",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff correctly appends the required sentence to the docstring with minimal, conventional formatting."
+   }
+  },
+  {
+   "rev": "pre-32",
+   "task": "ring_t1_pop1866",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff adds the requested :pop1866 entry with the exact lowercase pattern while preserving existing entries and style."
+   }
+  },
+  {
+   "rev": "pre-32",
+   "task": "ring_t1_rename_piped_locals",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 4,
+    "consistent": 5,
+    "note": "The diff correctly renames the bindings and updates all uses, with only a minor whitespace alignment adjustment."
+   }
+  },
+  {
+   "rev": "pre-32",
+   "task": "ring_t2_delete_dead_helper",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff cleanly removes the unused helper and its stale comment, including the separating blank line, without touching other forms."
+   }
+  },
+  {
+   "rev": "pre-32",
+   "task": "ring_t2_rename_dissoc_header",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff cleanly renames the private function and its visible call site without unrelated changes."
+   }
+  },
+  {
+   "rev": "pre-32",
+   "task": "ring_t3_parse_date_nil",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The guard makes nil return nil while preserving existing parsing behavior and adds a focused regression test."
+   }
+  },
+  {
+   "rev": "pre-28",
+   "task": "ds_t1_max_addr",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff makes exactly the requested one-line change and preserves the surrounding style."
+   }
+  },
+  {
+   "rev": "pre-28",
+   "task": "ds_t1_maybe_adapt_docstring",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff adds the exact requested docstring in the standard Clojure defn position with no unnecessary changes."
+   }
+  },
+  {
+   "rev": "pre-28",
+   "task": "ds_t2_rename_store_impl",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff performs the requested rename at the definition and all shown call sites with no unrelated edits."
+   }
+  },
+  {
+   "rev": "pre-28",
+   "task": "kondo_t1_cache_file_docstring",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff adds the exact requested docstring to cache-file without changing behavior."
+   }
+  },
+  {
+   "rev": "pre-28",
+   "task": "kondo_t1_rename_from_cache_local",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff renames the binding and its use exactly as requested without any unrelated changes."
+   }
+  },
+  {
+   "rev": "pre-28",
+   "task": "kondo_t3_resolve_conflict",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff cleanly resolves the conflict by preserving the original 3-argument cache-file and adding the requested 4-argument cache-file-with-suffix without markers."
+   }
+  },
+  {
+   "rev": "pre-28",
+   "task": "ring_t1_close_docstring",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff adds the required return sentence to the docstring with no unnecessary changes."
+   }
+  },
+  {
+   "rev": "pre-28",
+   "task": "ring_t1_rename_piped_locals",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff renames only the local bindings and their uses to is and os without altering unrelated code."
+   }
+  },
+  {
+   "rev": "pre-28",
+   "task": "ring_t2_delete_dead_helper",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff removes exactly the stale comment and unused private helper without touching any other forms."
+   }
+  },
+  {
+   "rev": "pre-28",
+   "task": "ring_t2_rename_dissoc_header",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff cleanly renames the private function and its sole call site without unrelated changes."
+   }
+  },
+  {
+   "rev": "pre-26",
+   "task": "ds_t1_max_addr",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff changes only the requested volatile initial value and preserves the surrounding code style."
+   }
+  },
+  {
+   "rev": "pre-26",
+   "task": "ds_t1_maybe_adapt_docstring",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff adds the exact requested docstring in the standard Clojure position with no unrelated changes."
+   }
+  },
+  {
+   "rev": "pre-26",
+   "task": "ds_t2_rename_store_impl",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff exactly renames the definition and all call sites without any unrelated changes."
+   }
+  },
+  {
+   "rev": "pre-26",
+   "task": "kondo_t1_cache_file_docstring",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff adds the exact requested docstring in the correct position with minimal disruption."
+   }
+  },
+  {
+   "rev": "pre-26",
+   "task": "kondo_t1_docstring_quotes",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff adds the exact required docstring with escaped quotes in the standard Clojure position."
+   }
+  },
+  {
+   "rev": "pre-26",
+   "task": "kondo_t1_rename_from_cache_local",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 4,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff performs exactly the requested rename with no unrelated changes, though naming an input stream as reader is slightly misleading."
+   }
+  },
+  {
+   "rev": "pre-26",
+   "task": "kondo_t3_resolve_conflict",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff cleanly resolves the conflict by preserving the 3-argument cache-file and adding the 4-argument variant as cache-file-with-suffix without leaving conflict markers."
+   }
+  },
+  {
+   "rev": "pre-26",
+   "task": "ring_t1_close_docstring",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff makes the exact requested docstring change with no unnecessary modifications."
+   }
+  },
+  {
+   "rev": "pre-26",
+   "task": "ring_t1_pop1866",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff adds the requested :pop1866 entry with the exact pattern while preserving existing entries."
+   }
+  },
+  {
+   "rev": "pre-26",
+   "task": "ring_t1_rename_piped_locals",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff performs exactly the requested local binding renames without altering any other code."
+   }
+  },
+  {
+   "rev": "pre-26",
+   "task": "ring_t2_delete_dead_helper",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff removes exactly the unused private helper and its stale comment while leaving the rest of the file untouched."
+   }
+  },
+  {
+   "rev": "pre-26",
+   "task": "ring_t2_rename_dissoc_header",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff correctly renames the private function and its call site with no unrelated changes."
+   }
+  },
+  {
+   "rev": "pre-26",
+   "task": "ring_t3_parse_date_nil",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The change directly fixes the nil-input crash with an idiomatic when guard and adds focused tests without altering existing parsing behavior."
+   }
+  },
+  {
+   "rev": "pre-15",
+   "task": "ds_t1_max_addr",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff changes only the requested volatile initial value and preserves the surrounding code style."
+   }
+  },
+  {
+   "rev": "pre-15",
+   "task": "ds_t1_maybe_adapt_docstring",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff adds the exact required docstring in the standard Clojure position without unrelated changes."
+   }
+  },
+  {
+   "rev": "pre-15",
+   "task": "ds_t2_rename_store_impl",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff exactly renames the private function and all visible call sites without unrelated changes."
+   }
+  },
+  {
+   "rev": "pre-15",
+   "task": "kondo_t1_rename_from_cache_local",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 4,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff makes exactly the requested rename with no unrelated changes, though `reader` is slightly ambiguous for an input stream."
+   }
+  },
+  {
+   "rev": "pre-15",
+   "task": "kondo_t3_resolve_conflict",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff cleanly removes the conflict markers, preserves the 3-argument cache-file, and adds the renamed 4-argument variant in a style consistent with the surrounding code."
+   }
+  },
+  {
+   "rev": "pre-15",
+   "task": "ring_t1_close_docstring",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff makes the exact requested docstring update with no unnecessary changes."
+   }
+  },
+  {
+   "rev": "pre-15",
+   "task": "ring_t2_delete_dead_helper",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff removes exactly the stale comment and unused private helper without touching any other forms."
+   }
+  },
+  {
+   "rev": "pre-15",
+   "task": "ring_t2_rename_dissoc_header",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff correctly renames the private function and its call site without unrelated changes."
+   }
+  },
+  {
+   "rev": "pre-15",
+   "task": "ring_t3_parse_date_nil",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff guards nil input with when and adds tests, preserving existing parsing behavior."
+   }
+  },
+  {
+   "rev": "head",
+   "task": "ring_t1_rename_piped_locals",
+   "judge": {
+    "approach": 1,
+    "idiomatic": 2,
+    "minimal": 1,
+    "consistent": 2,
+    "note": "The diff renames the bindings but incorrectly returns os instead of is, changing the function's behavior."
+   }
+  },
+  {
+   "rev": "pre-35",
+   "task": "ring_t2_delete_dead_helper",
+   "judge": {
+    "approach": 4,
+    "idiomatic": 3,
+    "minimal": 2,
+    "consistent": 2
+   }
+  },
+  {
+   "rev": "pre-32",
+   "task": "ring_t3_http_date_unquote",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 4,
+    "minimal": 5,
+    "consistent": 4,
+    "note": "The change cleanly promotes the helper and uses it, though a public :added metadata tag would make it fully consistent with Ring's public API conventions."
+   }
+  },
+  {
+   "rev": "pre-15",
+   "task": "ring_t1_rename_piped_locals",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff renames only the local bindings and their uses to is and os without altering any other code."
+   }
+  },
+  {
+   "rev": "head",
+   "task": "kondo_t2_insert_cache_helpers",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 4,
+    "minimal": 5,
+    "consistent": 4,
+    "note": "The helpers implement the requested path factoring cleanly, though the unused lang parameter and io/join choice are minor style/consistency trade-offs."
+   }
+  },
+  {
+   "rev": "head",
+   "task": "ring_t1_pop1866",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff adds the requested :pop1866 entry with the exact lowercase pattern while preserving existing entries."
+   }
+  },
+  {
+   "rev": "head",
+   "task": "ring_t2_insert_stream_helpers",
+   "judge": {
+    "error": "IncompleteRead(7336 bytes read, 140 more expected)"
+   }
+  },
+  {
+   "rev": "head",
+   "task": "ring_t3_http_date_unquote",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5
+   }
+  },
+  {
+   "rev": "pre-35",
+   "task": "kondo_t2_insert_cache_helpers",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 4,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff correctly adds the requested helpers and reuses them in cache-file, though the unused lang parameter in cache-file-base is slightly inelegant."
+   }
+  },
+  {
+   "rev": "pre-35",
+   "task": "ring_t1_rename_piped_locals",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 4,
+    "minimal": 3,
+    "consistent": 3,
+    "note": "The rename is correct, but the let binding alignment was needlessly reformatted."
+   }
+  },
+  {
+   "rev": "pre-35",
+   "task": "ring_t2_insert_stream_helpers",
+   "judge": {
+    "error": "timed out"
+   }
+  },
+  {
+   "rev": "pre-35",
+   "task": "ring_t3_http_date_unquote",
+   "judge": {
+    "error": "Unterminated string starting at: line 1 column 7421 (char 7420)"
+   }
+  },
+  {
+   "rev": "pre-32",
+   "task": "kondo_t2_insert_cache_helpers",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 4,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff adds the requested helpers with the correct signatures and string construction, though it could optionally reuse cache-file-base in cache-file-rel-path."
+   }
+  },
+  {
+   "rev": "pre-32",
+   "task": "ring_t2_insert_stream_helpers",
+   "judge": {
+    "error": "IncompleteRead(5131 bytes read, 2029 more expected)"
+   }
+  },
+  {
+   "rev": "pre-28",
+   "task": "kondo_t2_insert_cache_helpers",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 4,
+    "minimal": 5,
+    "consistent": 4,
+    "note": "The helpers are correctly added and reused, though the unused lang parameter and slash-based path are minor style concerns."
+   }
+  },
+  {
+   "rev": "pre-28",
+   "task": "ring_t1_pop1866",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff adds the requested :pop1866 entry with the exact lowercase pattern while preserving the existing map entries."
+   }
+  },
+  {
+   "rev": "pre-28",
+   "task": "ring_t2_insert_stream_helpers",
+   "judge": {
+    "error": "IncompleteRead(7585 bytes read, 342 more expected)"
+   }
+  },
+  {
+   "rev": "pre-28",
+   "task": "ring_t3_http_date_unquote",
+   "judge": {
+    "error": "Unterminated string starting at: line 1 column 191 (char 190)"
+   }
+  },
+  {
+   "rev": "pre-26",
+   "task": "kondo_t2_insert_cache_helpers",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff adds the requested helpers and reuses them in cache-file with the same string construction, making a clean minimal change."
+   }
+  },
+  {
+   "rev": "pre-26",
+   "task": "ring_t3_http_date_unquote",
+   "judge": {
+    "error": "IncompleteRead(5790 bytes read, 1760 more expected)"
+   }
+  },
+  {
+   "rev": "pre-15",
+   "task": "kondo_t2_insert_cache_helpers",
+   "judge": {
+    "error": "IncompleteRead(4473 bytes read, 2698 more expected)"
+   }
+  },
+  {
+   "rev": "pre-15",
+   "task": "ring_t1_pop1866",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff adds the requested :pop1866 entry exactly and minimally while preserving the existing map style."
+   }
+  },
+  {
+   "rev": "pre-15",
+   "task": "ring_t2_insert_stream_helpers",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 4,
+    "minimal": 4,
+    "consistent": 5,
+    "note": "The diff implements all three helpers in the existing style, with only minor opportunities to simplify string-output-stream and close-all!."
+   }
+  },
+  {
+   "rev": "pre-15",
+   "task": "ring_t3_http_date_unquote",
+   "judge": {
+    "approach": 5,
+    "idiomatic": 5,
+    "minimal": 5,
+    "consistent": 5,
+    "note": "The diff cleanly promotes the helper to a public nil-safe function and applies it in the middleware without changing parse-date behavior."
+   }
+  }
+ ],
+ "pairwise": [
+  {
+   "task": "ds_t1_max_addr",
+   "rev": "pre-35",
+   "a_is": "head",
+   "judge": {
+    "better": "tie",
+    "note": "Both diffs are identical and make only the required one-line change to the initial volatile value."
+   }
+  },
+  {
+   "task": "ds_t1_maybe_adapt_docstring",
+   "rev": "pre-35",
+   "a_is": "pre-35",
+   "judge": {
+    "better": "tie",
+    "note": "Both diffs add the exact required docstring in the same minimal, idiomatic way."
+   }
+  },
+  {
+   "task": "kondo_t1_cache_file_docstring",
+   "rev": "pre-35",
+   "a_is": "head",
+   "judge": {
+    "better": "A",
+    "note": "A adds the required docstring with the smallest change and preserves the existing one-line defn style."
+   }
+  },
+  {
+   "task": "kondo_t1_rename_from_cache_local",
+   "rev": "pre-35",
+   "a_is": "head",
+   "judge": {
+    "better": "tie",
+    "note": "Both diffs make the same minimal, correct rename from is to reader and update its use identically."
+   }
+  },
+  {
+   "task": "kondo_t3_resolve_conflict",
+   "rev": "pre-35",
+   "a_is": "pre-35",
+   "judge": {
+    "better": "tie",
+    "note": "Both diffs are identical and correctly preserve the 3-argument cache-file while adding the renamed 4-argument variant without conflict markers."
+   }
+  },
+  {
+   "task": "ring_t1_close_docstring",
+   "rev": "pre-35",
+   "a_is": "head",
+   "judge": {
+    "better": "tie",
+    "note": "Both diffs make the identical minimal docstring update."
+   }
+  },
+  {
+   "task": "ring_t1_pop1866",
+   "rev": "pre-35",
+   "a_is": "pre-35",
+   "judge": {
+    "better": "tie",
+    "note": "Both diffs are identical and correctly add the requested :pop1866 entry while preserving the existing entries."
+   }
+  },
+  {
+   "task": "ring_t1_rename_piped_locals",
+   "rev": "pre-35",
+   "a_is": "pre-35",
+   "judge": {
+    "better": "A",
+    "note": "Diff A correctly renames the bindings and returns the input stream, while Diff B incorrectly returns the output stream."
+   }
+  },
+  {
+   "task": "ring_t2_delete_dead_helper",
+   "rev": "pre-35",
+   "a_is": "head",
+   "judge": {
+    "better": "A",
+    "note": "Diff A removes only the stale comment and unused helper while preserving the file's final newline and all other forms."
+   }
+  },
+  {
+   "task": "ring_t2_rename_dissoc_header",
+   "rev": "pre-35",
+   "a_is": "head",
+   "judge": {
+    "better": "tie",
+    "note": "Both diffs make the required rename of the definition and call site with no other changes."
+   }
+  },
+  {
+   "task": "ring_t3_parse_date_nil",
+   "rev": "pre-35",
+   "a_is": "pre-35",
+   "judge": {
+    "better": "tie",
+    "note": "Both diffs are identical and correctly make parse-date return nil for nil while preserving existing parsing behavior."
+   }
+  },
+  {
+   "task": "ds_t1_max_addr",
+   "rev": "pre-32",
+   "a_is": "pre-32",
+   "judge": {
+    "better": "tie",
+    "note": "Both diffs make the exact same minimal change, so neither is better."
+   }
+  },
+  {
+   "task": "ds_t1_maybe_adapt_docstring",
+   "rev": "pre-32",
+   "a_is": "pre-32",
+   "judge": {
+    "better": "tie",
+    "note": "Both diffs are identical and add the exact requested docstring in an idiomatic, minimal way."
+   }
+  },
+  {
+   "task": "kondo_t1_rename_from_cache_local",
+   "rev": "pre-32",
+   "a_is": "pre-32",
+   "judge": {
+    "better": "tie",
+    "note": "Both diffs are identical and correctly rename the binding to reader while updating its use without changing anything else."
+   }
+  },
+  {
+   "task": "ring_t1_pop1866",
+   "rev": "pre-32",
+   "a_is": "pre-32",
+   "judge": {
+    "better": "tie",
+    "note": "Both diffs add the required :pop1866 entry identically and minimally."
+   }
+  },
+  {
+   "task": "ring_t1_rename_piped_locals",
+   "rev": "pre-32",
+   "a_is": "head",
+   "judge": {
+    "better": "B",
+    "note": "Diff B correctly returns the renamed input stream binding `is`, while Diff A incorrectly returns `os`."
+   }
+  },
+  {
+   "task": "ring_t2_delete_dead_helper",
+   "rev": "pre-32",
+   "a_is": "pre-32",
+   "judge": {
+    "better": "tie",
+    "note": "Both diffs are identical and correctly remove only the unused private helper and its stale comment."
+   }
+  },
+  {
+   "task": "ring_t2_rename_dissoc_header",
+   "rev": "pre-32",
+   "a_is": "pre-32",
+   "judge": {
+    "better": "tie",
+    "note": "Both diffs make the exact required rename with no other changes."
+   }
+  },
+  {
+   "task": "ring_t3_parse_date_nil",
+   "rev": "pre-32",
+   "a_is": "head",
+   "judge": {
+    "better": "B",
+    "note": "B is better because it makes the same minimal source fix and adds a regression test for the nil input case."
+   }
+  },
+  {
+   "task": "ds_t1_max_addr",
+   "rev": "pre-28",
+   "a_is": "pre-28",
+   "judge": {
+    "better": "tie",
+    "note": "Both diffs are identical and make the minimal required change to the *max-addr initial value."
+   }
+  },
+  {
+   "task": "ds_t1_maybe_adapt_docstring",
+   "rev": "pre-28",
+   "a_is": "pre-28",
+   "judge": {
+    "better": "tie",
+    "note": "Both diffs add the exact required docstring with identical minimal and idiomatic formatting."
+   }
+  },
+  {
+   "task": "ds_t2_rename_store_impl",
+   "rev": "pre-28",
+   "a_is": "pre-28",
+   "judge": {
+    "better": "tie"
+   }
+  },
+  {
+   "task": "kondo_t1_rename_from_cache_local",
+   "rev": "pre-28",
+   "a_is": "pre-28",
+   "judge": {
+    "better": "tie",
+    "note": "Both diffs make the exact requested rename with no other changes."
+   }
+  },
+  {
+   "task": "ring_t1_close_docstring",
+   "rev": "pre-28",
+   "a_is": "head",
+   "judge": {
+    "better": "tie",
+    "note": "Both diffs make the identical minimal docstring update."
+   }
+  },
+  {
+   "task": "ring_t1_pop1866",
+   "rev": "pre-28",
+   "a_is": "pre-28",
+   "judge": {
+    "better": "tie",
+    "note": "Both diffs add the requested :pop1866 entry with the exact lowercase pattern while preserving existing entries."
+   }
+  },
+  {
+   "task": "ring_t1_rename_piped_locals",
+   "rev": "pre-28",
+   "a_is": "pre-28",
+   "judge": {
+    "better": "A",
+    "note": "Diff A correctly preserves the original behavior by returning the renamed input stream binding `is`, whereas Diff B incorrectly returns `os`."
+   }
+  },
+  {
+   "task": "ring_t2_rename_dissoc_header",
+   "rev": "pre-28",
+   "a_is": "pre-28",
+   "judge": {
+    "better": "tie",
+    "note": "Both diffs make the same minimal rename of the definition and call site."
+   }
+  },
+  {
+   "task": "ds_t1_max_addr",
+   "rev": "pre-26",
+   "a_is": "pre-26",
+   "judge": {
+    "better": "tie",
+    "note": "Both diffs make the same minimal, correct change to raise the initial *max-addr value from 1,000,000 to 10,000,000."
+   }
+  },
+  {
+   "task": "ds_t1_maybe_adapt_docstring",
+   "rev": "pre-26",
+   "a_is": "head",
+   "judge": {
+    "better": "tie",
+    "note": "Both diffs are identical and add the required docstring minimally."
+   }
+  },
+  {
+   "task": "kondo_t1_cache_file_docstring",
+   "rev": "pre-26",
+   "a_is": "head",
+   "judge": {
+    "better": "tie",
+    "note": "Both diffs add the exact requested docstring in the idiomatic position and are otherwise identical."
+   }
+  },
+  {
+   "task": "kondo_t1_rename_from_cache_local",
+   "rev": "pre-26",
+   "a_is": "head",
+   "judge": {
+    "better": "tie",
+    "note": "Both diffs make the exact requested rename with no other changes, so they are equivalent."
+   }
+  },
+  {
+   "task": "ring_t1_close_docstring",
+   "rev": "pre-26",
+   "a_is": "pre-26",
+   "judge": {
+    "better": "tie",
+    "note": "Both diffs make the identical minimal docstring update."
+   }
+  },
+  {
+   "task": "ring_t1_pop1866",
+   "rev": "pre-26",
+   "a_is": "pre-26",
+   "judge": {
+    "better": "tie",
+    "note": "Both diffs add the same :pop1866 entry with the required pattern while preserving the existing entries."
+   }
+  },
+  {
+   "task": "ring_t1_rename_piped_locals",
+   "rev": "pre-26",
+   "a_is": "head",
+   "judge": {
+    "better": "B",
+    "note": "B correctly returns the renamed input stream binding is, while A incorrectly returns os."
+   }
+  },
+  {
+   "task": "ring_t2_rename_dissoc_header",
+   "rev": "pre-26",
+   "a_is": "pre-26",
+   "judge": {
+    "better": "tie"
+   }
+  },
+  {
+   "task": "ring_t3_parse_date_nil",
+   "rev": "pre-26",
+   "a_is": "pre-26",
+   "judge": {
+    "better": "A",
+    "note": "A includes regression tests for the nil and invalid-input cases while making the same minimal, correct source fix as B."
+   }
+  },
+  {
+   "task": "ds_t1_max_addr",
+   "rev": "pre-15",
+   "a_is": "head",
+   "judge": {
+    "better": "tie",
+    "note": "Both diffs make the same minimal, correct change to the initial *max-addr value."
+   }
+  },
+  {
+   "task": "ds_t1_maybe_adapt_docstring",
+   "rev": "pre-15",
+   "a_is": "pre-15",
+   "judge": {
+    "better": "tie",
+    "note": "Both diffs add the required docstring identically and minimally."
+   }
+  },
+  {
+   "task": "ds_t2_rename_store_impl",
+   "rev": "pre-15",
+   "a_is": "pre-15",
+   "judge": {
+    "better": "tie",
+    "note": "Both diffs are identical and correctly rename the function and update all call sites without any other changes."
+   }
+  },
+  {
+   "task": "kondo_t1_rename_from_cache_local",
+   "rev": "pre-15",
+   "a_is": "pre-15",
+   "judge": {
+    "better": "tie",
+    "note": "Both diffs are identical and correctly rename the binding to reader while updating its use."
+   }
+  },
+  {
+   "task": "ring_t1_close_docstring",
+   "rev": "pre-15",
+   "a_is": "pre-15",
+   "judge": {
+    "better": "tie",
+    "note": "Both diffs make the identical minimal docstring update."
+   }
+  },
+  {
+   "task": "ring_t1_pop1866",
+   "rev": "pre-15",
+   "a_is": "head",
+   "judge": {
+    "better": "tie",
+    "note": "Both diffs are identical and correctly add the requested :pop1866 entry while preserving the existing entries."
+   }
+  },
+  {
+   "task": "ring_t1_rename_piped_locals",
+   "rev": "pre-15",
+   "a_is": "pre-15",
+   "judge": {
+    "better": "A",
+    "note": "Diff A correctly returns the renamed input stream binding `is`, while Diff B incorrectly returns `os`."
+   }
+  },
+  {
+   "task": "ring_t3_parse_date_nil",
+   "rev": "pre-15",
+   "a_is": "head",
+   "judge": {
+    "better": "B",
+    "note": "Both fix the nil case identically, but B is better because it adds minimal regression tests for nil and invalid input while preserving existing behavior."
+   }
+  },
+  {
+   "task": "ds_t2_rename_store_impl",
+   "rev": "pre-35",
+   "a_is": "pre-35",
+   "judge": {
+    "better": "tie",
+    "note": "Both diffs are identical and correctly rename the definition and all call sites with no other changes."
+   }
+  },
+  {
+   "task": "kondo_t1_docstring_quotes",
+   "rev": "pre-35",
+   "a_is": "head",
+   "judge": {
+    "better": "B",
+    "note": "B places the long docstring on its own line, which is more readable and better suited to typical line-length conventions while remaining correct."
+   }
+  },
+  {
+   "task": "kondo_t2_insert_cache_helpers",
+   "rev": "pre-35",
+   "a_is": "head",
+   "judge": {
+    "error": "IncompleteRead(6222 bytes read, 821 more expected)"
+   }
+  }
+ ]
+}
