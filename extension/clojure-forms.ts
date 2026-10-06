@@ -9,7 +9,12 @@
  * what it means, infers unbalanced brackets from indentation when
  * repair: true (reported, never silent — the default refuses unbalanced
  * content with the candidate), never writes a file that doesn't parse,
- * and reports exactly what changed.
+ * and reports exactly what changed. A multi-form change is ONE batch
+ * (ops: [...]): N ops, one atomic call — every handle resolves against
+ * the original file and each target is tracked across the batch's own
+ * ops (docstring-then-body on one form = two ops, one handle, zero
+ * stale-handle churn; a later op on a form an earlier op removed is a
+ * clean targeted failure, never a silent mis-aim).
  * cljform edit itself reindents the submitted content (parinfer paren mode,
  * default on, `--no-format-content` to disable; `autoFormat: false` maps to
  * that flag) before base-shifting it to the target column;
@@ -82,6 +87,28 @@ interface CljformOutput {
 		wrote?: boolean;
 		/** tree line window (issue 28): requested vs effective span; real file lines. */
 		window?: { requested?: [number, number]; effective?: number[] };
+		/**
+		 * Batch (issue 36): the per-op blocks + the aggregate counts.
+		 * Each op block is the standard single-op result (text, summary,
+		 * changed, untouched, repaired, repairDiff, diff) plus `op`
+		 * (0-based index), `handle` (null for append/prepend), `mode`,
+		 * and `affected` (the affected-rows block). `text` carries the
+		 * composed human view (per-op blocks + the aggregate line).
+		 */
+		applied?: number;
+		ops?: {
+			op: number;
+			handle: string | null;
+			mode: string;
+			text?: string;
+			summary?: any;
+			changed?: number;
+			untouched?: number;
+			repaired?: boolean;
+			repairDiff?: string;
+			diff?: string;
+			affected?: string;
+		}[];
 	};
 	error?: {
 		code: string;
@@ -153,11 +180,12 @@ async function withTempFile(
 	prefix: string,
 	content: string,
 	fn: (tmp: string) => Promise<ToolOutcome>,
+	suffix = ".clj",
 ): Promise<ToolOutcome> {
 	const { writeFileSync, unlinkSync } = await import("node:fs");
 	const { tmpdir } = await import("node:os");
 	const { join } = await import("node:path");
-	const tmp = join(tmpdir(), `cljform-${prefix}-${process.pid}-${Date.now()}.clj`);
+	const tmp = join(tmpdir(), `cljform-${prefix}-${process.pid}-${Date.now()}${suffix}`);
 	writeFileSync(tmp, content);
 	try {
 		return await fn(tmp);
@@ -694,7 +722,15 @@ export default function ClojureForms(pi: ExtensionAPI) {
 			"The file is written only if the result parses and every untouched form is byte-identical. " +
 			"Submitted content is reindented in parinfer paren mode (default on; content the reindent " +
 			"refuses is sent verbatim with a note) and base-shifted to the target's column; patch " +
-			"oldText/newText are never reformatted.",
+			"oldText/newText are never reformatted.\n" +
+			"(3) BATCH (multi-form change → one batch): pass ops: [...] — an array of " +
+			"single-op objects ({handle, mode, content | oldText/newText}); N ops land in ONE atomic " +
+			"call. Every handle resolves against the ORIGINAL file and each op's target is tracked " +
+			"across the batch's own ops, so a docstring-then-body change on one form is two ops " +
+			"sharing one handle (zero stale-handle churn); a later op on a form an earlier op removed " +
+			"or restructured is a clean targeted failure (target-removed), never a silent mis-aim, " +
+			"and nothing is written if any op fails. A batch cannot target forms it CREATES — " +
+			"create-then-edit stays separate calls (use the handle the result reports).",
 		promptGuidelines: [
 			"Read the file with clj_tree first; copy a ⟦handle⟧ and pass it as handle — handles are the only edit target.",
 			"Handles are content-addressed: an unchanged form keeps its handle across edits elsewhere; if it changed, the edit refuses with stale-handle — re-run clj_tree.",
@@ -702,6 +738,7 @@ export default function ClojureForms(pi: ExtensionAPI) {
 			"Small change in a big form → patch mode (oldText/newText); full rewrite → content.",
 			"Fetch exact bytes with clj_get first; edit against them, never re-type from memory.",
 			"mode: replace (default) | patch (needs oldText/newText) | insert-after (anchor: handle) | insert-before (anchor: handle) | append | prepend (file ends, no handle) | delete (needs handle).",
+			"Multi-form change → one batch: pass ops: [...] (array of {handle, mode, ...}). Handles resolve against the original file and each op's target is tracked across the batch — docstring-then-body on one form is two ops sharing one handle, zero refetches. Ops that create forms cannot target them (create-then-edit stays separate calls).",
 			"Address WARNING D1/D2 lines in the result — they mean a form is nested inside another defn/let.",
 			"dryRun: true validates and shows the outcome without writing.",
 			"strict: true (CI mode) refuses detector warnings; together with repair it refuses the repair instead of applying it (repair-refused).",
@@ -753,9 +790,63 @@ export default function ClojureForms(pi: ExtensionAPI) {
 						"Reindent submitted content in parinfer paren mode inside cljform edit before the base shift (default true; false passes --no-format-content so content stays verbatim; patch oldText/newText are never touched)",
 				}),
 			),
+			ops: Type.Optional(
+				Type.Array(
+					Type.Object({
+						handle: Type.Optional(
+							Type.String({
+								description:
+									"The ⟦handle⟧ of the target form (required for replace/patch/delete/insert-after/insert-before; append/prepend take none)",
+							}),
+						),
+						mode: Type.Optional(
+							Type.Union(MODES.map((m) => Type.Literal(m)), { description: "Default replace" }),
+						),
+						content: Type.Optional(
+							Type.String({
+								description:
+									"Full replacement/insertion content (whole form(s)) for non-patch modes; required for replace/insert unless mode=delete",
+							}),
+						),
+						oldText: Type.Optional(
+							Type.String({
+								description: "Patch mode: exact text to replace inside the target form (must occur exactly once there)",
+							}),
+						),
+						newText: Type.Optional(
+							Type.String({ description: "Patch mode: replacement text (may be empty to delete)" }),
+						),
+					}),
+					{
+						description:
+							"Batch (issue 36): an array of ops — N ops in ONE atomic call. Each op is a normal clj_edit op ({handle, mode, content | oldText/newText}); every handle resolves against the ORIGINAL file and each op's target is tracked across the batch, so a docstring-then-body change on one form is two ops sharing one handle. Mutually exclusive with the single-op params (handle/content/oldText/newText/mode); dryRun/strict/repair/autoFormat apply to the whole batch. Ops that create forms cannot target them",
+					},
+				),
+			),
 		}),
 
 		async execute(_toolCallId, params, _signal, _onUpdate) {
+			if (params.ops !== undefined) {
+				const singles = [
+					"handle",
+					"content",
+					"oldText",
+					"newText",
+					"mode",
+				].filter((k) => (params as Record<string, unknown>)[k] !== undefined);
+				if (singles.length > 0) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: `clj_edit: ops (batch) is mutually exclusive with the single-op params: ${singles.join(", ")}`,
+							},
+						],
+						isError: true,
+					};
+				}
+				return await runBatchEdit(params);
+			}
 			const mode = params.mode ?? (params.oldText !== undefined ? "patch" : "replace");
 			// Validate payload vs mode.
 			if (mode !== "delete" && mode !== "patch" && params.content === undefined) {
@@ -905,7 +996,108 @@ export default function ClojureForms(pi: ExtensionAPI) {
 		return { content: [{ type: "text", text: lines.join("\n") }], details: { forms: out.forms, result: r } };
 	}
 
-	// ─── guard hook on built-in edit/write ──────────────────────────────────
+	// Issue 36: N ops in ONE atomic call. The CLI resolves every handle
+	// against the ORIGINAL file and tracks each target across the batch's
+	// own ops; the wrapper validates the per-op shape (same contract as the
+	// single-op params), writes the ops to a temp JSON file, passes --batch.
+	async function runBatchEdit(params: {
+		path: string;
+		ops: Array<Record<string, any>>;
+		dryRun?: boolean;
+		strict?: boolean;
+		repair?: boolean;
+		autoFormat?: boolean;
+	}): Promise<ToolOutcome> {
+		const opsList = params.ops;
+		if (!Array.isArray(opsList) || opsList.length === 0) {
+			return { content: [{ type: "text", text: "clj_edit batch: ops must be a non-empty array" }], isError: true };
+		}
+		for (let i = 0; i < opsList.length; i++) {
+			const o = opsList[i];
+			const mode = o.mode ?? (o.oldText !== undefined ? "patch" : "replace");
+			if (!MODES.includes(mode as (typeof MODES)[number])) {
+				return { content: [{ type: "text", text: `clj_edit batch op ${i + 1}: unknown mode ${JSON.stringify(mode)}` }], isError: true };
+			}
+			if (mode !== "delete" && mode !== "patch" && o.content === undefined) {
+				return { content: [{ type: "text", text: `clj_edit batch op ${i + 1}: ${mode} requires content` }], isError: true };
+			}
+			if (mode === "patch" && (o.oldText === undefined || o.newText === undefined)) {
+				return {
+					content: [{ type: "text", text: `clj_edit batch op ${i + 1}: patch requires oldText and newText` }],
+					isError: true,
+				};
+			}
+			if ((o.oldText !== undefined || o.newText !== undefined) && mode !== "patch") {
+				return { content: [{ type: "text", text: `clj_edit batch op ${i + 1}: oldText/newText only apply to mode "patch"` }], isError: true };
+			}
+			const needsHandle = mode !== "append" && mode !== "prepend";
+			if (o.handle !== undefined && !needsHandle) {
+				return { content: [{ type: "text", text: `clj_edit batch op ${i + 1}: append/prepend are file-level and take no handle` }], isError: true };
+			}
+			if (needsHandle && (o.handle === undefined || o.handle === "")) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `clj_edit batch op ${i + 1}: ${mode} requires handle — run clj_tree and copy the target form's ⟦handle⟧`,
+						},
+					],
+					isError: true,
+				};
+			}
+		}
+		const args = ["edit", params.path, "--json"];
+		if (params.dryRun) args.push("--dry-run");
+		if (params.strict) args.push("--strict");
+		if (params.repair) args.push("--repair");
+		if (params.autoFormat === false) args.push("--no-format-content");
+		return await withTempFile(
+			"batch",
+			JSON.stringify(opsList),
+			async (tmp) => {
+				args.push("--batch", tmp);
+				const run = await runClj(args, 30_000);
+				if (!run.ok) return run.result;
+				const out = run.out;
+				if (!params.dryRun) remember(params.path, out.forms);
+				const r = out.result ?? {};
+				// result.text is the CLI's composed view: one block per op
+				// (summary line + changed-region diff + affected rows) plus the
+				// aggregate counts — render as-is (each diff appears exactly once).
+				const lines: string[] = [r.text ?? "done"];
+				// Per-op next-handle affordance (issue 36): source from the JSON
+				// envelope's per-op summaries (the composed text carries the
+				// diffs, the envelope carries the post-batch handles).
+				const next: string[] = [];
+				for (const op of r.ops ?? []) {
+					const s: any = op.summary ?? {};
+					const label = `op ${op.op}`;
+					if (s.action === "replaced" || s.action === "patched") {
+						const h = s.handle ?? s.wasHandle;
+						if (h) next.push(`${label}: next handle ⟦${h}⟧`);
+					} else if (s.action === "inserted" && s.handle) {
+						next.push(`${label}: inserted ⟦${s.handle}⟧`);
+					}
+				}
+				if (next.length > 0) {
+					lines.push("");
+					lines.push("next handles (post-batch):");
+					for (const l of next) lines.push(`  ${l}`);
+				}
+				if (out.forms) {
+					lines.push(`file now: ${out.forms.length} forms · ${shapeSummary(out.forms)}`);
+				}
+				for (const n of out.notes ?? []) lines.push(`note: ${n}`);
+				lines.push(...warningsText(out.warnings ?? []));
+				if (params.dryRun) lines.push("(dry run — nothing written)");
+				return {
+					content: [{ type: "text", text: lines.join("\n") }],
+					details: { forms: out.forms, result: r },
+				};
+			},
+			".json",
+		);
+	}
 
 	pi.on("tool_result", async (event) => {
 		if (event.type !== "tool_result") return;

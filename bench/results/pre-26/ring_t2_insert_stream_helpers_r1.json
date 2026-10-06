@@ -1,0 +1,58 @@
+{
+ "task": "ring_t2_insert_stream_helpers",
+ "tier": 2,
+ "repo": "ring",
+ "rev": "pre-26",
+ "rep": 1,
+ "success": true,
+ "checks": {
+  "done": {
+   "pass": true,
+   "detail": "string-output-stream, piped-output-stream and close-all! all present"
+  },
+  "collateral": {
+   "pass": true,
+   "changedFiles": [
+    "ring-core/src/ring/util/io.clj"
+   ],
+   "detail": "no collateral"
+  },
+  "tests": {
+   "run": false
+  }
+ },
+ "lintDelta": {
+  "newErrors": 0,
+  "newWarnings": 0,
+  "newFindings": []
+ },
+ "diff": "diff --git a/ring-core/src/ring/util/io.clj b/ring-core/src/ring/util/io.clj\nindex d43e48a..1040fac 100644\n--- a/ring-core/src/ring/util/io.clj\n+++ b/ring-core/src/ring/util/io.clj\n@@ -1,10 +1,11 @@\n (ns ring.util.io\n   \"Utility functions for handling I/O.\"\n   (:import [java.io PipedInputStream\n             PipedOutputStream\n             ByteArrayInputStream\n+            ByteArrayOutputStream\n             File\n             IOException]))\n \n (defn piped-input-stream\n   \"Create an input stream from a function that takes an output stream as its\n@@ -50,5 +51,44 @@\n   {:added \"1.2\"}\n   [^File file]\n   (-> (.lastModified file)\n       (/ 1000) (long) (* 1000)\n       (java.util.Date.)))\n+\n+(defn string-output-stream\n+  \"Returns a ByteArrayOutputStream for the given String.\"\n+  {:added \"1.2\"}\n+  ([^String s]\n+   (let [bytes (.getBytes s)]\n+     (doto (ByteArrayOutputStream.) (.write bytes))))\n+  ([^String s ^String encoding]\n+   (let [bytes (.getBytes s encoding)]\n+     (doto (ByteArrayOutputStream.) (.write bytes)))))\n+\n+(defn piped-output-stream\n+  \"Create an output stream from a function that takes an input stream as its\n+  argument. The function will be executed in a separate thread. The stream\n+  will be automatically closed after the function finishes.\n+\n+  For example:\n+\n+    (with-open [istream (piped-output-stream\n+                           (fn [istream]\n+                             (println (.readLine istream))))]\n+      (.write istream (byte-array 5 0))))\"\n+  {:added \"1.2\"}\n+  [func]\n+  (let [input  (PipedInputStream.)\n+        output (PipedOutputStream.)]\n+    (.connect input output)\n+    (future\n+      (try\n+        (func input)\n+        (finally (.close input))))\n+    output))\n+\n+(defn close-all!\n+  \"Ensure all streams are closed, swallowing any exceptions.\"\n+  {:added \"1.2\"}\n+  [streams]\n+  (doseq [stream streams]\n+    (close! stream)))\n",
+ "taskStatement": "The file ring-core/src/ring/util/io.clj has input-stream helpers (`piped-input-stream`, `string-input-stream`) but no output counterparts. Add three public stream helpers in the same style:\n1. `string-output-stream` \u2014 returns a java.io.ByteArrayOutputStream containing the given String's bytes; two arities: [s] and [s encoding].\n2. `piped-output-stream` \u2014 the output-stream twin of `piped-input-stream`: takes a function of an input stream, runs it in a separate thread on a piped input stream, and returns the connected output stream.\n3. `close-all!` \u2014 takes a collection of streams and closes each one, swallowing exceptions, reusing the existing `close!`.",
+ "metrics": {
+  "tokens": {
+   "input": 202217,
+   "output": 7251,
+   "cacheRead": 0,
+   "cacheWrite": 0,
+   "reasoning": 0,
+   "total": 209468
+  },
+  "toolCalls": {
+   "read": 1,
+   "edit": 1,
+   "clj_edit": 3,
+   "bash": 13,
+   "clj_get": 1
+  },
+  "turns": 20,
+  "refusals": {
+   "total": 0
+  },
+  "refetches": 0
+ },
+ "wall": 170.1,
+ "run": {
+  "exitCode": 0,
+  "session": "/home/gary/dev/cljform/bench/results/pre-26/ring_t2_insert_stream_helpers_r1.session.jsonl"
+ }
+}

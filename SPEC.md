@@ -126,7 +126,9 @@ cljform [--json|--human] <op> [args]
   - `3` — targeting/refusal: `form-not-found`, `ambiguous`, `stale-handle`,
     `ambiguous-handle`, `patch-not-found`, `patch-ambiguous`,
     `unbalanced-content` (unbalanced content, inference is opt-in),
-    `repair-refused` (`--strict` beats `--repair`)
+    `repair-refused` (`--strict` beats `--repair`), `target-removed`
+    (batch, issue 36: a later op targets a form an earlier op removed or
+    replaced)
   - `4` — I/O error: `io` (unreadable file, write failure)
 - **Residual-panic backstop (issue 30).** Every envelope op runs inside
   a `catch_unwind` at the dispatch boundary. A residual panic (always a
@@ -494,7 +496,7 @@ session.
 | `clj_forms` | `{path}` | `cljform forms --json`; refreshes the fingerprint cache |
 | `clj_tree` | `{path, name?, depth?, json?, startLine?, endLine?, recover?}` | `cljform tree` — the primary handle-discovery view (`--depth N\|all`); `name` maps to `--name SYM` (the §10.2 selector: matched subtrees at full depth, zero matches is an ok empty result); `json` returns the structured node list; `startLine`/`endLine` map to `--start-line`/`--end-line` (the §10.2 line window: complete forms only, real file line numbers, the effective span echoed — page large files; the window header/echo passes through unchanged); `recover` maps to `--recover` (the §10.2 broken-file recovery view: on a broken file the JSON path renders the diagnostics + intact-form labels + window echo — no handles; on a healthy file the normal view). **Human path (default, `--human`) is a pass-through:** the annotated source is not a JSON envelope, so on exit 0 the wrapper returns `stdout` directly (BOM-stripped, `trimEnd`) with no `isError` — a successful default `clj_tree` is never an error and is never prefixed `cljform failed:`. Only a nonzero exit (or, in `json` mode, an unparseable/`ok:false` envelope) yields `isError`, using `errorText` when the output parses as an error envelope, else the `cljform failed: ${stderr \|\| stdout}` fallback. **Large-file default (issue 33 Part B):** a DEFAULT call (no `name`/`json`/`depth`/`startLine`/`endLine`/`recover`) on a file with MORE than `TREE_INDEX_THRESHOLD_LINES` (300, a wrapper constant) lines returns the compressed **FORM INDEX** instead of the whole annotated dump: a header `large file: N lines, M top-level forms — showing the form index (handles are live). Annotated view: pass startLine/endLine; a specific form: name.` then one `⟦handle⟧ head name (lines X–Y)` row per top-level form, sorted by line (the `--name`-block label style), with NO source body. The rows come from `cljform tree --json --depth 1` (a small payload since issue 33 Part A); a nonzero exit from that call surfaces as the same error result as the normal path. The index scales with form count, the annotated view with file size — the default picks the right tool instead of the biggest dump. Explicit calls are honored exactly and uncapped (`startLine`/`endLine` → the windowed annotated view; `name` → the selector view; `json` → the node table; `depth` → the cutoff), and below the threshold the pass-through is byte-identical (the CLI's own `tree` contract is unchanged — the wrapper owns the agent ergonomics) |
 | `clj_get` | `{path, name? / handle?}` | `cljform get --json` — exact bytes + the form's `⟦handle⟧` |
-| `clj_edit` | `{path, handle?, mode?, content? / oldText? + newText?, dryRun?, strict?, repair?, autoFormat?}` | `cljform edit --handle …` — mode auto-selects `patch` when `oldText` is present; append/prepend take no handle; `dryRun` ⇒ `--dry-run`, `strict` ⇒ `--strict`, `repair` ⇒ `--repair`; `autoFormat` (default true) maps to the in-edit content reindent: `false` passes `--no-format-content`, `true` (the default) passes nothing and lets `cljform edit` reindent the content itself in parinfer paren mode (§10.3/§10.5; a refused reindent is reported by the CLI as a note, the edit never fails for it); the wrapper no longer runs a separate `cljform format` call; `oldText`/`newText` are exact patch text and are never reformatted. **Next-handle affordance (issue 35):** on every successful (non-dry-run) edit the wrapper appends a final line sourced from the JSON envelope (`result.summary`), never from re-parsing the human text — `replace`/`patch` append `next handle: ⟦H⟧ — use it for the next edit to this form` (from `summary.handle`; falls back to `summary.wasHandle` only when `handle` is absent) so the agent chases the returned handle instead of re-fetching; `insert-after`/`insert-before` render `summary.inserted` (one labeled entry per top-level inserted form, §10.3 insert response contract) as a self-sufficient block — `inserted after ⟦anchor⟧:` / `  ⟦handle⟧ head name (lines a–b)` per entry / `— use these for the next edit` — and a SINGLE-entry insert collapses to the established `next handle:` line instead; `delete` appends nothing (the form is gone — no stale handle). Old envelopes (pre-issue-35 `summary.handles`) still render the legacy bare list |
+| `clj_edit` | `{path, handle?, mode?, content? / oldText? + newText?, dryRun?, strict?, repair?, autoFormat?, ops?}` | `cljform edit --handle …` — mode auto-selects `patch` when `oldText` is present; append/prepend take no handle; `dryRun` ⇒ `--dry-run`, `strict` ⇒ `--strict`, `repair` ⇒ `--repair`; `autoFormat` (default true) maps to the in-edit content reindent: `false` passes `--no-format-content`, `true` (the default) passes nothing and lets `cljform edit` reindent the content itself in parinfer paren mode (§10.3/§10.5; a refused reindent is reported by the CLI as a note, the edit never fails for it); the wrapper no longer runs a separate `cljform format` call; `oldText`/`newText` are exact patch text and are never reformatted. **Batch (issue 36):** `ops` (an array of `{handle?, mode?, content? / oldText? + newText?}`) takes precedence over the single-op params (passing both is a wrapper-side usage error) and maps to `cljform edit --batch <tempfile>` — N ops in one atomic call, every handle resolved against the ORIGINAL file and each target tracked across the batch (§10.3 batch contract); the wrapper validates each op's shape up front (same contract as the single-op params, the error names the op index) and renders `result.text` (the composed per-op blocks + aggregate line) as-is, then appends a `next handles (post-batch):` block sourced from the per-op `result.ops[*].summary` (replaced/patched → the new handle; inserted → the inserted handle) so the agent chases post-batch handles without a `clj_tree` round-trip; `dryRun/strict/repair/autoFormat` apply to the whole batch **Next-handle affordance (issue 35):** on every successful (non-dry-run) edit the wrapper appends a final line sourced from the JSON envelope (`result.summary`), never from re-parsing the human text — `replace`/`patch` append `next handle: ⟦H⟧ — use it for the next edit to this form` (from `summary.handle`; falls back to `summary.wasHandle` only when `handle` is absent) so the agent chases the returned handle instead of re-fetching; `insert-after`/`insert-before` render `summary.inserted` (one labeled entry per top-level inserted form, §10.3 insert response contract) as a self-sufficient block — `inserted after ⟦anchor⟧:` / `  ⟦handle⟧ head name (lines a–b)` per entry / `— use these for the next edit` — and a SINGLE-entry insert collapses to the established `next handle:` line instead; `delete` appends nothing (the form is gone — no stale handle). Old envelopes (pre-issue-35 `summary.handles`) still render the legacy bare list |
 | `clj_draft` | `{content}` | `cljform materialize --content-file …` — returns candidate + diff; never writes |
 
 **Fingerprint cache:** in-memory `Map<realpath, forms>`. Refreshed on every
@@ -798,6 +800,50 @@ collection delimiter:
   `— use these for the next edit`); a single-entry insert collapses to the
   established `next handle:` line. The affected-rows block (issue 32) is
   unchanged.
+- **Batch contract (issue 36).** `edit <file> --batch OPS.json` — N edit
+  ops in ONE atomic call. `OPS.json` is a JSON array of per-op objects
+  shaped like the single-op flags: `{"handle", "mode", "content" |` /
+  `{"handle", "mode", "oldText", "newText"}` (`mode` defaults to
+  `replace`; `append`/`prepend` take no handle; `delete` takes none
+  else). The batch is a usage error (exit 2) if it is not an array, any
+  op is not an object with a valid mode, or any op violates a single-op
+  field rule — the error names the offending op's index.
+- **Every op resolves against the ORIGINAL file.** Each op's handle is
+  resolved against the pre-batch node table — never an intermediate
+  state — so one `tree` run feeds the whole batch: docstring-then-body
+  on one form is two ops sharing one handle. For each target the engine
+  tracks its own position chain (its address in the evolving node table)
+  and re-resolves it before every op: earlier ops that MOVE the target
+  (an insert before/after its parent, a `prepend`, a top-level delete
+  before it, a nested restructure keeping it inside a rewritten form)
+  are transparent; a later op on a form an earlier op REMOVED or
+  REPLACED is a clean targeted failure — `target-removed` (exit 3),
+  naming the op that removed it — never a silent mis-aim and never a
+  `stale-handle` false alarm.
+- **Sequential application, per-op verification, atomic write.** Ops are
+  applied in order to the evolving in-memory file, each through the full
+  single-op pipeline (resolve → patch/replace → I1 parse → I2
+  untouched-forms byte-identical + boundary check → I3 form-count window
+  → strict/repair gates). Any failing op fails the whole batch: nothing
+  is written, and the error envelope is the failing op's single-op
+  envelope prefixed with its 0-based index (`batch op N: …`).
+- **Result shape.** The `--json` envelope keeps the issue-32 result-first
+  shape: `result` gains `applied` (op count) and `ops` — one block per
+  op: `{op (0-based), handle (null for append/prepend), mode, …the
+  single-op result fields…}` (text, summary, changed/untouched,
+  repaired/repairDiff, diff, affected rows). The human `result.text` is
+  the composed view: one block per op (summary line, changed-region
+  diff, affected rows) plus a single aggregate line `N ops applied;
+  file: F forms; C changed, U untouched`. Top-level `forms`/
+  `formsCount`, `warnings`, and `notes` reflect the post-batch file.
+- **Non-goal (by design).** Batch ops cannot target forms the batch
+  CREATES — create-then-target stays separate calls (re-run `tree`, or
+  use the handles the insert summary reports). Cross-op templating (an
+  op referencing another op's output text) is likewise out of scope: ops
+  are independent edits sharing one atomic file.
+- **Batch-of-one is the single op.** `--batch` with exactly one op writes
+  a byte-identical file to the equivalent single-op call (the pipeline
+  is shared; only the response shape differs).
 
 ### 10.4 Content ingest
 

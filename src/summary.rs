@@ -304,9 +304,15 @@ pub(crate) fn human_summary(summary: &serde_json::Value, shape: &invariants::Sha
         _ => String::new(),
     }
 }
-/// Issue 32 (A): the human-only edit-result block — the AFFECTED form's
-/// row(s) in the forms-table row format, with the handle, plus the counts
-/// line. No whole-file table at any size:
+// Eight parameters (mode-adjacent view data + post/pre form tables + the
+// post-edit node table): a parameter struct is clearer than dropping any
+// of them — one documented allow, same convention as `run_edit`.
+#[allow(clippy::too_many_arguments)]
+/// The issue-32 affected block as parts: the AFFECTED form's row(s) in the
+/// forms-table row format (with the handle), and the counts line, returned
+/// separately — the single edit composes both (rows + counts line), the
+/// batch driver (issue 36) takes the rows alone and composes its own
+/// aggregate line. No whole-file table at any size:
 /// - replaced/patched: the post-edit top-level form(s) intersecting the
 ///   changed window (the new form at top level; the enclosing form for a
 ///   nested edit);
@@ -321,11 +327,7 @@ pub(crate) fn human_summary(summary: &serde_json::Value, shape: &invariants::Sha
 ///
 /// `window` is the POST-edit changed region [lo, hi); `pre_node` is the
 /// pre-edit target (None for append/prepend).
-// Eight parameters (mode-adjacent view data + post/pre form tables + the
-// post-edit node table): a parameter struct is clearer than dropping any
-// of them — one documented allow, same convention as `run_edit`.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn human_affected_block(
+pub(crate) fn human_affected_parts(
     file: &Path,
     forms: &[Form],
     pre_forms: &[Form],
@@ -334,7 +336,7 @@ pub(crate) fn human_affected_block(
     shape: &invariants::ShapeCheck,
     window: (usize, usize),
     pre_node: Option<&handle::Node>,
-) -> String {
+) -> (Vec<String>, String) {
     let (lo, hi) = window;
     let intersects = |f: &Form| f.start_byte < hi && f.end_byte > lo;
     // Zero-length window (a patch whose --new-text is empty): contain the
@@ -411,11 +413,7 @@ pub(crate) fn human_affected_block(
         shape.untouched,
         file.display()
     );
-    if rows.is_empty() {
-        counts
-    } else {
-        format!("{}\n{}", rows.join("\n"), counts)
-    }
+    (rows, counts)
 }
 
 /// One post-edit top-level form as a table row (the forms-table format)

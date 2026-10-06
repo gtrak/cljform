@@ -22,7 +22,8 @@ pub mod exit {
     pub const USAGE: u8 = 2;
     /// Targeting/refusal: `form-not-found`, `ambiguous`, `stale-handle`,
     /// `ambiguous-handle`, `patch-not-found`, `patch-ambiguous`,
-    /// `unbalanced-content`, `repair-refused`.
+    /// `unbalanced-content`, `repair-refused`, `target-removed` (a batch op
+    /// targets a form an earlier batch op removed or restructured, issue 36).
     pub const TARGET: u8 = 3;
     /// I/O failure (file/stdin read, stdout/file write).
     pub const IO: u8 = 4;

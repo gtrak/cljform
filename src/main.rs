@@ -29,7 +29,7 @@ use std::process::ExitCode;
 
 use clap::Parser as _;
 
-use cli::Cli;
+use cli::{Cli, Mode};
 use errors::{ErrorBody, Fail, Output};
 
 /// Test-only panic-injection hook (issue 30 L3): when set, `dispatch`
@@ -151,15 +151,35 @@ fn dispatch(cli: &Cli) -> Result<Output, Fail> {
             old_text,
             new_text,
             handle,
+            batch,
             dry_run,
             strict,
             repair,
             format_content,
             no_format_content,
-        } => edit::run_edit(
-            file, *mode, content, content_file, old_text, new_text, handle, *dry_run, *strict,
-            *repair, *format_content || !*no_format_content,
-        ),
+        } => {
+            let format_content = *format_content || !*no_format_content;
+            // Issue 36: `--batch` is the whole op (clap enforces the
+            // conflict with the single-op payload flags); it composes with
+            // the batch-wide flags only.
+            if let Some(batch_file) = batch {
+                edit::run_batch_edit(file, batch_file, *dry_run, *strict, *repair, format_content)
+            } else {
+                edit::run_edit(
+                    file,
+                    mode.unwrap_or(Mode::Replace),
+                    content,
+                    content_file,
+                    old_text,
+                    new_text,
+                    handle,
+                    *dry_run,
+                    *strict,
+                    *repair,
+                    format_content,
+                )
+            }
+        }
         cli::Op::Tree {
             file,
             depth,

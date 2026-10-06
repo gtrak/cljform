@@ -641,14 +641,92 @@ pub fn run_edit(
     format_content: bool,
 ) -> Result<Output, Fail> {
     let (bytes, had_bom) = read_file(file)?;
-    let parsed = parse_or_fail(&bytes, "file")?;
-    let before_forms = parsed.forms.clone();
+    // Parse gate BEFORE target resolution (error order: an unparseable file
+    // refuses with parse-error, whatever the handle says). The op re-parses
+    // the same bytes for its form table; the gate keeps the contract.
+    parse_or_fail(&bytes, "file")?;
 
     // Target (SPEC §5/§10.3): --handle for replace/patch/delete/
     // insert-before/insert-after; append and prepend are file-level and
     // take no target.
     let (handle_node, handle_stripped) =
         resolve_edit_target(&bytes, mode, handle_opt, file)?;
+    run_edit_op(
+        file,
+        &bytes,
+        had_bom,
+        mode,
+        content,
+        content_file,
+        old_text,
+        new_text,
+        handle_node,
+        handle_stripped,
+        dry_run,
+        !dry_run,
+        strict,
+        repair,
+        format_content,
+    )
+    .map(|o| o.output)
+}
+
+/// One fully-verified op, in memory. The shared per-op pipeline (issue 36):
+/// parse gate, payload building, splice planning/application, and the full
+/// verification tail (boundary proof, I1–I3, detectors) — exactly the single
+/// `edit` pipeline, runnable against ANY byte state. A standalone edit
+/// (`run_edit`) calls it once on the on-disk bytes; a batch (`run_batch_edit`)
+/// calls it per op on the evolving bytes and writes ONCE, after every op
+/// verifies — so a batch op is verified exactly as a standalone edit, and a
+/// single-op batch is behaviorally identical to the equivalent single edit.
+///
+/// `write` decides whether the verified bytes are written to `file` NOW:
+/// true for a standalone non-dry-run edit, false for every batch op (the
+/// batch driver composes all ops and performs the single atomic write).
+pub struct OpOutcome {
+    /// The op's envelope (its `result` is the standard single-op result:
+    /// text, summary, changed, untouched, repaired, repairDiff, diff, wrote).
+    pub output: Output,
+    /// The evolving bytes after this op (the write candidate for the batch).
+    pub new_bytes: Vec<u8>,
+    /// The pre-op target's position chain (None for append/prepend).
+    pub target_chain: Option<Vec<u32>>,
+    /// The pre-op splice window (lo, hi) actually touched — zero-width for
+    /// inserts (the position itself).
+    pub window: (usize, usize),
+    /// Top-level forms this op contributed (content modes: the prepared
+    /// content's form count; patch/delete: 0) — the shift bookkeeping's
+    /// input, cross-checked by I3's verified form-count window.
+    pub contributed: usize,
+    /// The POST-op node table (the next op's re-anchor + residual check,
+    /// and the batch's final state for the last op).
+    pub new_nodes: Vec<handle::Node>,
+    /// The POST-op affected rows (the human block without the counts line —
+    /// the batch composes its own aggregate line).
+    pub affected_rows: Vec<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_edit_op(
+    file: &Path,
+    bytes: &[u8],
+    had_bom: bool,
+    mode: Mode,
+    content: &Option<String>,
+    content_file: &Option<PathBuf>,
+    old_text: &Option<String>,
+    new_text: &Option<String>,
+    target: Option<handle::Node>,
+    handle_stripped: bool,
+    dry_run: bool,
+    write: bool,
+    strict: bool,
+    repair: bool,
+    format_content: bool,
+) -> Result<OpOutcome, Fail> {
+    let parsed = parse_or_fail(bytes, "file")?;
+    let before_forms = parsed.forms.clone();
+    let handle_node = target;
 
     // Notes accumulate here (marker-strip / reindent).
     let mut notes: Vec<String> = Vec::new();
@@ -664,7 +742,7 @@ pub fn run_edit(
         Mode::Delete => None,
         Mode::Patch => match handle_node.as_ref() {
             Some(node) => {
-                Some(build_patch_payload(&bytes, old_text, new_text, node, &mut notes)?
+                Some(build_patch_payload(bytes, old_text, new_text, node, &mut notes)?
                 )
             }
             // resolve_edit_target already refused a patch without --handle
@@ -678,14 +756,14 @@ pub fn run_edit(
             }
         },
         _ => Some(build_prepared_payload(
-            mode, content, content_file, handle_node.as_ref(), &bytes, strict, repair,
+            mode, content, content_file, handle_node.as_ref(), bytes, strict, repair,
             format_content, &mut notes,
         )?),
     };
 
     // Splice + allowed-change window + actual splice window (lo, hi).
     let (sp, allowed, mut bound) =
-        plan_splice(mode, &bytes, &before_forms, handle_node.as_ref(), &payload)?;
+        plan_splice(mode, bytes, &before_forms, handle_node.as_ref(), &payload)?;
 
     // Issue 27 (F13): a delete of the last form must not leave MORE
     // trailing blank lines at EOF than the input had — the file's
@@ -714,7 +792,7 @@ pub fn run_edit(
                 t
             }
         };
-        let k = result_units.saturating_sub(seam::trailing_eol_units(&bytes));
+        let k = result_units.saturating_sub(seam::trailing_eol_units(bytes));
         if k > 0 {
             let (start, end) = if end < bytes.len() {
                 let t = seam::trailing_eol_units(&bytes[end..]);
@@ -740,7 +818,7 @@ pub fn run_edit(
         sp
     };
 
-    let mut new_bytes = splice::apply(&bytes, &before_forms, &sp);
+    let mut new_bytes = splice::apply(bytes, &before_forms, &sp);
 
     // R3 seam (issue 14, delete): a delete that leaves only the displaced
     // parent closers on its anchor's line pulls them onto the previous
@@ -750,11 +828,11 @@ pub fn run_edit(
     // splice is kept.
     if mode == Mode::Delete && handle_node.is_some() {
         let (start, end) = bound;
-        if let Some(window) = seam::pull_displaced_closers(&bytes, &mut new_bytes, start, end) {
+        if let Some(window) = seam::pull_displaced_closers(bytes, &mut new_bytes, start, end) {
             if parser::parse(&new_bytes).is_ok() {
                 bound = window;
             } else {
-                new_bytes = splice::apply(&bytes, &before_forms, &sp);
+                new_bytes = splice::apply(bytes, &before_forms, &sp);
             }
         }
     }
@@ -762,7 +840,7 @@ pub fn run_edit(
     // Verification tail: boundary proof, post-splice parse, untouched
     // forms, strict detector gate.
     let (after_parsed, shape, warnings) = verify_edit(
-        &bytes,
+        bytes,
         &new_bytes,
         &before_forms,
         handle_node.as_ref(),
@@ -775,7 +853,7 @@ pub fn run_edit(
     match (&payload, mode) {
         (Some(content::Payload::Prepared(p)), Mode::Replace) => {
             let new_text = String::from_utf8_lossy(&new_bytes).to_string();
-            let old_text = String::from_utf8_lossy(&bytes).to_string();
+            let old_text = String::from_utf8_lossy(bytes).to_string();
             if new_text == old_text && !p.repaired {
                 notes.push("no-op: content identical to the target form".to_string());
             }
@@ -806,14 +884,15 @@ pub fn run_edit(
     // never a second.
     let new_nodes = handle::collect(&new_bytes);
     let (summary_val, summary_notes) = if let Some(node) = handle_node.as_ref() {
-        summary::build_handle_summary(mode, node, &bytes, &new_bytes, &new_nodes, &payload, bound)
+        summary::build_handle_summary(mode, node, bytes, &new_bytes, &new_nodes, &payload, bound)
     } else {
         (summary::append_prepend_summary(&after_parsed, &allowed), Vec::new())
     };
     notes.extend(summary_notes);
     // Issue 32 (A): the human affected-rows block (computed before the
-    // Output takes ownership of after_parsed.forms).
-    let human_rows = summary::human_affected_block(
+    // Output takes ownership of after_parsed.forms). The batch driver
+    // (issue 36) takes the rows alone and composes its own aggregate line.
+    let (affected_rows, counts_line) = summary::human_affected_parts(
         file,
         &after_parsed.forms,
         &before_forms,
@@ -823,6 +902,11 @@ pub fn run_edit(
         post_window,
         handle_node.as_ref(),
     );
+    let human_rows = if affected_rows.is_empty() {
+        counts_line
+    } else {
+        format!("{}\n{}", affected_rows.join("\n"), counts_line)
+    };
 
     // Issue 27 (F12): every mutating op carries a unified diff of its
     // changed region in the result — patch already scopes its diff to
@@ -833,7 +917,7 @@ pub fn run_edit(
     // file bytes are unchanged) keeps its empty diff.
     let diff = match &payload {
         Some(content::Payload::Patch { diff, .. }) => diff.clone(),
-        _ if new_bytes == bytes => String::new(),
+        _ if new_bytes.as_slice() == bytes => String::new(),
         _ => {
             let old = String::from_utf8_lossy(&bytes[lo..hi]).to_string();
             let new = String::from_utf8_lossy(&new_bytes[lo..lo + content_len]).to_string();
@@ -869,12 +953,12 @@ pub fn run_edit(
         "repaired": repaired,
         "repairDiff": repair_diff,
         "diff": diff,
-        "wrote": !dry_run,
+        "wrote": write && !dry_run,
     });
 
     if dry_run {
         notes.push("dry run: nothing written".to_string());
-    } else {
+    } else if write {
         invariants::atomic_write(file, &with_bom(&new_bytes, had_bom))
             .map_err(|e| {
                 Fail(
@@ -884,15 +968,671 @@ pub fn run_edit(
             })?;
     }
 
+    let output = Output::ok("edit")
+        .file(Some(file.display().to_string()))
+        .file_hash(hashutil::tagged(&hashutil::file_hash(&new_bytes)))
+        .forms(after_parsed.forms)
+        .result(result)
+        .warnings(warnings)
+        .notes(notes)
+        .human_rows(human_rows);
+
+    Ok(OpOutcome {
+        output,
+        new_bytes: new_bytes.clone(),
+        target_chain: handle_node.as_ref().map(|n| n.path_chain.clone()),
+        window: (lo, hi),
+        contributed: match &payload {
+            Some(content::Payload::Prepared(p)) => p.forms,
+            _ => 0,
+        },
+        new_nodes,
+        affected_rows,
+    })
+}
+
+// ─── Batch edit (issue 36) ──────────────────────────────────────────────────
+//
+// `cljform edit <file> --batch ops.json`: N ops, one call, one atomic write.
+//
+// The core semantics: every op's handle resolves against the ORIGINAL file's
+// node table (up front, so a bad handle in op 5 is caught before op 0 runs),
+// and the engine tracks each target's IDENTITY across the batch by its
+// position chain — the issue-19/22 resolve_at/at_chain machinery. After each
+// op the tracked chains of the remaining ops are updated mechanically for
+// the op's verified top-level effect (inserts shift later siblings, deletes
+// shift them back, multi-form replaces shift by the net change), and the
+// chains are re-checked against the post-op node table: a chain that no
+// longer resolves (its form was deleted, or its structure was restructured)
+// marks the target GONE. A later op on a gone target is a clean, targeted
+// failure ("op K targets a form that op J removed") — never a silent
+// mis-aim. Same-form sequences are the headline case: a docstring patch
+// followed by a body patch on one form is two ops sharing one pre-batch
+// handle, re-anchored by chain, with zero stale-handle churn.
+//
+// Atomicity: the per-op pipeline (run_edit_op) never writes in batch mode;
+// the single atomic write happens at the very end, only when every op
+// verified. Any failure — before the write, at any op — leaves the file
+// byte-identical.
+
+/// One op of a parsed batch: the validated fields plus the bare (marker-
+/// stripped) handle string.
+struct ParsedBatchOp {
+    mode: Mode,
+    handle: Option<String>,
+    content: Option<String>,
+    old_text: Option<String>,
+    new_text: Option<String>,
+}
+
+/// The op names as they appear in ops.json (the clap value names).
+fn parse_mode(s: &str) -> Option<Mode> {
+    match s {
+        "replace" => Some(Mode::Replace),
+        "patch" => Some(Mode::Patch),
+        "insert-after" => Some(Mode::InsertAfter),
+        "insert-before" => Some(Mode::InsertBefore),
+        "append" => Some(Mode::Append),
+        "prepend" => Some(Mode::Prepend),
+        "delete" => Some(Mode::Delete),
+        _ => None,
+    }
+}
+
+fn batch_usage(msg: impl Into<String>) -> Fail {
+    Fail(errors::exit::USAGE, ErrorBody::new("usage", msg))
+}
+
+/// Parse + validate the ops array: a JSON array of objects, each a normal
+/// edit op (all modes, `content` / `oldText` / `newText`). Malformed JSON or
+/// shape is a usage error (exit 2, nothing read from the target file yet).
+fn parse_batch_ops(raw: &str) -> Result<(Vec<ParsedBatchOp>, Vec<bool>), Fail> {
+    let value: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|e| batch_usage(format!("malformed batch ops: not valid JSON ({e})")))?;
+    let arr = value
+        .as_array()
+        .ok_or_else(|| batch_usage("batch ops must be a JSON array of ops"))?;
+    if arr.is_empty() {
+        return Err(batch_usage("batch must contain at least one op"));
+    }
+    let mut ops: Vec<ParsedBatchOp> = Vec::with_capacity(arr.len());
+    let mut stripped: Vec<bool> = Vec::with_capacity(arr.len());
+    for (i, o) in arr.iter().enumerate() {
+        let n = i + 1;
+        let obj = o
+            .as_object()
+            .ok_or_else(|| batch_usage(format!("op {n} is not a JSON object")))?;
+        let mode = match obj.get("mode") {
+            None => Mode::Replace,
+            Some(v) => {
+                let s = v
+                    .as_str()
+                    .ok_or_else(|| batch_usage(format!("op {n}: mode must be a string")))?;
+                parse_mode(s).ok_or_else(|| {
+                    batch_usage(format!(
+                        "op {n}: unknown mode {s:?} (expected replace|patch|insert-after|insert-before|append|prepend|delete)"
+                    ))
+                })?
+            }
+        };
+        let handle = match obj.get("handle") {
+            None => None,
+            Some(v) => {
+                let s = v
+                    .as_str()
+                    .ok_or_else(|| batch_usage(format!("op {n}: handle must be a string")))?;
+                // §10.4: a handle copied from the annotated view is the
+                // marker span itself; drop the glyphs, keep the bare handle.
+                let (bare, extracted) = handle::bare_handle(s);
+                stripped.push(extracted);
+                Some(bare)
+            }
+        };
+        let string_field = |key: &str| -> Result<Option<String>, Fail> {
+            match obj.get(key) {
+                None => Ok(None),
+                Some(v) => Ok(Some(
+                    v.as_str()
+                        .ok_or_else(|| batch_usage(format!("op {n}: {key} must be a string")))?
+                        .to_string(),
+                )),
+            }
+        };
+        let content = string_field("content")?;
+        let old_text = string_field("oldText")?;
+        let new_text = string_field("newText")?;
+        // Cross-field rules (the same contract as the single-op flags).
+        if matches!(mode, Mode::Append | Mode::Prepend) && handle.is_some() {
+            return Err(batch_usage(format!(
+                "op {n}: append/prepend are file-level and take no handle"
+            )));
+        }
+        if !matches!(mode, Mode::Append | Mode::Prepend) && handle.is_none() {
+            return Err(batch_usage(format!(
+                "op {n}: mode {} targets a form and needs a handle (run tree to list current handles)",
+                mode_name(&mode)
+            )));
+        }
+        if mode == Mode::Patch {
+            if old_text.is_none() {
+                return Err(batch_usage(format!("op {n}: patch mode requires oldText")));
+            }
+            if new_text.is_none() {
+                return Err(batch_usage(format!("op {n}: patch mode requires newText (it may be empty)")));
+            }
+        }
+        if !matches!(mode, Mode::Patch | Mode::Delete) && content.is_none() {
+            return Err(batch_usage(format!(
+                "op {n}: mode {} requires content",
+                mode_name(&mode)
+            )));
+        }
+        ops.push(ParsedBatchOp {
+            mode,
+            handle,
+            content,
+            old_text,
+            new_text,
+        });
+        if stripped.len() == i {
+            stripped.push(false); // no handle → no strip flag recorded yet
+        }
+    }
+    Ok((ops, stripped))
+}
+
+/// The tracked state of one batch target (issue 36):
+/// - `chain`: the target's position chain IN THE CURRENT (evolving) file —
+///   seeded from the original table (resolve_at's chain), then mechanically
+///   shifted after each op (inserts push later siblings, deletes pull them
+///   back, multi-form replaces shift by the net change). Re-anchoring is a
+///   chain lookup in the current node table (at_chain), the issue-22
+///   same-position machinery.
+/// - `orig_content`: the blake3 of the target's bytes at resolution time
+///   (the pre-batch original) — the content-addressed half of the identity:
+///   an unchanged form's bytes must still match when it re-anchors, and a
+///   changed form may only have been touched by an earlier batch op
+///   (the `dirty` flag), or the re-anchor is a tracking failure, not a fact.
+/// - `gone_by`: the op index that removed the form (delete) or replaced /
+///   restructured it (its chain stopped resolving) — a later op on it fails
+///   with the targeted "op K targets a form that op J removed".
+/// - `dirty`: an earlier op's verified change window intersected this form's
+///   bytes — its content may legitimately differ from the original.
+struct BatchTarget {
+    chain: Vec<u32>,
+    orig_content: String,
+    gone_by: Option<usize>,
+    dirty: bool,
+}
+
+/// Position chain → node index over a node table (chains are unique: each
+/// node's chain is its path of 1-based named-child indices). O(n·depth) to
+/// build, O(depth) per lookup — the re-anchor and the dirty/gone checks all
+/// run off this map, never a per-target table scan.
+fn chain_index_map(nodes: &[handle::Node]) -> std::collections::HashMap<Vec<u32>, usize> {
+    nodes
+        .iter()
+        .enumerate()
+        .map(|(j, _)| (handle::chain_of(nodes, j), j))
+        .collect()
+}
+
+/// Wrap an op-level failure with the failing op's identity (the batch's
+/// error names the op index + keeps the standard recovery affordances —
+/// code, exit, position, hint, suggestions, diagnostics — untouched).
+fn wrap_op_error(fail: Fail, idx: usize, ops: &[ParsedBatchOp]) -> Fail {
+    let exit = fail.0;
+    let body = fail.1;
+    let op = &ops[idx];
+    let who = match &op.handle {
+        Some(h) => format!("{} \u{27E6}{h}\u{27E7}", mode_name(&op.mode)),
+        None => mode_name(&op.mode).to_string(),
+    };
+    Fail(
+        exit,
+        ErrorBody {
+            message: format!("op {} of {} ({who}): {}", idx + 1, ops.len(), body.message),
+            ..body
+        },
+    )
+}
+
+/// The targeted target-loss failure (issue 36, item 4): the later op
+/// addresses a form an earlier batch op removed or restructured — a clean
+/// refusal naming both ops, never a silent mis-aim.
+fn target_lost_error(i: usize, gone: usize, ops: &[ParsedBatchOp]) -> Fail {
+    let label = |o: &ParsedBatchOp| match &o.handle {
+        Some(h) => format!("{} \u{27E6}{h}\u{27E7}", mode_name(&o.mode)),
+        None => mode_name(&o.mode).to_string(),
+    };
+    let verb = match ops[gone].mode {
+        Mode::Delete => "removed",
+        Mode::Replace => "replaced",
+        _ => "changed the structure of",
+    };
+    Fail(
+        errors::exit::TARGET,
+        ErrorBody::new(
+            "target-removed",
+            format!(
+                "op {} ({}) targets a form that op {} ({}) {} — the pre-batch handle no longer addresses a live form",
+                i + 1,
+                label(&ops[i]),
+                gone + 1,
+                label(&ops[gone]),
+                verb
+            ),
+        )
+        .with_hint(
+            "the batch is atomic: nothing was written. Drop or reorder the conflicting op (or split the batch into separate clj_edit calls); run tree for current handles",
+        ),
+    )
+}
+
+/// The batch aggregate: forms whose bytes do not match any original form's
+/// bytes (with multiplicity) are "changed" — the byte-identity view of I2
+/// over the whole batch; the structural gate is the per-op verification.
+fn batch_changed_untouched(orig: &[parser::Form], final_forms: &[parser::Form]) -> (usize, usize) {
+    let mut left: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for f in orig {
+        *left.entry(f.hash.as_str()).or_insert(0) += 1;
+    }
+    let mut changed = 0usize;
+    for f in final_forms {
+        match left.get_mut(f.hash.as_str()) {
+            Some(c) if *c > 0 => *c -= 1,
+            _ => changed += 1,
+        }
+    }
+    (changed, final_forms.len() - changed)
+}
+
+/// `cljform edit <file> --batch ops.json` (issue 36): N ops, one call,
+/// one atomic write.
+///
+/// 1. The ops parse + validate (usage errors carry the op index).
+/// 2. Every op's handle resolves against the ORIGINAL file's node table —
+///    up front, so the batch either has all its targets or it names the
+///    failing op and writes nothing.
+/// 3. The ops apply in order, each through the full single-op pipeline on
+///    the evolving bytes (run_edit_op, write disabled): prepare → splice →
+///    parse → untouched-forms byte-identity → detectors, no weakening.
+/// 4. After each op the remaining targets' chains are shifted for the op's
+///    verified effect and re-checked against the post-op node table (gone
+///    targets are marked, for the targeted failure).
+/// 5. Only then — every op verified — the single atomic write.
+pub fn run_batch_edit(
+    file: &Path,
+    batch_file: &Path,
+    dry_run: bool,
+    strict: bool,
+    repair: bool,
+    format_content: bool,
+) -> Result<Output, Fail> {
+    let raw = std::fs::read_to_string(batch_file).map_err(|e| {
+        Fail(
+            errors::exit::IO,
+            ErrorBody::new(
+                "io",
+                format!("cannot read ops file {}: {e}", batch_file.display()),
+            ),
+        )
+    })?;
+    let (ops, stripped) = parse_batch_ops(&raw)?;
+    let n_ops = ops.len();
+
+    let (bytes, had_bom) = read_file(file)?;
+    let orig_forms = parse_or_fail(&bytes, "file")?.forms;
+    let orig_nodes = handle::collect(&bytes);
+    let mut cur_chain_map = chain_index_map(&orig_nodes);
+
+    // Step 2: up-front resolution of every handle against the ORIGINAL
+    // node table (the resolution semantics: the handle pins the form it
+    // named in the file the batch was aimed at, and the batch tracks that
+    // form through its own ops — never a re-resolution against the evolving
+    // bytes, which is what made single-op sequences stale-handle-chase).
+    let mut targets: Vec<Option<BatchTarget>> = Vec::with_capacity(n_ops);
+    let mut cache: std::collections::HashMap<String, handle::Node> =
+        std::collections::HashMap::new();
+    for (i, op) in ops.iter().enumerate() {
+        targets.push(match &op.handle {
+            Some(h) => {
+                let node = match cache.get(h) {
+                    Some(n) => n.clone(),
+                    None => {
+                        let n =
+                            resolve_handle(&bytes, h, file).map_err(|f| wrap_op_error(f, i, &ops))?;
+                        cache.insert(h.clone(), n.clone());
+                        n
+                    }
+                };
+                Some(BatchTarget {
+                    chain: node.path_chain.clone(),
+                    orig_content: blake3::hash(&bytes[node.start_byte..node.end_byte])
+                        .to_hex()
+                        .to_string(),
+                    gone_by: None,
+                    dirty: false,
+                })
+            }
+            None => None, // append/prepend: file-level, no target
+        });
+    }
+
+    // Steps 3–4: the sequential application.
+    let mut cur = bytes;
+    let mut cur_nodes = orig_nodes;
+    let mut blocks: Vec<serde_json::Value> = Vec::with_capacity(n_ops);
+    let mut text_parts: Vec<String> = Vec::with_capacity(n_ops);
+    let mut notes: Vec<String> = Vec::new();
+    let mut last_final: Option<(Vec<parser::Form>, Vec<invariants::DetectorWarning>)> = None;
+
+    for (i, op) in ops.iter().enumerate() {
+        // The target state (append/prepend carry none).
+        let (target_node, handle_stripped) = match targets.get_mut(i) {
+            Some(Some(t)) => {
+                if let Some(gone) = t.gone_by {
+                    return Err(target_lost_error(i, gone, &ops));
+                }
+                // Re-anchor: the tracked chain in the CURRENT node table
+                // (at_chain — the issue-22 same-position lookup).
+                let idx = *cur_chain_map.get(&t.chain).ok_or_else(|| {
+                    Fail(
+                        errors::exit::INTERNAL,
+                        ErrorBody::new(
+                            "internal-error",
+                            format!(
+                                "tool bug: op {}'s tracked position no longer resolves after op {} — position tracking failed; nothing was written",
+                                i + 1,
+                                i
+                            ),
+                        ),
+                    )
+                })?;
+                let mut node = cur_nodes[idx].clone();
+                node.path_chain = t.chain.clone();
+                // Content guard: the tracked slot's bytes may differ from
+                // the pre-batch original ONLY if an earlier batch op's
+                // verified change window touched this form. Different
+                // content at an untouched slot is a tracking failure —
+                // fail, never mis-aim.
+                let h = blake3::hash(&cur[node.start_byte..node.end_byte])
+                    .to_hex()
+                    .to_string();
+                if h != t.orig_content && !t.dirty {
+                    return Err(Fail(
+                        errors::exit::INTERNAL,
+                        ErrorBody::new(
+                            "internal-error",
+                            format!(
+                                "tool bug: op {}'s target re-anchored to a form whose bytes changed without any earlier batch op touching it — position tracking failed; nothing was written",
+                                i + 1
+                            ),
+                        ),
+                    ));
+                }
+                (Some(node), stripped[i])
+            }
+            _ => (None, false),
+        };
+
+        let outcome = match run_edit_op(
+            file,
+            &cur,
+            had_bom,
+            op.mode,
+            &op.content,
+            &None,
+            &op.old_text,
+            &op.new_text,
+            target_node,
+            handle_stripped,
+            dry_run,
+            false, // the batch writes once, at the end
+            strict,
+            repair,
+            format_content,
+        ) {
+            Ok(o) => o,
+            Err(f) => return Err(wrap_op_error(f, i, &ops)),
+        };
+
+        // The per-op block (issue 32 shape, scoped: diff + summary +
+        // affected rows; no whole-file table at any size).
+        #[allow(clippy::expect_used)]
+        let r = outcome.output.result.expect("op result is always set");
+        let diff = r.get("diff").and_then(|v| v.as_str()).unwrap_or("");
+        let repair_diff = r
+            .get("repairDiff")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        blocks.push(serde_json::json!({
+            "op": i,
+            "handle": op.handle.as_deref(),
+            "mode": mode_name(&op.mode),
+            "text": r.get("text"),
+            "summary": r.get("summary"),
+            "changed": r.get("changed"),
+            "untouched": r.get("untouched"),
+            "repaired": r.get("repaired"),
+            "repairDiff": r.get("repairDiff"),
+            "diff": r.get("diff"),
+            "affected": outcome.affected_rows.join("\n"),
+        }));
+        // The per-op human block: the "op k/N:" label (only when the batch
+        // has more than one op — a single-op batch reads like the single
+        // edit), the summary line, the repair diff (when repaired), the
+        // changed-region diff, the affected rows.
+        let mut part = String::new();
+        if n_ops > 1 {
+            part.push_str(&format!("op {}/{}: ", i + 1, n_ops));
+        }
+        part.push_str(
+            r.get("text")
+                .and_then(|t| t.as_str())
+                .and_then(|t| t.lines().next())
+                .unwrap_or(""),
+        );
+        if r.get("repaired").and_then(|v| v.as_bool()) == Some(true)
+            && !repair_diff.is_empty()
+        {
+            part.push('\n');
+            part.push_str(repair_diff);
+        }
+        if !diff.is_empty() {
+            part.push('\n');
+            part.push_str(diff);
+        }
+        if !outcome.affected_rows.is_empty() {
+            part.push('\n');
+            part.push_str(&outcome.affected_rows.join("\n"));
+        }
+        text_parts.push(part);
+        // Notes: per-op, prefixed by the op index (a batch of one keeps the
+        // single-edit notes verbatim); the dry-run note is deduplicated to
+        // one at the batch level below.
+        if let Some(ns) = &outcome.output.notes {
+            for n in ns {
+                if n == "dry run: nothing written" {
+                    continue;
+                }
+                if n_ops > 1 {
+                    notes.push(format!("op {}: {}", i + 1, n));
+                } else {
+                    notes.push(n.clone());
+                }
+            }
+        }
+
+        // ── Step 4: identity bookkeeping for the remaining ops. ──
+        let c_k = outcome.target_chain.clone(); // the pre-op target chain
+        // (1) A replace or delete DESTROYS the pre-batch form: the slot and
+        //     every descendant are gone for the rest of the batch (the
+        //     pre-batch handle promised that form; create-then-target-new-
+        //     handle stays separate calls — the documented non-goal).
+        if matches!(op.mode, Mode::Delete | Mode::Replace) {
+            let ck = match c_k.as_ref() {
+                Some(c) => c,
+                // delete/replace always carry a resolved target (validated
+                // upstream); the hard assertion is the internal-invariant
+                // proof (issue 30 L1).
+                #[allow(clippy::unreachable)]
+                None => unreachable!("delete/replace always carry a target"),
+            };
+            for t in targets.iter_mut().skip(i + 1).flatten() {
+                if t.chain.as_slice() == ck.as_slice() || t.chain.starts_with(ck.as_slice()) {
+                    t.gone_by = Some(i);
+                }
+            }
+        }
+        // (2) Position shifts for the verified top-level effect: the op's
+        //     net form-count change (I3-checked) is authoritative — insert
+        //     +n, top-level replace +(n−1), delete −1, all at/after the
+        //     target's slot (insert-before also moves the anchor itself);
+        //     nested inserts/deletes/multi-form replaces shift LATER
+        //     SIBLINGS of the anchor inside the anchor's parent.
+        match op.mode {
+            Mode::Prepend => {
+                let n = outcome.contributed as u32;
+                if n > 0 {
+                    for t in targets.iter_mut().skip(i + 1).flatten() {
+                        t.chain[0] += n;
+                    }
+                }
+            }
+            Mode::Append => {}
+            m if c_k.is_some() => {
+                let shift = match m {
+                    Mode::Delete => -1i64,
+                    Mode::Replace => (outcome.contributed as i64) - 1,
+                    Mode::InsertBefore | Mode::InsertAfter => outcome.contributed as i64,
+                    _ => 0, // patch: no modeled structural effect
+                };
+                if shift != 0 {
+                    let ck = match c_k.as_ref() {
+                        Some(c) => c,
+                        // The guard arm (`m if c_k.is_some()`) establishes
+                        // this; the hard assertion is the proof (issue 30 L1).
+                        #[allow(clippy::unreachable)]
+                        None => unreachable!("c_k is Some here"),
+                    };
+                    let d = ck.len();
+                    let anchor_idx = ck[d - 1]; // 1-based, in the parent
+                    for t in targets.iter_mut().skip(i + 1).flatten() {
+                        if t.chain.len() < d || t.chain[..d - 1] != ck[..d - 1] {
+                            continue;
+                        }
+                        let pos = t.chain[d - 1];
+                        if pos > anchor_idx {
+                            t.chain[d - 1] = (pos as i64 + shift) as u32;
+                        } else if pos == anchor_idx
+                            && m == Mode::InsertBefore
+                            && t.chain == *ck
+                        {
+                            // The anchor form itself moves (insert before).
+                            t.chain[d - 1] = (pos as i64 + shift) as u32;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        // (3) Dirty marking: the op's verified change window (zero-width
+        //     for inserts — they displace, they never rewrite) against each
+        //     remaining target's span in the pre-op file: a target whose
+        //     bytes this op actually touched may legitimately differ from
+        //     the pre-batch original when it re-anchors later.
+        let (lo, hi) = outcome.window;
+        if lo < hi {
+            for (j, t) in targets.iter_mut().enumerate() {
+                if j < i || t.is_none() {
+                    continue;
+                }
+                if let Some(t) = t {
+                    if t.gone_by.is_some() {
+                        continue;
+                    }
+                    if let Some(&idx) = cur_chain_map.get(&t.chain) {
+                        let span = &cur_nodes[idx];
+                        if lo < span.end_byte && hi > span.start_byte {
+                            t.dirty = true;
+                        }
+                    }
+                }
+            }
+        }
+        // (4) Residual check: any remaining target whose chain no longer
+        //     resolves in the post-op table was restructured by this op
+        //     (e.g. a patch changed a form's named children so a tracked
+        //     descendant's slot vanished) — mark it gone, for the targeted
+        //     failure at its op.
+        let post_map = chain_index_map(&outcome.new_nodes);
+        for (_j, t) in targets.iter_mut().enumerate().skip(i + 1) {
+            if let Some(t) = t {
+                if t.gone_by.is_none() && !post_map.contains_key(&t.chain) {
+                    t.gone_by = Some(i);
+                }
+            }
+        }
+
+        cur = outcome.new_bytes;
+        let new_nodes = outcome.new_nodes;
+        cur_chain_map = post_map;
+        cur_nodes = new_nodes;
+        last_final = Some((
+            outcome.output.forms.clone().unwrap_or_default(),
+            outcome.output.warnings.clone().unwrap_or_default(),
+        ));
+    }
+
+    // Step 5: the single atomic write — only now, every op verified.
+    if !dry_run {
+        invariants::atomic_write(file, &with_bom(&cur, had_bom)).map_err(|e| {
+            Fail(
+                errors::exit::IO,
+                ErrorBody::new(
+                    "io",
+                    format!("write failed: {e} (batch aborted; file unchanged)"),
+                ),
+            )
+        })?;
+    } else {
+        notes.push("dry run: nothing written".to_string());
+    }
+
+    #[allow(clippy::expect_used)]
+    let (final_forms, warnings) = last_final.expect("the ops array is non-empty (validated)");
+    let (changed, untouched) = batch_changed_untouched(&orig_forms, &final_forms);
+    let aggregate = format!(
+        "{} {} applied; file: {} forms; {} changed, {} untouched",
+        n_ops,
+        if n_ops == 1 { "op" } else { "ops" },
+        final_forms.len(),
+        changed,
+        untouched
+    );
+    let mut text = text_parts.join("\n\n");
+    text.push('\n');
+    text.push_str(&aggregate);
+
+    let result = serde_json::json!({
+        "text": text,
+        "applied": n_ops,
+        "ops": blocks,
+        "forms": final_forms.len(),
+        "changed": changed,
+        "untouched": untouched,
+        "wrote": !dry_run,
+    });
+
     Ok(
         Output::ok("edit")
             .file(Some(file.display().to_string()))
-            .file_hash(hashutil::tagged(&hashutil::file_hash(&new_bytes)))
-            .forms(after_parsed.forms)
+            .file_hash(hashutil::tagged(&hashutil::file_hash(&cur)))
+            .forms(final_forms)
             .result(result)
             .warnings(warnings)
-            .notes(notes)
-            .human_rows(human_rows),
+            .notes(notes),
     )
 }
 

@@ -72,8 +72,8 @@ pub enum Op {
     Edit {
         file: PathBuf,
         /// replace|patch|insert-after|insert-before|append|prepend|delete
-        #[arg(long, default_value = "replace")]
-        mode: Mode,
+        #[arg(long, num_args = 0..=1, default_missing_value = "replace")]
+        mode: Option<Mode>,
         /// Replacement/insertion content (else --content-file or stdin).
         /// Not used by patch (use --old-text/--new-text) or delete.
         #[arg(long)]
@@ -93,6 +93,14 @@ pub enum Op {
         /// and prepend are file-level and take no target.
         #[arg(long)]
         handle: Option<String>,
+        /// Batch edit (issue 36): a JSON file holding an array of ops —
+        /// N edit ops, one call, one atomic write. Each op is a normal edit
+        /// op ({"handle", "mode", "content" / "oldText" / "newText"}); every
+        /// handle resolves against the ORIGINAL file and each target is
+        /// tracked across the batch's own ops. Composes with --dry-run,
+        /// --strict, --repair, --format-content/--no-format-content.
+        #[arg(long, conflicts_with_all = ["mode", "handle", "content", "content_file", "old_text", "new_text"])]
+        batch: Option<PathBuf>,
         /// Validate only; write nothing.
         #[arg(long)]
         dry_run: bool,
@@ -285,29 +293,40 @@ fn print_human(out: &Output) {
         // present), the summary line, the repair diff (when repaired), the
         // affected form's row(s) + counts line (human_rows), then notes and
         // warnings. NO full-table dump in human mode, at any file size.
+        // Issue 36 (batch): result.text IS the composed human view — the
+        // per-op blocks (label, summary line, repair diff, changed-region
+        // diff, affected rows) plus the aggregate counts line — so it is
+        // printed whole, and nothing else from the result is re-printed
+        // (the per-op blocks already carry the diffs exactly once).
         if let Some(r) = &out.result {
-            if let Some(diff) = r.get("diff").and_then(|v| v.as_str()) {
-                if !diff.is_empty() {
-                    print_payload(diff);
+            if r.get("ops").is_some() {
+                if let Some(text) = r.get("text").and_then(|t| t.as_str()) {
+                    print_payload(text);
                 }
-            }
-            // The summary line is the first line of result.text (the JSON
-            // field keeps its issue-27 composition; the human view is the
-            // reshaped one).
-            if let Some(text) = r.get("text").and_then(|t| t.as_str()) {
-                if let Some(line) = text.lines().next() {
-                    println!("{line}");
-                }
-            }
-            if r.get("repaired").and_then(|v| v.as_bool()) == Some(true) {
-                if let Some(repair_diff) = r.get("repairDiff").and_then(|v| v.as_str()) {
-                    if !repair_diff.is_empty() {
-                        print_payload(repair_diff);
+            } else {
+                if let Some(diff) = r.get("diff").and_then(|v| v.as_str()) {
+                    if !diff.is_empty() {
+                        print_payload(diff);
                     }
                 }
-            }
-            if let Some(block) = &out.human_rows {
-                print_payload(block);
+                // The summary line is the first line of result.text (the JSON
+                // field keeps its issue-27 composition; the human view is the
+                // reshaped one).
+                if let Some(text) = r.get("text").and_then(|t| t.as_str()) {
+                    if let Some(line) = text.lines().next() {
+                        println!("{line}");
+                    }
+                }
+                if r.get("repaired").and_then(|v| v.as_bool()) == Some(true) {
+                    if let Some(repair_diff) = r.get("repairDiff").and_then(|v| v.as_str()) {
+                        if !repair_diff.is_empty() {
+                            print_payload(repair_diff);
+                        }
+                    }
+                }
+                if let Some(block) = &out.human_rows {
+                    print_payload(block);
+                }
             }
         }
     } else if out.op == "materialize" || out.op == "format" {

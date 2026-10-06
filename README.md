@@ -112,6 +112,27 @@ An unchanged form keeps its handle across edits elsewhere; a changed one
 rotates its handle and the edit summary says so — a stale handle can
 re-aim, never mis-aim.
 
+A multi-form change is ONE batch — N ops in one atomic call, all handles
+from a single `tree` run:
+
+```console
+$ cljform edit todos.clj --batch ops.json
+# ops.json: [{"handle": "b36464", "mode": "patch", "oldText": "...", "newText": "..."},
+#            {"handle": "a2fbf8", "mode": "replace", "content": "(defn ...)"}]
+op 0: patched form ⟦…⟧ complete-all (lines 8–9) …
+op 1: replaced form ⟦…⟧ complete-todos (lines 1–7) …
+2 ops applied; file: 4 forms; 2 changed, 2 untouched
+```
+
+Every op's handle resolves against the **original** file; the engine
+tracks each target through the batch's own ops, so docstring-then-body on
+one form is two ops sharing one handle — no stale-handle churn. A later
+op on a form an earlier op removed or replaced fails the whole batch
+(cleanly, `target-removed`, naming the op that removed it) and writes
+nothing; every op is verified with the full single-op pipeline on the
+evolving file. A batch cannot target forms it creates (create-then-edit
+stays separate calls). Full contract: SPEC §10.3 (batch).
+
 ## The model
 
 - **Handles are content-addressed.** `tree` marks each form with
@@ -138,6 +159,7 @@ re-aim, never mis-aim.
 | `forms <file>` | Flat table: addr, kind, name, lines, blake3, shape summary, warnings |
 | `get <file> --name SYM \| --handle H` | One form's exact bytes + metadata (pass its handle to `edit`); human view is payload-first: the bytes, then one metadata line |
 | `edit <file> --handle H` | Whole-form edit: `--mode replace\|patch\|insert-after\|insert-before\|append\|prepend\|delete`, with `--content`/`--content-file` or patch `--old-text/--new-text`. Returns a unified diff of the changed region. See below for repair/strict |
+| `edit <file> --batch OPS.json` | N edit ops in one atomic call: a JSON array of `{handle, mode, content / oldText+newText}`. Every handle resolves against the original file and each target is tracked across the batch; per-op blocks + aggregate counts; any failure writes nothing |
 | `check <file>` | Parse + form table + detector warnings (file or stdin) |
 | `materialize --content C` | Indent-mode bracket completion → candidate + diff, never writes |
 | `format <file>` | Reindent like parinfer paren mode → candidate + diff, never writes |
