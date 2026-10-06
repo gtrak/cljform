@@ -195,3 +195,16 @@ Both reported silent-corruption modes DO NOT reproduce (repros in /tmp/repro17):
   comment insertion in non-form regions, whole-file reindent (format is
   candidate-only).
 - Zero built-in edit usage all session.
+## T19 (dogfood of the verdict line, warning-heavy analyzer.clj) — BEHAVIORAL RESULT: POSITIVE
+- THE number: re-verification calls after clean edits = 0 (9 real writes;
+  T15/T17 baseline had a redundant tree/get tail after clean edits).
+- All classification cases passed: trap (form whose body carries 5
+  pre-existing D2s inside the diff) -> "0 new (21 pre-existing)";
+  attribution/fix pair -> "1 new" labeled as mine, then "1 resolved" on
+  the fix; batch verdict aggregates correctly (3 changed, 0 new).
+- Caveats: (a) the leading verdict is --human-only; piped JSON buries it
+  in warningsDelta (same data, weaker salience) — candidate: a top-level
+  "verdict" string in the JSON envelope too; (b) the verdict is a delta
+  claim — an agent that skips measuring P has no anchor (dogfood briefs
+  should mandate the baseline check); (c) minor wording asymmetry
+  clean-vs-dirty.
