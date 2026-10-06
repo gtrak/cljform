@@ -522,6 +522,52 @@ await run("insert-nested-labeled", async () => {
 	}
 });
 
+
+// ─── issue 36 (batch edit): clj_edit cells ─────────────────────────────────────
+// Multi-op in ONE atomic call; the same-form sequence (docstring + body) via
+// ONE pre-batch handle — the stale-handle churn the batch exists to kill.
+const BATCH_FIXTURE = `(ns batch-demo)
+
+(def a 1)
+
+(def b 2)
+`;
+
+await run("edit-batch-multi", async () => {
+	const file = writeEditFixture("batch-36.clj");
+	writeFileSync(file, BATCH_FIXTURE);
+	const hA = await handleFor(tools, file, /\(\u27E6([0-9a-f]+)\u27E7def a/);
+	const hB = await handleFor(tools, file, /\(\u27E6([0-9a-f]+)\u27E7def b/);
+	const out = await tools.get("clj_edit").execute("h", {
+		path: file,
+		ops: [
+			{ handle: hA, mode: "patch", oldText: "(def a 1)", newText: "(def a 11)" },
+			{ handle: hB, mode: "patch", oldText: "(def b 2)", newText: "(def b 22)" },
+		],
+	}, null, () => {});
+	check("edit-batch: not an error", !out.isError, text(out));
+	check("edit-batch: ops applied line", /2 ops applied/.test(text(out)), text(out));
+	check("edit-batch: both changes landed", text(out).includes("(def a 11)") && text(out).includes("(def b 22)"), text(out));
+});
+
+await run("edit-batch-same-form", async () => {
+	const file = writeEditFixture("batch-36b.clj");
+	writeFileSync(file, BATCH_FIXTURE);
+	const hA = await handleFor(tools, file, /\(\u27E6([0-9a-f]+)\u27E7def a/);
+	// TWO ops on the SAME form, sharing ONE pre-batch handle: the batch
+	// re-anchors op 2 after op 1 rotates the form — zero stale-handle churn.
+	const out = await tools.get("clj_edit").execute("h", {
+		path: file,
+		ops: [
+			{ handle: hA, mode: "patch", oldText: "(def a 1)", newText: "(def a 11)" },
+			{ handle: hA, mode: "patch", oldText: "11", newText: "12" },
+		],
+	}, null, () => {});
+	check("edit-batch-same-form: not an error", !out.isError, text(out));
+	check("edit-batch-same-form: 2 ops applied", /2 ops applied/.test(text(out)), text(out));
+	check("edit-batch-same-form: both edits on the form", text(out).includes("(def a 12)"), text(out));
+});
+
 // ─── report ──────────────────────────────────────────────────────────────────
 for (const p of PASS) console.log(`PASS ${p}`);
 for (const f of FAIL) console.log(`FAIL ${f.name}\n${f.evidence}`);
