@@ -132,31 +132,61 @@ fn build_patch_payload(
     let escape_suspect = old_raw.contains("\\n") || old_raw.contains("\\t");
     match hits.len() {
         0 => {
+            // Issue 37 (B): the whitespace-normalized indentation
+            // diagnosis — exactly one normalized region carries a
+            // per-line delta report; zero or several never guess.
+            let diagnosis = indentation_diagnostics(scoped, needle);
+            // Issue 37 (D): sub-form steering — the trimmed oldText
+            // matching EXACTLY ONE nested sub-form's bytes is a fact
+            // (the sub-form exists with those bytes), so its handle is
+            // the steering hint; partial or multi-byte matches never are.
+            let subform = subform_match(bytes, node, &old);
+            let mut message = format!(
+                "--old-text not found inside {scope_label} (lines {}–{}); occurrences elsewhere in the file do not count",
+                line_range[0],
+                line_range[1],
+            );
+            if let Some((region_line, deltas)) = &diagnosis {
+                message.push_str(&format!(
+                    "\n\nindentation diagnosis — the whitespace-normalized oldText matches exactly one region (form line {region_line}); per-line leading-space deltas (a tab counts as 2 spaces, as in the reindent):"
+                ));
+                for d in deltas {
+                    message.push('\n');
+                    message.push_str(d);
+                }
+            }
+            message.push_str(&format!("\n\nexact form bytes (copy oldText from these):\n{scope_bytes}"));
             return Err(Fail(
                 errors::exit::TARGET,
-                ErrorBody::new(
-                    "patch-not-found",
-                    // Hand back the exact form bytes: the dominant
-                    // failure is oldText re-typed from a sed/cat read,
-                    // and this makes recovery one call, no clj_get.
-                    format!(
-                        "--old-text not found inside {scope_label} (lines {}–{}); occurrences elsewhere in the file do not count\n\nexact form bytes (copy oldText from these):\n{}",
-                        line_range[0],
-                        line_range[1],
-                        scope_bytes
-                    ),
-                )
-                .at(Some(line_range[0]), None)
-                .with_hint({
-                    let mut hint = "use the exact bytes above verbatim; only re-fetch with clj_get if the file changed since you read it"
-                        .to_string();
-                    if escape_suspect {
-                        hint.push_str(
-                            "; oldText contains the literal two characters backslash-n (or backslash-t); if you meant a newline or tab, send a real one",
-                        );
-                    }
-                    hint
-                }),
+                ErrorBody::new("patch-not-found", message)
+                    .at(Some(line_range[0]), None)
+                    .with_hint({
+                        let mut hint = "use the exact bytes above verbatim; only re-fetch with clj_get if the file changed since you read it"
+                            .to_string();
+                        if escape_suspect {
+                            hint.push_str(
+                                "; oldText contains the literal two characters backslash-n (or backslash-t); if you meant a newline or tab, send a real one",
+                            );
+                        }
+                        if diagnosis.is_some() {
+                            hint.push_str(
+                                "; the deltas above name the oldText lines to re-indent before retrying",
+                            );
+                        }
+                        if let Some(n) = &subform {
+                            let label = match (&n.head, &n.def_name) {
+                                (Some(h), Some(d)) => format!("{h} {d}"),
+                                (Some(h), None) => h.clone(),
+                                (None, Some(d)) => d.clone(),
+                                (None, None) => n.kind.clone(),
+                            };
+                            hint.push_str(&format!(
+                                "; this region is sub-form \u{27E6}{}\u{27E7} ({label}) — replace it by handle",
+                                n.handle
+                            ));
+                        }
+                        hint
+                    }),
             ));
         }
         1 => {}
@@ -761,6 +791,28 @@ pub(crate) fn run_edit_op(
         )?),
     };
 
+    // Issue 37 (C): the advisory head-change note — a replace whose NEW
+    // content's head symbol differs from the target form's head flags the
+    // observed mis-aim (a handle passed on the outer `(is ...)` wrapper
+    // believing it was the call). Advisory only: head changes are
+    // legitimate (defn -> def), so it is a note, not a warning, and it
+    // never gates --strict.
+    if mode == Mode::Replace {
+        if let (Some(node), Some(content::Payload::Prepared(p))) =
+            (handle_node.as_ref(), payload.as_ref())
+        {
+            if let (Some(old_head), Some(new_head)) =
+                (node.head.as_deref(), leading_head_symbol(&p.bytes))
+            {
+                if old_head != new_head {
+                    notes.push(format!(
+                        "form head changed: {old_head} -> {new_head} (check you targeted the intended form)"
+                    ));
+                }
+            }
+        }
+    }
+
     // Splice + allowed-change window + actual splice window (lo, hi).
     let (sp, allowed, mut bound) =
         plan_splice(mode, bytes, &before_forms, handle_node.as_ref(), &payload)?;
@@ -1177,6 +1229,58 @@ fn chain_index_map(nodes: &[handle::Node]) -> std::collections::HashMap<Vec<u32>
         .collect()
 }
 
+/// One tracked chain's share of an op's verified top-level position shift
+/// (issue 36 step 4 (2), shared with the issue 37 (A) end-state echo
+/// chains): the op's net form-count change (I3-checked) is authoritative —
+/// prepend +n at the front, insert +n, top-level replace +(n−1), delete
+/// −1, all at/after the target's slot (insert-before also moves the anchor
+/// form itself); nested inserts/deletes/multi-form replaces shift LATER
+/// SIBLINGS of the anchor inside the anchor's parent. Patch and append
+/// have no modeled structural effect. delete/replace/insert-* always carry
+/// a resolved target (validated upstream); a missing chain is a no-op, not
+/// a panic — the construction stays total.
+fn shift_tracked_chain(
+    c: &mut Vec<u32>,
+    mode: Mode,
+    c_k: Option<&Vec<u32>>,
+    contributed: usize,
+) {
+    match mode {
+        Mode::Prepend => {
+            if contributed > 0 {
+                c[0] += contributed as u32;
+            }
+        }
+        Mode::Append => {}
+        m => {
+            let shift = match m {
+                Mode::Delete => -1i64,
+                Mode::Replace => (contributed as i64) - 1,
+                Mode::InsertBefore | Mode::InsertAfter => contributed as i64,
+                _ => 0, // patch: no modeled structural effect
+            };
+            if shift == 0 {
+                return;
+            }
+            let Some(ck) = c_k else {
+                return;
+            };
+            let d = ck.len();
+            let anchor_idx = ck[d - 1]; // 1-based, in the parent
+            if c.len() < d || c[..d - 1] != ck[..d - 1] {
+                return;
+            }
+            let pos = c[d - 1];
+            if pos > anchor_idx {
+                c[d - 1] = (pos as i64 + shift) as u32;
+            } else if pos == anchor_idx && m == Mode::InsertBefore && *c == *ck {
+                // The anchor form itself moves (insert-before).
+                c[d - 1] = (pos as i64 + shift) as u32;
+            }
+        }
+    }
+}
+
 /// Wrap an op-level failure with the failing op's identity (the batch's
 /// error names the op index + keeps the standard recovery affordances —
 /// code, exit, position, hint, suggestions, diagnostics — untouched).
@@ -1195,6 +1299,73 @@ fn wrap_op_error(fail: Fail, idx: usize, ops: &[ParsedBatchOp]) -> Fail {
             ..body
         },
     )
+}
+
+/// Issue 37 (A): wrap an op-level failure DURING batch execution: the ABORT
+/// LINE leads the response (it names the failing op and states that nothing
+/// was written), and every op that had already run rides along relabeled —
+/// `would apply (not written — batch aborted at op N)` — so a failed batch
+/// reads as a refusal, never as accomplishments. The relabeled blocks carry
+/// each op's summary line (the accomplished-tense verb dropped: patched →
+/// patch), its changed-region diff, and its affected rows.
+fn wrap_abort_error(
+    fail: Fail,
+    idx: usize,
+    ops: &[ParsedBatchOp],
+    blocks: &[serde_json::Value],
+) -> Fail {
+    let exit = fail.0;
+    let body = fail.1;
+    let op = &ops[idx];
+    let who = match &op.handle {
+        Some(h) => format!("{} \u{27E6}{h}\u{27E7}", mode_name(&op.mode)),
+        None => mode_name(&op.mode).to_string(),
+    };
+    let n = idx + 1;
+    let message = format!(
+        "batch aborted at op {n} of {} ({who}) — nothing was written: {}",
+        ops.len(),
+        body.message
+    );
+    let relabel = format!("would apply (not written — batch aborted at op {n})");
+    let mut batch_blocks: Vec<errors::BatchOpBlock> = Vec::new();
+    for (k, b) in blocks.iter().enumerate() {
+        let line = b["text"]
+            .as_str()
+            .and_then(|t| t.lines().next())
+            .unwrap_or("");
+        let summary_line = if ops.len() > 1 {
+            format!("op {}/{}: {}: {}", k + 1, ops.len(), relabel, would_apply_line(line))
+        } else {
+            format!("{}: {}", relabel, would_apply_line(line))
+        };
+        batch_blocks.push(errors::BatchOpBlock {
+            op: k + 1,
+            handle: b["handle"].as_str().map(String::from),
+            mode: b["mode"].as_str().unwrap_or("").to_string(),
+            summary_line,
+            diff: b["diff"].as_str().filter(|s| !s.is_empty()).map(String::from),
+            affected: b["affected"].as_str().filter(|s| !s.is_empty()).map(String::from),
+        });
+    }
+    Fail(exit, ErrorBody { message, ..body }.with_batch_ops(batch_blocks))
+}
+
+/// "patched form …" -> "patch form …": the accomplished-tense verb of the
+/// op's summary line becomes the mode name — the op never wrote anything,
+/// so the relabeled block must not read as one.
+fn would_apply_line(line: &str) -> String {
+    let (first, rest) = line
+        .split_once(' ')
+        .unwrap_or((line, ""));
+    let v = match first {
+        "patched" => "patch",
+        "replaced" => "replace",
+        "deleted" => "delete",
+        "inserted" => "insert",
+        _ => return line.to_string(),
+    };
+    format!("{v} {rest}")
 }
 
 /// The targeted target-loss failure (issue 36, item 4): the later op
@@ -1227,6 +1398,106 @@ fn target_lost_error(i: usize, gone: usize, ops: &[ParsedBatchOp]) -> Fail {
             "the batch is atomic: nothing was written. Drop or reorder the conflicting op (or split the batch into separate clj_edit calls); run tree for current handles",
         ),
     )
+}
+
+/// Issue 37 (A): one end-state-echo entry — a DISTINCT form the batch
+/// touched (in first-touch order; a form edited by k ops is one entry,
+/// resolved against the post-batch state, with the LAST op's data as the
+/// delete/restructure fallback).
+struct EchoEntry {
+    /// Chain-keyed (a patch/replace/delete target): the pre-batch position
+    /// chain — the post-batch resolution is a chain lookup in the final
+    /// node table.
+    chain: Option<Vec<u32>>,
+    /// Insert-keyed (an inserted form): its post-op handle — inserted forms
+    /// are never addressable mid-batch, so the handle is the identity.
+    ins_handle: Option<String>,
+    /// The last op that touched this form (its block carries the
+    /// delete/restructure fallback data).
+    last_op: usize,
+    /// A batch op deleted the form (no post-batch form to echo).
+    deleted: bool,
+}
+
+/// Upsert an echo entry (first-touch order; a repeat touch updates the
+/// last-op data and the delete flag — a form edited by k ops stays one
+/// entry).
+fn touch_echo(echo: &mut Vec<(String, EchoEntry)>, key: String, e: EchoEntry) {
+    if let Some(item) = echo.iter_mut().find(|(k, _)| *k == key) {
+        item.1.last_op = e.last_op;
+        item.1.deleted = item.1.deleted || e.deleted;
+    } else {
+        echo.push((key, e));
+    }
+}
+
+/// One resolvable node's echo line: post-batch handle, label, line span,
+/// and the first line of the form's final bytes.
+fn node_echo_line(bytes: &[u8], n: &handle::Node) -> String {
+    let first = String::from_utf8_lossy(line_at(bytes, n.start_byte));
+    format!(
+        "  \u{27E6}{}\u{27E7} {} (lines {}–{}): {first}",
+        n.handle,
+        node_echo_label(n),
+        n.line[0],
+        n.line[1]
+    )
+}
+
+/// The echo's form label: head + def name ("defn f"), else head, else the
+/// node's kind.
+fn node_echo_label(n: &handle::Node) -> String {
+    match (&n.def_name, &n.head) {
+        (Some(d), Some(h)) => format!("{h} {d}"),
+        (Some(d), None) => d.clone(),
+        (None, Some(h)) => h.clone(),
+        (None, None) => n.kind.clone(),
+    }
+}
+
+/// The form label out of a summary value (the fallback path: the last op's
+/// summary carries head/name/kind-or-wasKind — head + name combined, the
+/// echo's label shape).
+fn summary_echo_label(s: &serde_json::Value) -> String {
+    let name = s["name"].as_str().filter(|v| !v.is_empty());
+    let head = s["head"].as_str().filter(|v| !v.is_empty());
+    match (name, head) {
+        (Some(n), Some(h)) => format!("{h} {n}"),
+        (Some(n), None) => n.to_string(),
+        (None, Some(h)) => h.to_string(),
+        (None, None) => {
+            for k in ["kind", "wasKind"] {
+                if let Some(v) = s[k].as_str().filter(|v| !v.is_empty()) {
+                    return v.to_string();
+                }
+            }
+            "form".to_string()
+        }
+    }
+}
+
+/// The line span out of a summary value (post-edit `line`, else the
+/// pre-edit `wasLine`/`lineBefore`).
+fn summary_echo_line(s: &serde_json::Value) -> Option<(usize, usize)> {
+    for k in ["line", "wasLine", "lineBefore"] {
+        if let Some(a) = s[k].as_array().filter(|a| a.len() == 2) {
+            if let (Some(lo), Some(hi)) = (a[0].as_u64(), a[1].as_u64()) {
+                return Some((lo as usize, hi as usize));
+            }
+        }
+    }
+    None
+}
+
+/// An echo line without a first-line echo (the identity-only fallbacks):
+/// the span when the summary carries one, the bare identity otherwise.
+fn push_identity_line(lines: &mut Vec<String>, h: &str, label: &str, span: Option<(usize, usize)>) {
+    match span {
+        Some((a, b)) => lines.push(format!(
+            "  \u{27E6}{h}\u{27E7} {label} (lines {a}–{b})"
+        )),
+        None => lines.push(format!("  \u{27E6}{h}\u{27E7} {label}")),
+    }
 }
 
 /// The batch aggregate: forms whose bytes do not match any original form's
@@ -1326,6 +1597,11 @@ pub fn run_batch_edit(
     let mut text_parts: Vec<String> = Vec::with_capacity(n_ops);
     let mut notes: Vec<String> = Vec::new();
     let mut last_final: Option<(Vec<parser::Form>, Vec<invariants::DetectorWarning>)> = None;
+    // Issue 37 (A): end-state echo bookkeeping — one entry per DISTINCT
+    // touched form, in first-touch order (a form edited by k ops appears
+    // once; the post-batch state resolves it, the LAST touch supplies the
+    // delete/restructure fallback data).
+    let mut echo: Vec<(String, EchoEntry)> = Vec::new();
 
     for (i, op) in ops.iter().enumerate() {
         // The target state (append/prepend carry none).
@@ -1394,7 +1670,13 @@ pub fn run_batch_edit(
             format_content,
         ) {
             Ok(o) => o,
-            Err(f) => return Err(wrap_op_error(f, i, &ops)),
+            Err(f) => {
+                // Issue 37 (A): the abort response — the abort line leads,
+                // and every op that had run is relabeled "would apply
+                // (not written — batch aborted at op N)"; nothing was
+                // written (atomic), so the blocks are counterfactual.
+                return Err(wrap_abort_error(f, i, &ops, &blocks));
+            }
         };
 
         // The per-op block (issue 32 shape, scoped: diff + summary +
@@ -1464,6 +1746,49 @@ pub fn run_batch_edit(
             }
         }
 
+        // ── Issue 37 (A) end-state echo: record the forms this op
+        //    touched. Addressed forms (patch/replace/delete) key on the
+        //    pre-batch position chain (same-form sequences collapse to
+        //    one entry); inserted forms key on their post-op handle
+        //    (inserted forms are never addressable mid-batch, so they
+        //    cannot repeat). ──
+        if matches!(op.mode, Mode::Patch | Mode::Replace | Mode::Delete) {
+            if let Some(c) = &outcome.target_chain {
+                let key = format!(
+                    "chain:{}",
+                    c.iter().map(ToString::to_string).collect::<Vec<_>>().join(".")
+                );
+                touch_echo(
+                    &mut echo,
+                    key,
+                    EchoEntry {
+                        chain: Some(c.clone()),
+                        ins_handle: None,
+                        last_op: i,
+                        deleted: op.mode == Mode::Delete,
+                    },
+                );
+            }
+        }
+        for ins in blocks[i]["summary"]["inserted"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            if let Some(h) = ins.get("handle").and_then(|v| v.as_str()) {
+                touch_echo(
+                    &mut echo,
+                    format!("ins:{h}"),
+                    EchoEntry {
+                        chain: None,
+                        ins_handle: Some(h.to_string()),
+                        last_op: i,
+                        deleted: false,
+                    },
+                );
+            }
+        }
+
         // ── Step 4: identity bookkeeping for the remaining ops. ──
         let c_k = outcome.target_chain.clone(); // the pre-op target chain
         // (1) A replace or delete DESTROYS the pre-batch form: the slot and
@@ -1486,56 +1811,17 @@ pub fn run_batch_edit(
             }
         }
         // (2) Position shifts for the verified top-level effect: the op's
-        //     net form-count change (I3-checked) is authoritative — insert
-        //     +n, top-level replace +(n−1), delete −1, all at/after the
-        //     target's slot (insert-before also moves the anchor itself);
-        //     nested inserts/deletes/multi-form replaces shift LATER
-        //     SIBLINGS of the anchor inside the anchor's parent.
-        match op.mode {
-            Mode::Prepend => {
-                let n = outcome.contributed as u32;
-                if n > 0 {
-                    for t in targets.iter_mut().skip(i + 1).flatten() {
-                        t.chain[0] += n;
-                    }
-                }
+        //     net form-count change (I3-checked) is authoritative — see
+        //     `shift_tracked_chain` (shared with the issue 37 (A) end-state
+        //     echo chains, which must stay aligned with the tracked
+        //     targets through every op).
+        for t in targets.iter_mut().skip(i + 1).flatten() {
+            shift_tracked_chain(&mut t.chain, op.mode, c_k.as_ref(), outcome.contributed);
+        }
+        for (_key, e) in echo.iter_mut() {
+            if let Some(c) = &mut e.chain {
+                shift_tracked_chain(c, op.mode, c_k.as_ref(), outcome.contributed);
             }
-            Mode::Append => {}
-            m if c_k.is_some() => {
-                let shift = match m {
-                    Mode::Delete => -1i64,
-                    Mode::Replace => (outcome.contributed as i64) - 1,
-                    Mode::InsertBefore | Mode::InsertAfter => outcome.contributed as i64,
-                    _ => 0, // patch: no modeled structural effect
-                };
-                if shift != 0 {
-                    let ck = match c_k.as_ref() {
-                        Some(c) => c,
-                        // The guard arm (`m if c_k.is_some()`) establishes
-                        // this; the hard assertion is the proof (issue 30 L1).
-                        #[allow(clippy::unreachable)]
-                        None => unreachable!("c_k is Some here"),
-                    };
-                    let d = ck.len();
-                    let anchor_idx = ck[d - 1]; // 1-based, in the parent
-                    for t in targets.iter_mut().skip(i + 1).flatten() {
-                        if t.chain.len() < d || t.chain[..d - 1] != ck[..d - 1] {
-                            continue;
-                        }
-                        let pos = t.chain[d - 1];
-                        if pos > anchor_idx {
-                            t.chain[d - 1] = (pos as i64 + shift) as u32;
-                        } else if pos == anchor_idx
-                            && m == Mode::InsertBefore
-                            && t.chain == *ck
-                        {
-                            // The anchor form itself moves (insert before).
-                            t.chain[d - 1] = (pos as i64 + shift) as u32;
-                        }
-                    }
-                }
-            }
-            _ => {}
         }
         // (3) Dirty marking: the op's verified change window (zero-width
         //     for inserts — they displace, they never rewrite) against each
@@ -1611,9 +1897,91 @@ pub fn run_batch_edit(
         changed,
         untouched
     );
+    // Issue 37 (A): the end-state echo on SUCCESSFUL multi-op batches —
+    // one entry per DISTINCT touched form (a form edited by k ops appears
+    // once), resolved against the POST-BATCH state: its post-batch handle,
+    // label, line span, and the first line of its final bytes — all
+    // intended changes verifiable in one place.
+    let echo_lines: Option<Vec<String>> = (n_ops > 1 && !echo.is_empty()).then(|| {
+        let handle_index: std::collections::HashMap<&str, usize> = cur_nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.handle.as_str(), i))
+            .collect();
+        let mut lines: Vec<String> = Vec::new();
+        for (_key, e) in &echo {
+            match &e.chain {
+                Some(c) => {
+                    if e.deleted {
+                        // The form is gone — echo its pre-batch identity
+                        // (the deleting op's summary carries it).
+                        let s = &blocks[e.last_op]["summary"];
+                        let h = s["wasHandle"].as_str().unwrap_or("");
+                        match summary_echo_line(s) {
+                            Some((a, b)) => lines.push(format!(
+                                "  \u{27E6}{h}\u{27E7} {} (was lines {a}–{b}) — deleted",
+                                summary_echo_label(s)
+                            )),
+                            None => lines.push(format!(
+                                "  \u{27E6}{h}\u{27E7} {} — deleted",
+                                summary_echo_label(s)
+                            )),
+                        }
+                    } else if let Some(&idx) = cur_chain_map.get(c) {
+                        lines.push(node_echo_line(&cur, &cur_nodes[idx]));
+                    } else {
+                        // The last op restructured this position (the
+                        // chain stopped resolving): the op's summary
+                        // carries the best identity, without a first line
+                        // (the form's bytes are not addressable by chain).
+                        let s = &blocks[e.last_op]["summary"];
+                        let h = s["handle"]
+                            .as_str()
+                            .or_else(|| s["wasHandle"].as_str())
+                            .unwrap_or("");
+                        push_identity_line(&mut lines, h, &summary_echo_label(s), summary_echo_line(s));
+                    }
+                }
+                None => {
+                    // An inserted form: resolve its post-op handle in the
+                    // post-batch table (the inserted bytes are never
+                    // rewritten by a later batch op — inserted forms are
+                    // not addressable mid-batch — so only the span/handle
+                    // can move).
+                    let Some(h) = e.ins_handle.as_deref() else { continue };
+                    match handle_index.get(h) {
+                        Some(&idx) => lines.push(node_echo_line(&cur, &cur_nodes[idx])),
+                        None => {
+                            // Rare: the handle rotated in a later op — the
+                            // inserting op's summary entry carries the
+                            // identity (no first line: not verifiable from
+                            // the post-batch state).
+                            let entry = blocks[e.last_op]["summary"]["inserted"]
+                                .as_array()
+                                .and_then(|a| a.iter().find(|v| v["handle"] == h))
+                                .unwrap_or(&serde_json::Value::Null);
+                            let h = entry["handle"].as_str().unwrap_or(h);
+                            let label = summary_echo_label(entry);
+                            match summary_echo_line(entry) {
+                                Some((a, b)) => lines.push(format!(
+                                    "  \u{27E6}{h}\u{27E7} {label} (lines {a}–{b})"
+                                )),
+                                None => lines.push(format!("  \u{27E6}{h}\u{27E7} {label}")),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        lines
+    });
     let mut text = text_parts.join("\n\n");
     text.push('\n');
     text.push_str(&aggregate);
+    if let Some(lines) = &echo_lines {
+        text.push_str("\n\nend state (post-batch):\n");
+        text.push_str(&lines.join("\n"));
+    }
 
     let result = serde_json::json!({
         "text": text,
@@ -1657,4 +2025,216 @@ fn find_all(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
         }
     }
     out
+}
+
+// ─── Issue 37 diagnostics ──────────────────────────────────────────────────
+
+/// Leading-whitespace count of a line in the reindent's display-width
+/// convention (SPEC §10.5: a tab counts as 2 spaces).
+fn ws_units(line: &[u8]) -> usize {
+    let mut n = 0;
+    for &b in line {
+        match b {
+            b' ' => n += 1,
+            b'\t' => n += 2,
+            _ => break,
+        }
+    }
+    n
+}
+
+/// The file line starting at `start` (up to its newline, or the region end).
+fn line_at(bytes: &[u8], start: usize) -> &[u8] {
+    match bytes[start..].iter().position(|b| *b == b'\n') {
+        Some(rel) => &bytes[start..start + rel],
+        None => &bytes[start..],
+    }
+}
+
+/// The byte offset just past the newline ending the line at `start`.
+fn next_line_start(bytes: &[u8], start: usize) -> Option<usize> {
+    bytes[start..]
+        .iter()
+        .position(|b| *b == b'\n')
+        .map(|rel| start + rel + 1)
+}
+
+/// True when `norm` (per-line whitespace-normalized needle) matches the
+/// region of `scoped` starting at line offset `pos`: every needle line
+/// begins its file line's CONTENT (past the file line's leading
+/// whitespace) with the same content (a non-final needle line occupies its
+/// whole content; the final line may be a prefix of the file line — the
+/// oldText may end mid-line).
+fn norm_matches(scoped: &[u8], mut pos: usize, norm: &[&[u8]]) -> bool {
+    for (i, nl) in norm.iter().enumerate() {
+        // The file line's leading whitespace is exactly what the diagnosis
+        // measures: align the comparison on the line's content.
+        let mut p = pos;
+        while matches!(scoped.get(p), Some(b' ') | Some(b'\t')) {
+            p += 1;
+        }
+        if !scoped[p..].starts_with(nl) {
+            return false;
+        }
+        if i + 1 == norm.len() {
+            return true;
+        }
+        // A non-final needle line is a whole content line: nothing may
+        // follow it on its file line, and the region must not end
+        // mid-needle.
+        match scoped[p..].iter().position(|b| *b == b'\n') {
+            None => return false,
+            Some(rel) => {
+                if !scoped[p + nl.len()..p + rel].is_empty() {
+                    return false;
+                }
+                pos = p + rel + 1;
+            }
+        }
+    }
+    true
+}
+
+/// Issue 37 (B): the whitespace-normalized diagnosis of a patch-not-found
+/// refusal. Normalizes LEADING whitespace per line of the needle (the
+/// re-typed-continuation-line failure: one space off, same content) and
+/// looks for regions of the target form's bytes whose lines carry the same
+/// content: exactly ONE such region -> the region's form line plus per-line
+/// leading-space deltas for that region; zero or several -> None (no
+/// guessing — the refusal message stays as-is). The refusal stands in all
+/// cases; this is diagnosis, not inference. Token-sequence matching
+/// (ignoring whitespace anywhere) is out of scope by design (riskier).
+fn indentation_diagnostics(scoped: &[u8], needle: &[u8]) -> Option<(usize, Vec<String>)> {
+    let lines: Vec<&[u8]> = needle.split(|b| *b == b'\n').collect();
+    let ws: Vec<usize> = lines.iter().map(|l| ws_units(l)).collect();
+    let norm: Vec<&[u8]> = lines
+        .iter()
+        .enumerate()
+        .map(|(i, l)| {
+            let l = l.strip_suffix(b"\r").unwrap_or(l);
+            &l[ws[i]..]
+        })
+        .collect();
+    if norm.iter().all(|l| l.is_empty()) {
+        return None; // a whitespace-only needle has nothing to diagnose
+    }
+    // Every line start in the region; scan them all and stop at the second
+    // match (zero or multi => no diagnosis).
+    let mut matches = 0usize;
+    let mut hit = 0usize;
+    let mut pos = 0usize;
+    loop {
+        if norm_matches(scoped, pos, &norm) {
+            matches += 1;
+            hit = pos;
+            if matches > 1 {
+                return None;
+            }
+        }
+        match next_line_start(scoped, pos) {
+            Some(n) => pos = n,
+            None => break,
+        }
+    }
+    if matches != 1 {
+        return None;
+    }
+    let region_line = 1 + scoped[..hit].iter().filter(|b| **b == b'\n').count();
+    // Per-line deltas against the matched region: report only the lines
+    // that actually differ (an all-equal set is the exact match that
+    // `find_all` already ruled out, modulo line endings — no diagnosis).
+    let mut deltas: Vec<String> = Vec::new();
+    let mut p = hit;
+    for (i, nl) in norm.iter().enumerate() {
+        if !nl.is_empty() {
+            let expected = ws_units(line_at(scoped, p));
+            if expected != ws[i] {
+                deltas.push(format!(
+                    "line {} of oldText: expected {expected} leading spaces, got {}",
+                    i + 1,
+                    ws[i]
+                ));
+            }
+        }
+        p = next_line_start(scoped, p).unwrap_or(scoped.len());
+    }
+    (matches == 1 && !deltas.is_empty()).then_some((region_line, deltas))
+}
+
+/// Issue 37 (D): the sub-form steering match of a patch-not-found refusal.
+/// The trimmed oldText matching EXACTLY ONE nested sub-form's bytes in the
+/// target form (the node table carries the nested handles) returns that
+/// node; zero or several matches -> None (no steering without a fact).
+fn subform_match(bytes: &[u8], node: &handle::Node, old: &str) -> Option<handle::Node> {
+    let trimmed = old.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Refusal path only (hits == 0): the whole-file node table is built
+    // once here, never on the success path.
+    let nodes = handle::collect(bytes);
+    let mut found: Vec<handle::Node> = nodes
+        .iter()
+        .filter(|n| {
+            n.start_byte > node.start_byte
+                && n.end_byte < node.end_byte
+                && &bytes[n.start_byte..n.end_byte] == trimmed.as_bytes()
+        })
+        .cloned()
+        .collect();
+    // exactly one: the single element; zero or several: None (no steering
+    // without the exact-bytes fact).
+    if found.len() != 1 {
+        return None;
+    }
+    found.pop()
+}
+
+/// Issue 37 (C): the head symbol of submitted whole-form content — the
+/// first symbol after a list's opening delimiter, or the leading atom
+/// token of a non-list form (a list replaced by a scalar has a changed
+/// "head" too). Vectors, maps, reader-prefixed forms, and empty lists
+/// carry no head (None — the note stays silent rather than guess).
+fn leading_head_symbol(bytes: &[u8]) -> Option<String> {
+    let mut rest = bytes;
+    while matches!(rest.first(), Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r')) {
+        rest = &rest[1..];
+    }
+    match rest.first() {
+        Some(b'(') => {
+            let mut inner = &rest[1..];
+            while matches!(
+                inner.first(),
+                Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r')
+            ) {
+                inner = &inner[1..];
+            }
+            if inner.first() == Some(&b')') {
+                return None; // empty list
+            }
+            read_atom_token(inner)
+        }
+        Some(b'[') | Some(b'{') => None,
+        Some(_) => read_atom_token(rest),
+        None => None,
+    }
+}
+
+/// The leading Clojure atom/symbol token (alphanumerics + the symbol
+/// punctuation), or None when the form does not start with one.
+fn read_atom_token(s: &[u8]) -> Option<String> {
+    let mut end = 0;
+    while let Some(&b) = s.get(end) {
+        if b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'-' | b'?' | b'+' | b'*' | b'/' | b'&' | b'=' | b'<' | b'>' | b'!' | b'.'
+            )
+        {
+            end += 1;
+        } else {
+            break;
+        }
+    }
+    (end > 0).then(|| String::from_utf8_lossy(&s[..end]).into_owned())
 }

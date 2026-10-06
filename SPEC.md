@@ -496,7 +496,7 @@ session.
 | `clj_forms` | `{path}` | `cljform forms --json`; refreshes the fingerprint cache |
 | `clj_tree` | `{path, name?, depth?, json?, startLine?, endLine?, recover?}` | `cljform tree` — the primary handle-discovery view (`--depth N\|all`); `name` maps to `--name SYM` (the §10.2 selector: matched subtrees at full depth, zero matches is an ok empty result); `json` returns the structured node list; `startLine`/`endLine` map to `--start-line`/`--end-line` (the §10.2 line window: complete forms only, real file line numbers, the effective span echoed — page large files; the window header/echo passes through unchanged); `recover` maps to `--recover` (the §10.2 broken-file recovery view: on a broken file the JSON path renders the diagnostics + intact-form labels + window echo — no handles; on a healthy file the normal view). **Human path (default, `--human`) is a pass-through:** the annotated source is not a JSON envelope, so on exit 0 the wrapper returns `stdout` directly (BOM-stripped, `trimEnd`) with no `isError` — a successful default `clj_tree` is never an error and is never prefixed `cljform failed:`. Only a nonzero exit (or, in `json` mode, an unparseable/`ok:false` envelope) yields `isError`, using `errorText` when the output parses as an error envelope, else the `cljform failed: ${stderr \|\| stdout}` fallback. **Large-file default (issue 33 Part B):** a DEFAULT call (no `name`/`json`/`depth`/`startLine`/`endLine`/`recover`) on a file with MORE than `TREE_INDEX_THRESHOLD_LINES` (300, a wrapper constant) lines returns the compressed **FORM INDEX** instead of the whole annotated dump: a header `large file: N lines, M top-level forms — showing the form index (handles are live). Annotated view: pass startLine/endLine; a specific form: name.` then one `⟦handle⟧ head name (lines X–Y)` row per top-level form, sorted by line (the `--name`-block label style), with NO source body. The rows come from `cljform tree --json --depth 1` (a small payload since issue 33 Part A); a nonzero exit from that call surfaces as the same error result as the normal path. The index scales with form count, the annotated view with file size — the default picks the right tool instead of the biggest dump. Explicit calls are honored exactly and uncapped (`startLine`/`endLine` → the windowed annotated view; `name` → the selector view; `json` → the node table; `depth` → the cutoff), and below the threshold the pass-through is byte-identical (the CLI's own `tree` contract is unchanged — the wrapper owns the agent ergonomics) |
 | `clj_get` | `{path, name? / handle?}` | `cljform get --json` — exact bytes + the form's `⟦handle⟧` |
-| `clj_edit` | `{path, handle?, mode?, content? / oldText? + newText?, dryRun?, strict?, repair?, autoFormat?, ops?}` | `cljform edit --handle …` — mode auto-selects `patch` when `oldText` is present; append/prepend take no handle; `dryRun` ⇒ `--dry-run`, `strict` ⇒ `--strict`, `repair` ⇒ `--repair`; `autoFormat` (default true) maps to the in-edit content reindent: `false` passes `--no-format-content`, `true` (the default) passes nothing and lets `cljform edit` reindent the content itself in parinfer paren mode (§10.3/§10.5; a refused reindent is reported by the CLI as a note, the edit never fails for it); the wrapper no longer runs a separate `cljform format` call; `oldText`/`newText` are exact patch text and are never reformatted. **Batch (issue 36):** `ops` (an array of `{handle?, mode?, content? / oldText? + newText?}`) takes precedence over the single-op params (passing both is a wrapper-side usage error) and maps to `cljform edit --batch <tempfile>` — N ops in one atomic call, every handle resolved against the ORIGINAL file and each target tracked across the batch (§10.3 batch contract); the wrapper validates each op's shape up front (same contract as the single-op params, the error names the op index) and renders `result.text` (the composed per-op blocks + aggregate line) as-is, then appends a `next handles (post-batch):` block sourced from the per-op `result.ops[*].summary` (replaced/patched → the new handle; inserted → the inserted handle) so the agent chases post-batch handles without a `clj_tree` round-trip; `dryRun/strict/repair/autoFormat` apply to the whole batch **Next-handle affordance (issue 35):** on every successful (non-dry-run) edit the wrapper appends a final line sourced from the JSON envelope (`result.summary`), never from re-parsing the human text — `replace`/`patch` append `next handle: ⟦H⟧ — use it for the next edit to this form` (from `summary.handle`; falls back to `summary.wasHandle` only when `handle` is absent) so the agent chases the returned handle instead of re-fetching; `insert-after`/`insert-before` render `summary.inserted` (one labeled entry per top-level inserted form, §10.3 insert response contract) as a self-sufficient block — `inserted after ⟦anchor⟧:` / `  ⟦handle⟧ head name (lines a–b)` per entry / `— use these for the next edit` — and a SINGLE-entry insert collapses to the established `next handle:` line instead; `delete` appends nothing (the form is gone — no stale handle). Old envelopes (pre-issue-35 `summary.handles`) still render the legacy bare list |
+| `clj_edit` | `{path, handle?, mode?, content? / oldText? + newText?, dryRun?, strict?, repair?, autoFormat?, ops?}` | `cljform edit --handle …` — mode auto-selects `patch` when `oldText` is present; append/prepend take no handle; `dryRun` ⇒ `--dry-run`, `strict` ⇒ `--strict`, `repair` ⇒ `--repair`; `autoFormat` (default true) maps to the in-edit content reindent: `false` passes `--no-format-content`, `true` (the default) passes nothing and lets `cljform edit` reindent the content itself in parinfer paren mode (§10.3/§10.5; a refused reindent is reported by the CLI as a note, the edit never fails for it); the wrapper no longer runs a separate `cljform format` call; `oldText`/`newText` are exact patch text and are never reformatted. **Batch (issue 36):** `ops` (an array of `{handle?, mode?, content? / oldText? + newText?}`) takes precedence over the single-op params (passing both is a wrapper-side usage error) and maps to `cljform edit --batch <tempfile>` — N ops in one atomic call, every handle resolved against the ORIGINAL file and each target tracked across the batch (§10.3 batch contract); the wrapper validates each op's shape up front (same contract as the single-op params, the error names the op index) and renders `result.text` (the composed per-op blocks + aggregate line) as-is, then appends a `next handles (post-batch):` block sourced from the per-op `result.ops[*].summary` (replaced/patched → the new handle; inserted → the inserted handle) so the agent chases post-batch handles without a `clj_tree` round-trip; a successful multi-op batch's `result.text` carries the end-state echo (the `end state (post-batch):` block, §10.3) which the as-is rendering surfaces; a batch ABORT renders `error.batch_ops` (the relabeled would-apply per-op blocks, §10.3 batch abort rendering) directly under the error line — both sourced from the JSON envelope, never from re-parsing human text. **Issue 37 patch-not-found hints:** the wrapper passes the CLI's `hint`/`message` through verbatim, so the indentation-delta diagnosis (B) and the sub-form steering hint (D) reach the agent without wrapper logic. **Next-handle affordance (issue 35):** on every successful (non-dry-run) edit the wrapper appends a final line sourced from the JSON envelope (`result.summary`), never from re-parsing the human text — `replace`/`patch` append `next handle: ⟦H⟧ — use it for the next edit to this form` (from `summary.handle`; falls back to `summary.wasHandle` only when `handle` is absent) so the agent chases the returned handle instead of re-fetching; `insert-after`/`insert-before` render `summary.inserted` (one labeled entry per top-level inserted form, §10.3 insert response contract) as a self-sufficient block — `inserted after ⟦anchor⟧:` / `  ⟦handle⟧ head name (lines a–b)` per entry / `— use these for the next edit` — and a SINGLE-entry insert collapses to the established `next handle:` line instead; `delete` appends nothing (the form is gone — no stale handle). Old envelopes (pre-issue-35 `summary.handles`) still render the legacy bare list |
 | `clj_draft` | `{content}` | `cljform materialize --content-file …` — returns candidate + diff; never writes |
 
 **Fingerprint cache:** in-memory `Map<realpath, forms>`. Refreshed on every
@@ -826,7 +826,11 @@ collection delimiter:
   untouched-forms byte-identical + boundary check → I3 form-count window
   → strict/repair gates). Any failing op fails the whole batch: nothing
   is written, and the error envelope is the failing op's single-op
-  envelope prefixed with its 0-based index (`batch op N: …`).
+  envelope with the abort line leading (`batch aborted at op N of M
+  (…) — nothing was written: …`, N 1-based) plus the relabeled
+  would-apply blocks of the ops that had run (`error.batch_ops` — see the
+  batch abort rendering above); a pre-execution refusal (a handle that
+  never resolves) keeps the bare `op N of M (…) : …` prefix.
 - **Result shape.** The `--json` envelope keeps the issue-32 result-first
   shape: `result` gains `applied` (op count) and `ops` — one block per
   op: `{op (0-based), handle (null for append/prepend), mode, …the
@@ -844,6 +848,53 @@ collection delimiter:
 - **Batch-of-one is the single op.** `--batch` with exactly one op writes
   a byte-identical file to the equivalent single-op call (the pipeline
   is shared; only the response shape differs).
+- **Batch abort rendering (issue 37).** When a batch ABORTS at op N (an
+  op's execution fails), the error message LEADS with the abort line —
+  `batch aborted at op N of M (…) — nothing was written: …` (the failing
+  op's own message follows) — and `error.batch_ops` carries every op that
+  had already run as a relabeled block: `{op, handle, mode, summaryLine,
+  diff?, affected?}` where the summaryLine is `op k/M: would apply (not
+  written — batch aborted at op N): <op verb> form …` — the accomplished
+  tense is dropped (patched → patch, replaced → replace, …), so a failed
+  batch never reads as accomplishments. The blocks (and the CLI/wrapper
+  human renderings of them) ride the standard error envelope — the code,
+  exit, position, hint, and recovery affordances of the failing op are
+  untouched; the refusal stands.
+- **End-state echo (issue 37).** A SUCCESSFUL multi-op batch appends a
+  final `end state (post-batch):` block to `result.text`: one entry per
+  DISTINCT touched form (a form edited by k ops appears once, with its
+  post-batch handle), each entry the form's post-batch handle, label,
+  line span, and the first line of its final bytes — all intended changes
+  verifiable in one place. A deleted form is named with its pre-batch
+  handle and `— deleted`; a form whose chain no longer resolves after its
+  last touching op (restructured in place) falls back to that op's
+  summary (no first line). The single-op batch and the single edit carry
+  no echo.
+- **Head-change note (issue 37).** A `replace` whose NEW content's head
+  symbol differs from the target form's head appends the advisory note
+  `form head changed: A -> B (check you targeted the intended form)` —
+  the observed mis-aim (a handle passed on the outer `(is …)` wrapper
+  believing it was the call). Advisory only: head changes are legitimate
+  (defn -> def), so it is a note, not a warning, and it never gates
+  `--strict` (no refusal, no detector interaction). Same-head replaces are
+  silent; vectors/maps and reader-prefixed content carry no head (silent).
+- **patch-not-found hints (issue 37).** On top of the exact-form-bytes
+  handback, two non-inferential diagnostics fire on `patch-not-found`
+  (composable — both may appear): (B) INDENTATION DELTAS — if the
+  whitespace-normalized `--old-text` (leading whitespace per line removed;
+  trailing CR tolerated for CRLF) matches EXACTLY ONE region of the
+  target form's bytes, the message reports the region's form line and the
+  per-line leading-space deltas (`line k of oldText: expected m leading
+  spaces, got n`; a tab counts as 2 spaces, as in the §10.5 reindent);
+  zero or several normalized regions keep the current message untouched
+  (no guessing), as does token-sequence matching (ignoring whitespace
+  anywhere) — out of scope by design, riskier. (D) SUB-FORM STEERING — if
+  the trimmed `--old-text` matches EXACTLY ONE nested sub-form's bytes in
+  the target form, the hint appends `this region is sub-form ⟦h⟧ (label)
+  — replace it by handle` (the sub-form exists with those exact bytes:
+  the handle is a fact, not an inference); zero or several exact
+  sub-forms never steer. The refusal semantics are unchanged in both
+  cases — diagnosis and steering ride the message/hint.
 
 ### 10.4 Content ingest
 

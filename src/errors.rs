@@ -56,6 +56,12 @@ pub struct ErrorBody {
     /// stay byte-identical.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diagnostics: Option<Vec<Diagnostic>>,
+    /// Batch abort blocks (issue 37 A): the relabeled would-apply per-op
+    /// blocks of a `cljform edit --batch` run that aborted after at least
+    /// one op had run — present only on those failures (nothing was
+    /// written; the atomic batch is the refusal).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch_ops: Option<Vec<BatchOpBlock>>,
 }
 
 impl ErrorBody {
@@ -70,6 +76,7 @@ impl ErrorBody {
             hint: None,
             suggestions: None,
             diagnostics: None,
+            batch_ops: None,
         }
     }
 
@@ -98,6 +105,15 @@ impl ErrorBody {
         }
         self
     }
+
+    /// Attach the batch abort blocks (issue 37 A); an empty list attaches
+    /// nothing (the key stays absent on non-batch failures).
+    pub fn with_batch_ops(mut self, blocks: Vec<BatchOpBlock>) -> Self {
+        if !blocks.is_empty() {
+            self.batch_ops = Some(blocks);
+        }
+        self
+    }
 }
 
 #[derive(Serialize)]
@@ -106,6 +122,29 @@ pub struct Suggestion {
     pub kind: String,
     pub name: Option<String>,
     pub line: [usize; 2],
+}
+
+/// One relabeled per-op block of a batch that aborted (issue 37 A): the op's
+/// would-apply summary line (no accomplished-tense verb — nothing was
+/// written), its changed-region diff, and its affected rows. The batch is
+/// atomic, so every block in `ErrorBody::batch_ops` is counterfactual.
+#[derive(Serialize)]
+pub struct BatchOpBlock {
+    /// 1-based op index in the batch.
+    pub op: usize,
+    /// The op's handle (null for append/prepend).
+    pub handle: Option<String>,
+    pub mode: String,
+    /// The op's summary line, relabeled: `would apply (not written — batch
+    /// aborted at op N): <op verb> form …`.
+    #[serde(rename = "summaryLine")]
+    pub summary_line: String,
+    /// The op's changed-region diff — what WOULD have been written.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
+    /// The op's affected rows — what WOULD have changed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub affected: Option<String>,
 }
 
 /// The shared positional-error mapping for PARSE failures: the `ErrorBody`

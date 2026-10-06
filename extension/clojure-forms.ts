@@ -119,6 +119,15 @@ interface CljformOutput {
 		suggestions?: { addr: number; kind: string; name: string | null; line: [number, number] }[];
 			/** Broken-file diagnostics (issue 31): conflict regions + parse-error spans. */
 			diagnostics?: CljDiagnostic[];
+			/**
+			 * Batch abort blocks (issue 37 A): the relabeled would-apply per-op
+			 * blocks of a clj_edit batch that aborted — the error's abort line
+			 * names the failing op and states nothing was written; each block's
+			 * summaryLine is "…: would apply (not written — batch aborted at op
+			 * N): …" (no accomplished-tense verb), plus the op's would-have diff
+			 * and affected rows.
+			 */
+			batch_ops?: { op: number; handle: string | null; mode: string; summaryLine: string; diff?: string; affected?: string }[];
 	};
 }
 
@@ -267,6 +276,18 @@ function errorText(out: CljformOutput): string {
 	const e = out.error!;
 	const at = e.line !== undefined ? ` @ line ${e.line}${e.col !== undefined ? ` col ${e.col}` : ""}` : "";
 	const lines = [`cljform ${e.code}${at}: ${e.message}`];
+	// Issue 37 (A): the batch abort blocks lead the diagnosis — the relabeled
+	// would-apply per-op blocks (the abort line in the message already names
+	// the failing op and states nothing was written); mirrors the CLI's human
+	// error rendering exactly (summaryLine, diff, affected, blank line apart).
+	if (e.batch_ops?.length) {
+		e.batch_ops.forEach((b, i) => {
+			if (i > 0) lines.push("");
+			lines.push(b.summaryLine);
+			if (b.diff) lines.push(b.diff);
+			if (b.affected) lines.push(b.affected);
+		});
+	}
 	if (e.suggestions?.length) {
 		for (const s of e.suggestions) {
 			lines.push(

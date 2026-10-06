@@ -568,6 +568,35 @@ await run("edit-batch-same-form", async () => {
 	check("edit-batch-same-form: both edits on the form", text(out).includes("(def a 12)"), text(out));
 });
 
+await run("edit-batch-abort", async () => {
+	// Issue 37 (A): a batch that fails at op 2 — the abort line leads the
+	// error, the already-run op renders relabeled (would apply, no
+	// accomplished-tense verb), and the file is unchanged.
+	const file = writeEditFixture("batch-37.clj");
+	writeFileSync(file, BATCH_FIXTURE);
+	const hA = await handleFor(tools, file, /\(\u27E6([0-9a-f]+)\u27E7def a/);
+	const hB = await handleFor(tools, file, /\(\u27E6([0-9a-f]+)\u27E7def b/);
+	const out = await tools.get("clj_edit").execute("h", {
+		path: file,
+		ops: [
+			{ handle: hA, mode: "patch", oldText: "(def a 1)", newText: "(def a 11)" },
+			{ handle: hB, mode: "patch", oldText: "nope", newText: "nope2" },
+		],
+	}, null, () => {});
+	const t = text(out);
+	check("edit-batch-abort: is an error", out.isError, t);
+	check("edit-batch-abort: abort line leads", /batch aborted at op 2/.test(t), t);
+	check("edit-batch-abort: nothing-warned phrasing", t.includes("nothing was written"), t);
+	check(
+		"edit-batch-abort: op 1 relabeled would-apply",
+		/\u006Fp 1\/2: would apply \(not written \u2014 batch aborted at op 2\): patch form \u27E6[0-9a-f]+\u27E7/.test(t),
+		t,
+	);
+	check("edit-batch-abort: no accomplished patched language", !/patched/.test(t), t);
+	const { readFileSync } = await import("node:fs");
+	check("edit-batch-abort: the file was not written", readFileSync(file, "utf8") === BATCH_FIXTURE, t);
+});
+
 // ─── report ──────────────────────────────────────────────────────────────────
 for (const p of PASS) console.log(`PASS ${p}`);
 for (const f of FAIL) console.log(`FAIL ${f.name}\n${f.evidence}`);

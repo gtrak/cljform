@@ -237,6 +237,23 @@ fn print_human(out: &Output) {
                 .map(|l| format!(" (line {l}, col {})", e.col.unwrap_or(1)))
                 .unwrap_or_default()
         );
+        // Issue 37 (A): the batch abort blocks lead the diagnosis — the
+        // relabeled would-apply per-op blocks (the abort line above already
+        // names the failing op and states nothing was written).
+        if let Some(blocks) = &e.batch_ops {
+            for (i, b) in blocks.iter().enumerate() {
+                if i > 0 {
+                    eprintln!();
+                }
+                eprintln!("{}", b.summary_line);
+                if let Some(diff) = b.diff.as_deref().filter(|s| !s.is_empty()) {
+                    eprintln!("{diff}");
+                }
+                if let Some(affected) = b.affected.as_deref().filter(|s| !s.is_empty()) {
+                    eprintln!("{affected}");
+                }
+            }
+        }
         if let Some(s) = &e.suggestions {
             for sug in s {
                 eprintln!(
