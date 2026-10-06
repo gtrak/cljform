@@ -315,6 +315,13 @@ fn print_human(out: &Output) {
         // diff, affected rows) plus the aggregate counts line — so it is
         // printed whole, and nothing else from the result is re-printed
         // (the per-op blocks already carry the diffs exactly once).
+        // Issue 38: the VERDICT line leads everything — derived from
+        // verified facts (parse ok + I2 untouched + warning delta), it is
+        // the "did I cause this" answer before the diff, for single ops
+        // and batches alike.
+        if let Some(v) = &out.human_verdict {
+            print_payload(v);
+        }
         if let Some(r) = &out.result {
             if r.get("ops").is_some() {
                 if let Some(text) = r.get("text").and_then(|t| t.as_str()) {
@@ -394,8 +401,23 @@ fn print_human(out: &Output) {
         }
     }
     if let Some(ws) = &out.warnings {
+        // Issue 38: on the edit op the delta has already spoken — the new
+        // warnings led (in the verdict block), so they are not re-listed
+        // here; the pre-existing ones close the output, labeled. Non-edit
+        // ops (check, …) stay flat.
+        let edit_delta = out.op == "edit" && out.warnings_delta.is_some();
         for w in ws {
-            println!("warning {}: {}", w.id, w.message);
+            if edit_delta {
+                match w.new {
+                    Some(true) => {}
+                    Some(false) => {
+                        println!("warning {} (pre-existing): {}", w.id, w.message)
+                    }
+                    None => println!("warning {}: {}", w.id, w.message),
+                }
+            } else {
+                println!("warning {}: {}", w.id, w.message);
+            }
         }
     }
 }

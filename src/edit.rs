@@ -597,7 +597,12 @@ fn plan_splice(
 
 /// The verification tail: the §10.3 boundary proof (the splice only touched
 /// its actual window), the I1 post-splice parse, the I2/I3 untouched-forms
-/// check, and the strict detector gate.
+/// check, and the strict detector gate. The pre-edit warnings (the parse the
+/// pipeline already did for I1's start table, issue 38) feed both the strict
+/// refusal's "N of these are new" decoration and the returned delta.
+#[allow(clippy::too_many_arguments)] // issue 38's pre-warnings ride beside
+// the established verification inputs; a param struct would hide the
+// pipeline's single call site.
 fn verify_edit(
     bytes: &[u8],
     new_bytes: &[u8],
@@ -605,8 +610,17 @@ fn verify_edit(
     handle_node: Option<&handle::Node>,
     bound: (usize, usize),
     allowed: &invariants::Allowed,
+    pre_warnings: &[invariants::DetectorWarning],
     strict: bool,
-) -> Result<(parser::Parsed, invariants::ShapeCheck, Vec<invariants::DetectorWarning>), Fail> {
+) -> Result<
+    (
+        parser::Parsed,
+        invariants::ShapeCheck,
+        Vec<invariants::DetectorWarning>,
+        invariants::WarningDelta,
+    ),
+    Fail,
+> {
     // §10.3 boundary check (I2 extension): the splice may only touch its
     // actual window — [start, end) for replace/patch/delete, and the insert
     // position for inserts (which for a top-level insert-after can be past
@@ -635,16 +649,19 @@ fn verify_edit(
     let shape = invariants::verify_untouched(before_forms, &after_parsed.forms, allowed)
         .map_err(|m| Fail(errors::exit::PARSE, ErrorBody::new("shape-violation", m)))?;
 
-    // Detectors on the result.
+    // Detectors on the result + the issue-38 pre/post delta (the multiset
+    // match on (id, line-span-stripped message): unmatched post -> new).
     let warnings = after_parsed.warnings.clone();
+    let delta = invariants::compute_warning_delta(pre_warnings, &warnings);
     if strict && !warnings.is_empty() {
         return Err(Fail(
             errors::exit::PARSE,
             ErrorBody::new(
                 "detector-fatal",
                 format!(
-                    "--strict: {} detector warning(s), first: {}",
+                    "--strict: {} detector warning(s) ({} of these are new), first: {}",
                     warnings.len(),
+                    delta.new,
                     warnings[0].message
                 ),
             )
@@ -653,7 +670,7 @@ fn verify_edit(
         ));
     }
 
-    Ok((after_parsed, shape, warnings))
+    Ok((after_parsed, shape, warnings, delta))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -890,16 +907,29 @@ pub(crate) fn run_edit_op(
     }
 
     // Verification tail: boundary proof, post-splice parse, untouched
-    // forms, strict detector gate.
-    let (after_parsed, shape, warnings) = verify_edit(
+    // forms, strict detector gate. The pre-edit parse's warnings (already
+    // computed at the top of this op) are the delta's pre side.
+    let (after_parsed, shape, warnings, warning_delta) = verify_edit(
         bytes,
         &new_bytes,
         &before_forms,
         handle_node.as_ref(),
         bound,
         &allowed,
+        &parsed.warnings,
         strict,
     )?;
+
+    // Issue 38: the per-warning attribution flag — `new: true|false` on
+    // every post warning of the edit envelope (check stays flat: its
+    // warnings carry no flag at all).
+    let warnings = {
+        let mut ws = warnings;
+        for (w, is_new) in ws.iter_mut().zip(warning_delta.new_flags.iter()) {
+            w.new = Some(*is_new);
+        }
+        ws
+    };
 
     // No-op detection.
     match (&payload, mode) {
@@ -1020,14 +1050,18 @@ pub(crate) fn run_edit_op(
             })?;
     }
 
+    let verdict =
+        edit_verdict_text(shape.changed, shape.untouched, &warning_delta, &warnings);
     let output = Output::ok("edit")
         .file(Some(file.display().to_string()))
         .file_hash(hashutil::tagged(&hashutil::file_hash(&new_bytes)))
         .forms(after_parsed.forms)
         .result(result)
         .warnings(warnings)
+        .warnings_delta(warning_delta.counts())
         .notes(notes)
-        .human_rows(human_rows);
+        .human_rows(human_rows)
+        .human_verdict(verdict);
 
     Ok(OpOutcome {
         output,
@@ -1041,6 +1075,54 @@ pub(crate) fn run_edit_op(
         new_nodes,
         affected_rows,
     })
+}
+
+// ─── Warning-delta verdict (issue 38) ──────────────────────────────────────────────────────────────────────────
+
+/// The human verdict line: computed from VERIFIED facts only — the op
+/// reached this point (I1 post-parse ok, I2 untouched byte-identical,
+/// boundary proof), and the warning delta is a multiset fact, never a
+/// heuristic. Uncertainty falls loud: an unmatched post warning is new
+/// (a lying clean would be an issue-19-class bug in reverse).
+///
+/// - no new warnings: `verified — C changed, U untouched · warnings: 0
+///   new (P pre-existing)`, plus `; R resolved` when the edit removed
+///   pre-existing warnings (the count is cheap: the pre side is right here);
+/// - new warnings: `N new warning(s) (P pre-existing):` followed by the
+///   NEW entries only (the pre-existing ones follow, labeled, after the
+///   diff/rows — the CLI's print_human owns that tail).
+fn edit_verdict_text(
+    changed: usize,
+    untouched: usize,
+    delta: &invariants::WarningDelta,
+    post: &[invariants::DetectorWarning],
+) -> String {
+    if delta.new == 0 {
+        let tail = if delta.resolved > 0 {
+            format!(
+                "0 new ({p} pre-existing; {r} resolved)",
+                p = delta.pre_existing,
+                r = delta.resolved
+            )
+        } else {
+            format!("0 new ({p} pre-existing)", p = delta.pre_existing)
+        };
+        format!(
+            "verified — {changed} changed, {untouched} untouched · warnings: {tail}"
+        )
+    } else {
+        let plural = if delta.new == 1 { "" } else { "s" };
+        let mut s = format!(
+            "{} new warning{} ({} pre-existing):",
+            delta.new,
+            plural,
+            delta.pre_existing
+        );
+        for w in post.iter().filter(|w| w.new == Some(true)) {
+            s.push_str(&format!("\n  warning {}: {}", w.id, w.message));
+        }
+        s
+    }
 }
 
 // ─── Batch edit (issue 36) ──────────────────────────────────────────────────
@@ -1553,7 +1635,8 @@ pub fn run_batch_edit(
     let n_ops = ops.len();
 
     let (bytes, had_bom) = read_file(file)?;
-    let orig_forms = parse_or_fail(&bytes, "file")?.forms;
+    let orig_parsed = parse_or_fail(&bytes, "file")?;
+    let orig_forms = orig_parsed.forms;
     let orig_nodes = handle::collect(&bytes);
     let mut cur_chain_map = chain_index_map(&orig_nodes);
 
@@ -1889,6 +1972,19 @@ pub fn run_batch_edit(
     #[allow(clippy::expect_used)]
     let (final_forms, warnings) = last_final.expect("the ops array is non-empty (validated)");
     let (changed, untouched) = batch_changed_untouched(&orig_forms, &final_forms);
+    // Issue 38: the batch-level delta — the pre side is the PRE-BATCH
+    // original parse (the batch is one call; its envelope attributes the
+    // batch), not the last op's evolving state. The last op's per-op flags
+    // are fully re-marked below (every post warning gets exactly one flag).
+    let batch_delta =
+        invariants::compute_warning_delta(&orig_parsed.warnings, &warnings);
+    let warnings = {
+        let mut ws = warnings;
+        for (w, is_new) in ws.iter_mut().zip(batch_delta.new_flags.iter()) {
+            w.new = Some(*is_new);
+        }
+        ws
+    };
     let aggregate = format!(
         "{} {} applied; file: {} forms; {} changed, {} untouched",
         n_ops,
@@ -1993,6 +2089,7 @@ pub fn run_batch_edit(
         "wrote": !dry_run,
     });
 
+    let verdict = edit_verdict_text(changed, untouched, &batch_delta, &warnings);
     Ok(
         Output::ok("edit")
             .file(Some(file.display().to_string()))
@@ -2000,7 +2097,9 @@ pub fn run_batch_edit(
             .forms(final_forms)
             .result(result)
             .warnings(warnings)
-            .notes(notes),
+            .warnings_delta(batch_delta.counts())
+            .notes(notes)
+            .human_verdict(verdict),
     )
 }
 

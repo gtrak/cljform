@@ -76,15 +76,19 @@ writeFileSync(boundaryPath, largeFixture(9)); // 280 lines — NOT above the thr
 // ─── mock pi (ExtensionAPI subset the extension touches) ────────────────────
 function makePi() {
 	const tools = new Map();
+	const handlers = new Map();
 	const execCalls = [];
 	return {
 		tools,
+		handlers,
 		execCalls,
 		api: {
 			registerTool(t) {
 				tools.set(t.name, t);
 			},
-			on() {},
+			on(type, fn) {
+				handlers.set(type, fn);
+			},
 			async exec(cmd, args, opts) {
 				execCalls.push({ cmd, args });
 				return new Promise((res, rej) => {
@@ -595,6 +599,70 @@ await run("edit-batch-abort", async () => {
 	check("edit-batch-abort: no accomplished patched language", !/patched/.test(t), t);
 	const { readFileSync } = await import("node:fs");
 	check("edit-batch-abort: the file was not written", readFileSync(file, "utf8") === BATCH_FIXTURE, t);
+});
+
+// ─── issue 38 (warning delta): guard hook cells ─────────────────────────────
+// The guard hook attributes detector warnings against its cached pre-edit
+// snapshot: a shifted pre-existing warning is "0 new", a newly introduced
+// one lists FIRST (the loud side); the flat list stands without a snapshot.
+const GUARD_WARN_FIXTURE = `(ns guard-demo)
+
+(defn outer [x]
+  (def sneaky 1)
+  (inc x))
+
+(def tail 2)
+`;
+
+await run("guard-warning-delta", async () => {
+	const { readFileSync: readFs } = await import("node:fs");
+	const hook = pi.handlers.get("tool_result");
+	check("guard-38: tool_result handler registered", typeof hook === "function", [...pi.handlers.keys()]);
+	if (typeof hook !== "function") return;
+	const file = join(tmp, "guard-38.clj");
+	writeFileSync(file, GUARD_WARN_FIXTURE);
+	const report = async () => {
+		const ev = { type: "tool_result", toolName: "edit", input: { path: file }, content: [{ type: "text", text: "ok" }] };
+		const r = await hook(ev);
+		return r.content[r.content.length - 1].text;
+	};
+	// Seed: the hook's own first check caches the pre-existing D2 warning.
+	let r1 = await report();
+	check("guard-38 seed: D2 warning listed", r1.includes("WARNING D2"), r1);
+	check("guard-38 seed: no delta line without a second snapshot", !r1.includes("warnings: "), r1);
+	// Shift: an external edit adds lines ABOVE the defn — the warning's line
+	// span moves; the line-span-stripped multiset match must read 0 new.
+	writeFileSync(file, readFs(file, "utf8").replace("(ns guard-demo)", "(ns guard-demo)\n;; external edit\n;; more context"));
+	let r2 = await report();
+	check("guard-38: shifted warning is 0 new (1 pre-existing)", r2.includes("warnings: 0 new (1 pre-existing)"), r2);
+	check("guard-38: pre-existing labeled", r2.includes("WARNING D2 (pre-existing): def sneaky"), r2);
+	// Introduce: a second local def — a NEW warning listed FIRST.
+	writeFileSync(file, readFs(file, "utf8").replace("(def sneaky 1)", "(def sneaky 1)\n  (def sneaky2 2)"));
+	let r3 = await report();
+	check("guard-38: 1 new (1 pre-existing)", r3.includes("warnings: 1 new (1 pre-existing)"), r3);
+	check("guard-38: new listed first", r3.indexOf("(new)") !== -1 && r3.indexOf("(new)") < r3.indexOf("(pre-existing)"), r3);
+	check("guard-38: the new warning is sneaky2", /WARNING D2 \(new\): def sneaky2/.test(r3), r3);
+	check("guard-38: the pre-existing one stays labeled", r3.includes("WARNING D2 (pre-existing): def sneaky "), r3);
+});
+
+await run("guard-warning-resolved", async () => {
+	const { readFileSync: readFs } = await import("node:fs");
+	const hook = pi.handlers.get("tool_result");
+	check("guard-38r: tool_result handler registered", typeof hook === "function", [...pi.handlers.keys()]);
+	if (typeof hook !== "function") return;
+	const file = join(tmp, "guard-38r.clj");
+	writeFileSync(file, GUARD_WARN_FIXTURE);
+	const report = async () => {
+		const ev = { type: "tool_result", toolName: "write", input: { path: file }, content: [{ type: "text", text: "ok" }] };
+		const r = await hook(ev);
+		return r.content[r.content.length - 1].text;
+	};
+	await report(); // seed the snapshot (1 pre-existing warning)
+	// The external edit REMOVES the local def — the warning disappears.
+	writeFileSync(file, readFs(file, "utf8").replace("  (def sneaky 1)\n", ""));
+	const r2 = await report();
+	check("guard-38r: resolved warning reads 0 new (0 pre-existing)", r2.includes("warnings: 0 new (0 pre-existing)"), r2);
+	check("guard-38r: no WARNING line remains", !r2.includes("WARNING"), r2);
 });
 
 // ─── report ──────────────────────────────────────────────────────────────────

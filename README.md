@@ -88,11 +88,21 @@ by handle:
 $ cljform edit todos.clj --handle a2fbf8 --mode patch \
     --old-text '(map #(assoc % :done true) t)' \
     --new-text '(map (fn [todo] (assoc todo :done true :completed-at (now))) todo)'
+verified — 1 changed, 3 untouched · warnings: 0 new (0 pre-existing)
 --- before / +++ after …
 patched form ⟦b36464⟧ complete-all (lines 8–9) — 1 changed, 3 untouched
     4  defn         complete-all             lines 8–9  ⟦b36464⟧
 4 forms; 1 changed, 3 untouched — tree todos.clj for the full table
 ```
+
+The response **leads with the verdict line**: `verified — C changed,
+U untouched · warnings: 0 new (P pre-existing)` — the edit is verified
+(parse, untouched-forms byte-identity, and the detector walk run on the
+PRE-edit parse matched against the post-edit one), and every warning is
+attributed: *did I cause this, or was it always here?* When the edit
+introduces a warning, the line becomes `N new warning(s) (P pre-existing):`
+and the new entries follow it, so a clean edit can be told from a
+warning-introducing one at a glance (SPEC §10.3, issue 38).
 
 The response is **result-first**: the changed-region diff, the summary
 line, the affected form's row (with its new handle — your next edit

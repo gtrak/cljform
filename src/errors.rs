@@ -280,6 +280,12 @@ pub struct Output {
     pub result: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warnings: Option<Vec<invariants::DetectorWarning>>,
+    /// Issue 38 (EDIT envelopes only): the pre/post warning delta —
+    /// `warningsDelta: {new, preExisting}`. Additive key: present on every
+    /// edit envelope (single op and batch), absent from every non-edit
+    /// envelope (a check-only call has no before/after; check stays flat).
+    #[serde(skip_serializing_if = "Option::is_none", rename = "warningsDelta")]
+    pub warnings_delta: Option<invariants::WarningDeltaCounts>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notes: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -290,6 +296,11 @@ pub struct Output {
     /// its byte offsets).
     #[serde(skip)]
     pub human_rows: Option<String>,
+    /// Issue 38: the human-only edit VERDICT line (computed from verified
+    /// facts: parse ok + I2 untouched + warning delta). Never serialized —
+    /// the JSON envelope stays machine-shape; print_human prints it FIRST.
+    #[serde(skip)]
+    pub human_verdict: Option<String>,
 }
 
 impl Output {
@@ -305,9 +316,11 @@ impl Output {
             forms_count: None,
             result: None,
             warnings: None,
+            warnings_delta: None,
             notes: None,
             error: None,
             human_rows: None,
+            human_verdict: None,
         }
     }
 
@@ -354,6 +367,18 @@ impl Output {
 
     pub fn warnings(mut self, warnings: Vec<invariants::DetectorWarning>) -> Self {
         self.warnings = Some(warnings);
+        self
+    }
+
+    /// Attach the warning-delta counts (issue 38, edit envelopes only).
+    pub fn warnings_delta(mut self, warnings_delta: invariants::WarningDeltaCounts) -> Self {
+        self.warnings_delta = Some(warnings_delta);
+        self
+    }
+
+    /// Attach the human-only verdict line (issue 38, edit envelopes only).
+    pub fn human_verdict(mut self, human_verdict: String) -> Self {
+        self.human_verdict = Some(human_verdict);
         self
     }
 

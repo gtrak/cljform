@@ -48,6 +48,12 @@ interface DetectorWarning {
 	line: number;
 	end_line: number;
 	message: string;
+	/**
+	 * Edit envelope only (issue 38): the pre/post attribution flag — true
+	 * when the warning did not exist pre-edit, false when it matched a
+	 * pre-edit warning. Absent on flat surfaces (check has no before/after).
+	 */
+	new?: boolean;
 }
 
 /** A broken-file diagnostic (issue 31): an error.diagnostics row. */
@@ -236,6 +242,47 @@ function warningsText(ws: DetectorWarning[]): string[] {
 	return ws.map((w) => `WARNING ${w.id}: ${w.message}`);
 }
 
+/**
+ * Issue 38: the line-span-INDEPENDENT identity of a detector warning — the
+ * (id, message) pair with the "(line N)" / "(lines A–B)" segments removed
+ * (edits shift line numbers; matching on raw lines or the full message
+ * would misclassify every shifted pre-existing warning as new). Mirrors
+ * the CLI's matching rule exactly (SPEC §10.3, issue 38).
+ */
+function warningKey(w: DetectorWarning): string {
+	return `${w.id} ${w.message.replace(/ ?\(lines? \d+(–\d+)?\)/g, " ").replace(/ {2,}/g, " ")}`;
+}
+
+/**
+ * Issue 38: the pre/post warning multiset diff (the CLI's warning-delta
+ * rule, mirrored for the guard hook): post warnings match pre warnings by
+ * (id, line-span-stripped message) WITH multiplicity; every unmatched post
+ * warning is NEW (the loud side), the unmatched pre side is resolved.
+ */
+function warningDelta(
+	pre: DetectorWarning[],
+	post: DetectorWarning[],
+): { newWarnings: DetectorWarning[]; preExistingWarnings: DetectorWarning[]; preExisting: number } {
+	const remaining = new Map<string, number>();
+	for (const w of pre) {
+		const k = warningKey(w);
+		remaining.set(k, (remaining.get(k) ?? 0) + 1);
+	}
+	const newWarnings: DetectorWarning[] = [];
+	const preExistingWarnings: DetectorWarning[] = [];
+	for (const w of post) {
+		const k = warningKey(w);
+		const c = remaining.get(k) ?? 0;
+		if (c > 0) {
+			remaining.set(k, c - 1);
+			preExistingWarnings.push(w);
+		} else {
+			newWarnings.push(w);
+		}
+	}
+	return { newWarnings, preExistingWarnings, preExisting: preExistingWarnings.length };
+}
+
 /** `line a` or `lines a–b`. */
 function lineSpan(sp: [number, number]): string {
 	return sp[0] === sp[1] ? `line ${sp[0]}` : `lines ${sp[0]}–${sp[1]}`;
@@ -310,12 +357,20 @@ function errorText(out: CljformOutput): string {
 // ─── Extension ────────────────────────────────────────────────────────────────
 
 export default function ClojureForms(pi: ExtensionAPI) {
-	// Fingerprint cache for the guard hook's shape delta. Correctness never
-	// depends on it: a missing entry just means no delta line.
-	const cache = new Map<string, FormRow[]>();
+	// Fingerprint cache for the guard hook's shape + warning delta.
+	// Correctness never depends on it: a missing entry just means no delta line.
+	const cache = new Map<string, { forms?: FormRow[]; warnings?: DetectorWarning[] }>();
 
-	function remember(path: string, forms: FormRow[] | undefined) {
-		if (forms) cache.set(path, forms);
+	function remember(path: string, forms?: FormRow[], warnings?: DetectorWarning[]) {
+		// Store a FRESH snapshot object on every call: readers may hold a
+		// reference to the previous entry (the guard hook's prev-vs-post
+		// delta), so in-place mutation would corrupt the snapshot being
+		// diffed against.
+		const prev = cache.get(path);
+		cache.set(path, {
+			forms: forms ?? prev?.forms,
+			warnings: warnings ?? prev?.warnings,
+		});
 	}
 
 	/**
@@ -422,7 +477,7 @@ export default function ClojureForms(pi: ExtensionAPI) {
 			const run = await runClj(["forms", params.path, "--json"], 15_000);
 			if (!run.ok) return run.result;
 			const out = run.out;
-			remember(params.path, out.forms);
+			remember(params.path, out.forms, out.warnings);
 			const lines = [
 				`${params.path}: ${out.forms!.length} top-level forms · ${out.file_hash?.slice(0, 19)}…`,
 				formTableText(out.forms!),
@@ -942,7 +997,7 @@ export default function ClojureForms(pi: ExtensionAPI) {
 		const run = await runClj(args, 20_000);
 		if (!run.ok) return run.result;
 		const out = run.out;
-		if (!params.dryRun) remember(params.path, out.forms);
+		if (!params.dryRun) remember(params.path, out.forms, out.warnings);
 
 		const r = out.result ?? {};
 		// Issue 32 (A/D): result.text keeps the CLI's issue-27 composition
@@ -1080,7 +1135,7 @@ export default function ClojureForms(pi: ExtensionAPI) {
 				const run = await runClj(args, 30_000);
 				if (!run.ok) return run.result;
 				const out = run.out;
-				if (!params.dryRun) remember(params.path, out.forms);
+				if (!params.dryRun) remember(params.path, out.forms, out.warnings);
 				const r = out.result ?? {};
 				// result.text is the CLI's composed view: one block per op
 				// (summary line + changed-region diff + affected rows) plus the
@@ -1153,17 +1208,29 @@ export default function ClojureForms(pi: ExtensionAPI) {
 			report.push("Fix the bracket structure immediately; nothing else about this edit is verified.");
 		} else {
 			const prev = cache.get(abs);
-			remember(abs, out.forms);
-			const delta = prev ? shapeDelta(prev, out.forms) : null;
-			const warnings = warningsText(out.warnings ?? []);
+			remember(abs, out.forms, out.warnings);
+			const delta = prev?.forms ? shapeDelta(prev.forms, out.forms) : null;
+			const post = out.warnings ?? [];
 			if (delta) {
 				report.push(delta);
-			} else if (warnings.length > 0) {
+			} else if (post.length > 0) {
 				report.push(`shape (${out.forms!.length} forms: ${shapeSummary(out.forms!)})`);
 			} else {
 				report.push(`shape ok (${out.forms!.length} forms: ${shapeSummary(out.forms!)})`);
 			}
-			report.push(...warnings);
+			// Issue 38: the warning delta — "0 new (P pre-existing)" is an
+			// attribution, not an absence of signal; new warnings list FIRST
+			// (the loud side), pre-existing ones after, labeled. Without a
+			// cached pre-edit snapshot the flat list stands (correctness
+			// never depends on the cache); BLOCKING behavior is unchanged.
+			if (prev?.warnings) {
+				const wd = warningDelta(prev.warnings, post);
+				report.push(`warnings: ${wd.newWarnings.length} new (${wd.preExisting} pre-existing)`);
+				for (const w of wd.newWarnings) report.push(`WARNING ${w.id} (new): ${w.message}`);
+				for (const w of wd.preExistingWarnings) report.push(`WARNING ${w.id} (pre-existing): ${w.message}`);
+			} else {
+				report.push(...warningsText(post));
+			}
 		}
 
 		return {

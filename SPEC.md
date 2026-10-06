@@ -178,6 +178,15 @@ cljform [--json|--human] <op> [args]
   itself stays the first-error text, byte-identical). Additive key:
   absent on every healthy-file envelope.
 
+  **Warning-delta attribution (issue 38).** The EDIT envelope only
+  (single op and batch) additionally carries `warningsDelta:
+  {new, preExisting}` plus an additive `new: true|false` flag on every
+  entry of its `warnings` array — the post-edit detector walk
+  attributed against the pre-edit parse (matching rule and loud-side
+  fallback: §10.3). Both are additive keys; every non-edit envelope
+  (check, forms, …) stays flat — a check-only call has no before/after,
+  and its `warnings` entries carry no `new` key.
+
 ### 4.2 Form table (the `forms` array)
 
 ```json
@@ -292,6 +301,9 @@ table`), then notes, then warnings. NO whole-file table in human mode, at
 any file size (`forms` / `tree` are the full-table surfaces). The JSON
 envelope is unchanged (the `result.text` field keeps its issue-27
 composition: summary line + repair diff + changed-region diff).
+Issue 38: the EDIT human output additionally LEADS with the verdict line
+(`verified — C changed, U untouched · warnings: 0 new (P pre-existing)`,
+or `N new warning(s) (P pre-existing):` + the new entries) — §10.3
 
 **Marker auto-strip on ingest (§10.4):** `⟦…⟧` markers in `--content`,
 `--old-text`, and `--new-text` are stripped before use (lossless, with a
@@ -878,6 +890,34 @@ collection delimiter:
   (defn -> def), so it is a note, not a warning, and it never gates
   `--strict` (no refusal, no detector interaction). Same-head replaces are
   silent; vectors/maps and reader-prefixed content carry no head (silent).
+- **Warning-delta verdict (issue 38).** The edit pipeline runs the
+  detector walk on BOTH parses: the pre-edit parse it already performs for
+  I1's start form table, and the post-edit parse of the verification
+  tail. Post warnings are matched to pre warnings as a **multiset by
+  (detector id, message with the line spans stripped)**: line spans shift
+  with the edit, so raw-line or full-message matching would misclassify
+  every shifted pre-existing warning as new, and multiset multiplicity is
+  what handles duplicate identical warnings (two identical pre warnings
+  match two post ones; a third is new). Every UNMATCHED post warning is
+  NEW — uncertainty falls loud (an unmatchable warning is reported, never
+  silently dropped; a lying clean would be an issue-19-class bug in
+  reverse). Envelope: per-warning additive `new: true|false` +
+  `warningsDelta: {new, preExisting}` (§4.1). The `check` op is
+  unchanged (no before/after: flat warnings, no delta); the BATCH
+  envelope's delta is against the pre-batch ORIGINAL (the batch is one
+  call; its envelope attributes the batch). Human: a VERDICT line leads
+  the edit response (before the diff), derived from verified facts —
+  parse ok + I2 untouched + the warning delta — never a heuristic:
+  clean → `verified — C changed, U untouched · warnings: 0 new (P
+  pre-existing)` (plus `; R resolved` when the edit removed pre-existing
+  warnings — the resolved count of the pre side); not clean → `N new
+  warning(s) (P pre-existing):` followed by the NEW entries only, with
+  the pre-existing ones (labeled `(pre-existing)`) after the diff/rows.
+  The pi extension's guard hook carries the same delta against its cached
+  pre-edit check snapshot (`warnings: 0 new (21 pre-existing)` on the
+  success path; new warnings listed first on the attention path; BLOCKING
+  behavior unchanged). `--strict` is unchanged (warnings still refuse;
+  the delta decorates the refusal: "N of these are new").
 - **patch-not-found hints (issue 37).** On top of the exact-form-bytes
   handback, two non-inferential diagnostics fire on `patch-not-found`
   (composable — both may appear): (B) INDENTATION DELTAS — if the

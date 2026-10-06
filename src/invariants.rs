@@ -21,6 +21,12 @@ pub struct DetectorWarning {
     pub end_line: usize,
     pub message: String,
     pub hint: String,
+    /// Issue 38: the edit envelope's attribution flag — `Some(true)` when the
+    /// warning did not exist pre-edit, `Some(false)` when it matched a pre-edit
+    /// warning. `None` on every non-edit surface (check/forms stay flat: no
+    /// before/after to attribute), where the key is omitted entirely.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new: Option<bool>,
 }
 
 /// Data-driven detector rules: (id, host heads, forbidden heads). Heads match
@@ -72,6 +78,7 @@ fn detect_d3(forms: &[Form]) -> Vec<DetectorWarning> {
                 f.addr, f.line[0]
             ),
             hint: "reorder the file so the ns form is first, or split namespaces".to_string(),
+            new: None,
         })
         .collect()
 }
@@ -146,6 +153,7 @@ pub fn run_detectors(root: &Node, forms: &[Form], bytes: &[u8]) -> Vec<DetectorW
                     host_node.end_position().row + 1
                 ),
                 hint: "move it to top level".to_string(),
+                new: None,
             });
             return true; // one warning per offending node
         }
@@ -153,6 +161,138 @@ pub fn run_detectors(root: &Node, forms: &[Form], bytes: &[u8]) -> Vec<DetectorW
     });
 
     warnings
+}
+
+/// Issue 38: the pre/post warning delta. `new_flags[i]` is `true` when the
+/// i-th POST warning matched no pre-edit warning — the unmatched post side is
+/// the NEW (loud) side; a pre warning with no post counterpart is RESOLVED
+/// (the edit removed it).
+pub struct WarningDelta {
+    /// Per-post-warning `new` flag (parallel to the post list).
+    pub new_flags: Vec<bool>,
+    /// Post warnings with no pre counterpart (newly introduced).
+    pub new: usize,
+    /// Post warnings that matched a pre counterpart (pre-existing, possibly
+    /// shifted by the edit).
+    pub pre_existing: usize,
+    /// Pre warnings with no post counterpart (the edit resolved them).
+    pub resolved: usize,
+}
+
+/// The `warningsDelta` envelope payload (issue 38): `{new, preExisting}` —
+/// both counts of the post warning set, the resolved count living in the
+/// human verdict only (it is a pre-side statistic).
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct WarningDeltaCounts {
+    pub new: usize,
+    #[serde(rename = "preExisting")]
+    pub pre_existing: usize,
+}
+
+impl WarningDelta {
+    pub fn counts(&self) -> WarningDeltaCounts {
+        WarningDeltaCounts {
+            new: self.new,
+            pre_existing: self.pre_existing,
+        }
+    }
+}
+
+/// Issue 38: the multiset matching key — the (detector id, message) pair
+/// with the line-span segments stripped. Edits shift line numbers, so the
+/// raw line fields and the line spans embedded in the message are NOT
+/// part of the identity: matching on them would misclassify every shifted
+/// pre-existing warning as new. Multiset counting (with multiplicity) is
+/// what handles duplicate identical warnings.
+pub fn match_key(w: &DetectorWarning) -> String {
+    format!("{} {}", w.id, strip_line_spans(&w.message))
+}
+
+/// Remove every ` (line N)` / ` (lines A–B)` segment from a detector
+/// message and collapse the double spaces the removals leave. Every span
+/// segment is preceded by a space and followed by the first `)` after the
+/// digits, so a small linear scan is exact for the shipped message shapes
+/// (a def name containing the literal text ` (line ` would be misread —
+/// not a realistic input; the fallback is loud, not silent: a miskeyed
+/// warning is matched as NEW, never silently dropped).
+fn strip_line_spans(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    loop {
+        let p_line = rest.find(" (line ");
+        let p_lines = rest.find(" (lines ");
+        let (p, marker_len) = match (p_line, p_lines) {
+            (Some(a), Some(b)) => {
+                if a < b {
+                    (a, " (line ".len())
+                } else {
+                    (b, " (lines ".len())
+                }
+            }
+            (Some(a), None) => (a, " (line ".len()),
+            (None, Some(b)) => (b, " (lines ".len()),
+            (None, None) => {
+                out.push_str(rest);
+                break;
+            }
+        };
+        let after = &rest[p + marker_len..];
+        let Some(close) = after.find(')') else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..p]);
+        out.push(' ');
+        rest = &after[close + 1..];
+    }
+    let mut collapsed = String::with_capacity(out.len());
+    for c in out.chars() {
+        if c == ' ' && collapsed.ends_with(' ') {
+            continue;
+        }
+        collapsed.push(c);
+    }
+    collapsed
+}
+
+/// Issue 38: the pre/post warning multiset diff. Post warnings are matched
+/// to pre warnings by `match_key` WITH MULTIPLICITY (two identical pre
+/// warnings match two post ones; the third is new); every unmatched post
+/// warning is new. Deterministic: post order is preserved.
+pub fn compute_warning_delta(
+    pre: &[DetectorWarning],
+    post: &[DetectorWarning],
+) -> WarningDelta {
+    let mut remaining: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for w in pre {
+        *remaining.entry(match_key(w)).or_insert(0) += 1;
+    }
+    let mut new_flags: Vec<bool> = Vec::with_capacity(post.len());
+    let mut pre_existing = 0usize;
+    for w in post {
+        let key = match_key(w);
+        let matched = remaining
+            .get_mut(&key)
+            .is_some_and(|c| {
+                if *c > 0 {
+                    *c -= 1;
+                    true
+                } else {
+                    false
+                }
+            });
+        if matched {
+            pre_existing += 1;
+        }
+        new_flags.push(!matched);
+    }
+    WarningDelta {
+        new_flags,
+        new: post.len() - pre_existing,
+        pre_existing,
+        resolved: pre.len() - pre_existing,
+    }
 }
 
 /// I2 verification result.
