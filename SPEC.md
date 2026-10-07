@@ -434,6 +434,14 @@ the walker is provably panic-free (byte iteration and `pop()` only).
   is missing N closer(s); mechanical tail (placement is yours to verify):
   <tail>` line; mismatch → the line:col diagnosis); the inferred-candidate
   display stays as-is — repair stays opt-in and heuristic-labeled.
+- `edit` resulting-file parse refusal (I1 write gate): the SAME walk runs
+  on the submitted content (every mode that takes content) and its verdict
+  LEADS the message — the field named, the exact mechanical tail
+  ("placement is yours to verify"), or the mismatch line:col diagnosis —
+  while the file-level `resulting file does not parse` layer is demoted to
+  context (still present, with its own coordinates; the refusal itself is
+  unchanged). Content that balances is left alone: the parse failed for
+  other reasons and the file-level message stands.
 - The `clj_draft` extension tool: when inference is applied (a candidate
   + a hunk-carrying diff returned), one line is appended: `verify balance
   before use: cljform balance --stdin` (the draft itself is unchanged; it

@@ -3,7 +3,9 @@
 //! string/comment/charlit/regex traps, --tail accept/reject/wrong-order,
 //! the flat JSON shape, exit codes, stdin + file paths, and the
 //! unbalanced-content refusal hint wiring (missing-tail and mismatch
-//! branches).
+//! branches), and the write-gate diagnosis (issue 39 follow-up: a
+//! resulting-file parse refusal leads with the content-side verdict,
+//! the file-level line 1 col 1 pointer demoted to context).
 // Test harness (issue 30 L1): panicking asserts are the harness's
 // own failure mode — a hit fails the test, not the tool; the
 // binary-under-test is asserted by its envelope/exit contract.
@@ -11,7 +13,7 @@
 
 mod common;
 
-use common::{edit_content, edit_content_extra, fixture, handle_of, run_bytes, run_json};
+use common::{check_ok, edit_args, edit_content, edit_content_extra, fixture, handle_of, run_bytes, run_json};
 use std::process::Command;
 
 const FIXTURE: &str = "(ns r)\n\n(defn target [x]\n  (inc x))\n";
@@ -419,4 +421,135 @@ fn edit_hint_mismatch_line_col_diagnosis() {
     );
     assert_eq!(code2, 0, "{d2} {err2}");
     assert_eq!(d2["result"]["repaired"], true, "{d2}");
+}
+
+// ─── write-gate diagnosis (issue 39 follow-up) ──────────────────────────────
+//
+// Second incident: a replacement with unbalanced content was correctly
+// refused by the WRITE gate ("resulting file does not parse: … @ line 1
+// col 1") — correct gate, useless diagnosis; the agent fell back to
+// Python counters. Balanced-in-isolation content always splices safely, so
+// a write-gate parse failure means the submitted content is the culprit:
+// the refusal must lead with the CONTENT-side verdict (which field, the
+// exact mechanical tail, or the mismatch line:col diagnosis), demoting the
+// file-level message to context. Patch is the reachable shape: it is
+// surgical and carries no content-stage balance gate, so an unbalanced
+// --new-text lands exactly here.
+
+/// The incident shape (missing-tail branch): an unbalanced replacement
+/// that reaches the write gate — the refusal LEADS with the content-side
+/// mechanical tail (field named, exact tail, placement caveat), not with
+/// the "line 1 col 1" file-level pointer.
+#[test]
+fn write_gate_missing_tail_leads_content_side() {
+    let p = f("wg-tail.clj");
+    let h = handle_of(&p, "target");
+    let new_text = "let [y 1\n  (inc y x";
+    let (code, d, err) = edit_args(
+        &p,
+        Some("patch"),
+        Some(&h),
+        &["--old-text", "inc x", "--new-text", new_text],
+    );
+    assert_eq!(code, 1, "{d} {err}");
+    assert_eq!(d["error"]["code"], "parse-error");
+    let msg = d["error"]["message"].as_str().unwrap();
+    // The content-side verdict leads; the walker runs on the SUBMITTED
+    // new_text (the spliced bytes would read differently).
+    assert!(
+        msg.starts_with(
+            "newText is missing 2 closer(s); mechanical tail (placement is yours to verify): )]"
+        ),
+        "{msg}"
+    );
+    // The file-level layer is demoted to context — still present, with its
+    // own coordinates.
+    assert!(msg.contains("file-level context: resulting file does not parse"), "{msg}");
+    assert!(msg.contains("@ line 1 col 1"), "demoted, not dropped: {msg}");
+    // The machine coordinates stay file-level (the demoted layer's own).
+    assert_eq!(d["error"]["line"].as_u64(), Some(1));
+    assert_eq!(d["error"]["col"].as_u64(), Some(1));
+    let hint = d["error"]["hint"].as_str().unwrap();
+    assert!(hint.starts_with("fix the submitted newText:"), "{hint}");
+    // Nothing written: the gate still refuses.
+    check_ok(&p);
+}
+
+/// The incident shape (mismatch branch): a misplaced closer in the
+/// replacement — the refusal leads with the line:col diagnosis naming the
+/// closer and the innermost opener; no tail is offered.
+#[test]
+fn write_gate_mismatch_leads_content_side() {
+    let p = f("wg-mismatch.clj");
+    let h = handle_of(&p, "target");
+    // `)` with no openers remaining in the submitted text; the spliced
+    // file has one extra closer and cannot parse.
+    let (code, d, err) = edit_args(
+        &p,
+        Some("patch"),
+        Some(&h),
+        &["--old-text", "inc x", "--new-text", "inc y )"],
+    );
+    assert_eq!(code, 1, "{d} {err}");
+    assert_eq!(d["error"]["code"], "parse-error");
+    let msg = d["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.starts_with(
+            "newText: mismatch at line 1 col 7: ) closes nothing — no openers remain; a misplaced closer cannot be fixed by a tail"
+        ),
+        "{msg}"
+    );
+    assert!(msg.contains("file-level context: resulting file does not parse"), "{msg}");
+    let hint = d["error"]["hint"].as_str().unwrap();
+    assert!(hint.starts_with("fix the misplaced closer in the submitted newText (named above)"), "{hint}");
+    check_ok(&p);
+}
+
+/// No behavior change when the content BALANCES but the parse fails for
+/// other reasons (here: the splice splits the string state) — the walker
+/// simply reports balanced and the file-level message stands alone,
+/// byte-identical to the pre-follow-up refusal.
+#[test]
+fn write_gate_balanced_content_keeps_file_level_message() {
+    let p = fixture("wg-bal.clj", b"(def s \"hello\")\n");
+    let h = handle_of(&p, "s");
+    // `x"` balances (the open string eats no brackets) but spliced it
+    // leaves the file's string unterminated.
+    let (code, d, err) = edit_args(
+        &p,
+        Some("patch"),
+        Some(&h),
+        &["--old-text", "hello", "--new-text", "x\""],
+    );
+    assert_eq!(code, 1, "{d} {err}");
+    let msg = d["error"]["message"].as_str().unwrap();
+    assert!(msg.starts_with("resulting file does not parse: "), "unchanged: {msg}");
+    assert_eq!(
+        d["error"]["hint"].as_str().unwrap(),
+        "fix the bracket structure first; cljform never writes to a file that does not parse"
+    );
+    check_ok(&p);
+}
+
+/// The content-stage unbalanced refusal is a DIFFERENT gate and stays
+/// untouched: the same unbalanced content through a whole-form mode never
+/// reaches the write gate (the `unbalanced-content` refusal fires first,
+/// with its own hint — no content-side duplication on that path).
+#[test]
+fn write_gate_diagnosis_does_not_touch_content_stage() {
+    let p = f("wg-stage.clj");
+    let (code, d, err) = edit_content(&p, &handle_of(&p, "target"), "(defn target [x]\n  (dec x");
+    assert_eq!(code, 3, "{d} {err}");
+    assert_eq!(d["error"]["code"], "unbalanced-content");
+    // The content-stage hint (issue 39 wiring) is intact, and the
+    // write-gate demotion wording never appears on this path.
+    assert!(
+        d["error"]["hint"]
+            .as_str()
+            .unwrap()
+            .starts_with("content is missing 2 closer(s); mechanical tail (placement is yours to verify): )) — "),
+        "{}",
+        d["error"]["hint"]
+    );
+    assert!(!d["error"]["message"].as_str().unwrap().contains("file-level context"), "{}", d);
 }

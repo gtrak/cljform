@@ -673,6 +673,97 @@ fn verify_edit(
     Ok((after_parsed, shape, warnings, delta))
 }
 
+/// Issue 39 follow-up (write-gate diagnosis): when the resulting-file parse
+/// gate (I1) refuses, the CONTENT-side balance verdict leads the message.
+/// The rationale: balanced-in-isolation content always splices safely
+/// (balanced bytes replacing balanced form bytes ⇒ balanced file), so a
+/// write-gate parse failure with a submitted content means the content is
+/// the culprit. The verdict names the content field — missing-tail (the
+/// exact mechanical tail, "placement is yours to verify") or mismatch
+/// (closer line:col + innermost opener) — and the file-level message is
+/// demoted to context (layered diagnostics, the issue 31 pattern). The
+/// walker runs on the SUBMITTED content for every mode that takes content;
+/// a content that BALANCES leaves the refusal untouched (the parse failed
+/// for other reasons — a splice splitting a string, say — and the
+/// file-level message stands alone). The content-stage unbalanced refusal
+/// is a separate gate and is never touched: this fires only when the
+/// resulting-file parse fails (patch reaches it directly — patch is
+/// surgical and carries no content-stage balance gate; the whole-form modes
+/// reach it only via the `--repair` path or a tool bug).
+fn write_gate_enrich(
+    fail: Fail,
+    payload: &Option<content::Payload>,
+    content: &Option<String>,
+    content_file: &Option<PathBuf>,
+    new_text: &Option<String>,
+) -> Fail {
+    let Fail(exit, body) = fail;
+    // Only the resulting-file parse layer qualifies: the other verify_edit
+    // failures (boundary proof, untouched-forms shape, strict detector
+    // gate) carry their own codes and never take a content verdict.
+    if body.code != "parse-error"
+        || !body.message.starts_with("resulting file does not parse:")
+    {
+        return Fail(exit, body);
+    }
+    // The submitted content, per mode: the whole-form modes carry the
+    // content as submitted (re-read on this failure path only); patch
+    // carries --new-text. The view markers never count — they are not
+    // ASCII brackets — so the raw submission is the faithful walk input.
+    let (field, submitted) = match payload {
+        Some(content::Payload::Prepared(_)) => match read_content(content, content_file) {
+            Ok(t) => ("content", t),
+            Err(_) => return Fail(exit, body),
+        },
+        Some(content::Payload::Patch { .. }) => match new_text {
+            Some(t) => ("newText", t.clone()),
+            None => return Fail(exit, body),
+        },
+        None => return Fail(exit, body),
+    };
+    let (lead, hint) = match crate::balance::walk(&submitted) {
+        // The content balances: the parse failed for other reasons — the
+        // file-level message stands alone (no behavior change).
+        crate::balance::Walk::Balanced { .. } => return Fail(exit, body),
+        crate::balance::Walk::MissingTail { stack, .. } => {
+            let n = stack.len();
+            let tail = crate::balance::tail_for(&stack);
+            (
+                format!(
+                    "{field} is missing {n} closer(s); mechanical tail (placement is yours to verify): {tail}"
+                ),
+                format!(
+                    "fix the submitted {field}: place the missing closers where they belong, then resubmit; cljform never writes to a file that does not parse"
+                ),
+            )
+        }
+        crate::balance::Walk::Mismatch {
+            closer,
+            line,
+            col,
+            innermost,
+            ..
+        } => (
+            format!(
+                "{field}: {}; a misplaced closer cannot be fixed by a tail",
+                crate::balance::mismatch_sentence(closer, line, col, innermost)
+            ),
+            format!(
+                "fix the misplaced closer in the submitted {field} (named above), then resubmit; cljform never writes to a file that does not parse"
+            ),
+        ),
+    };
+    // The file-level coordinates are the parse error's own (parse_or_fail
+    // always attaches them); the layer is demoted, not dropped — the
+    // diagnostics ride along unchanged.
+    let (line, col) = (body.line.unwrap_or_default(), body.col.unwrap_or_default());
+    let message = format!(
+        "{lead}\nfile-level context: {} @ line {line} col {col}",
+        body.message
+    );
+    Fail(exit, ErrorBody { message, hint: Some(hint), ..body })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_edit(
     file: &Path,
@@ -908,8 +999,11 @@ pub(crate) fn run_edit_op(
 
     // Verification tail: boundary proof, post-splice parse, untouched
     // forms, strict detector gate. The pre-edit parse's warnings (already
-    // computed at the top of this op) are the delta's pre side.
-    let (after_parsed, shape, warnings, warning_delta) = verify_edit(
+    // computed at the top of this op) are the delta's pre side. A failing
+    // tail is routed through the issue-39 follow-up write-gate diagnosis
+    // (content-side verdict leads; the helper gates on the resulting-file
+    // parse layer, so the other failures pass through untouched).
+    let (after_parsed, shape, warnings, warning_delta) = match verify_edit(
         bytes,
         &new_bytes,
         &before_forms,
@@ -918,7 +1012,12 @@ pub(crate) fn run_edit_op(
         &allowed,
         &parsed.warnings,
         strict,
-    )?;
+    ) {
+        Ok(ok) => ok,
+        Err(fail) => {
+            return Err(write_gate_enrich(fail, &payload, content, content_file, new_text))
+        }
+    };
 
     // Issue 38: the per-warning attribution flag — `new: true|false` on
     // every post warning of the edit envelope (check stays flat: its
@@ -2336,4 +2435,147 @@ fn read_atom_token(s: &[u8]) -> Option<String> {
         }
     }
     (end > 0).then(|| String::from_utf8_lossy(&s[..end]).into_owned())
+}
+
+#[cfg(test)]
+// Test harness (issue 30 L1): panicking asserts are the harness's own
+// failure mode — a hit fails the test, not the tool.
+#[allow(clippy::unwrap_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    /// The I1 refusal exactly as `parse_or_fail` builds it (the
+    /// resulting-file parse layer).
+    fn resulting_file_fail() -> Fail {
+        Fail(
+            errors::exit::PARSE,
+            ErrorBody::new(
+                "parse-error",
+                "resulting file does not parse: unclosed open-paren (form reaches end of file)",
+            )
+            .at(Some(1), Some(1))
+            .with_hint(
+                "fix the bracket structure first; cljform never writes to a file that does not parse",
+            ),
+        )
+    }
+
+    fn prepared_payload() -> content::Payload {
+        content::Payload::Prepared(content::Prepared {
+            bytes: Vec::new(),
+            forms: 1,
+            repaired: false,
+            repair_diff: String::new(),
+            notes: Vec::new(),
+        })
+    }
+
+    /// The walker sees the SUBMITTED content of the whole-form modes — the
+    /// `content` field is named in the lead (the `--content-file` route
+    /// re-reads on the failure path; a string-valued `--content` is the
+    /// case tested here).
+    #[test]
+    fn write_gate_prepared_missing_tail_names_content_field() {
+        let submitted = "(defn f [x]\n  (dec x";
+        let out = write_gate_enrich(
+            resulting_file_fail(),
+            &Some(prepared_payload()),
+            &Some(submitted.to_string()),
+            &None,
+            &None,
+        );
+        let body = &out.1;
+        assert_eq!(body.code, "parse-error");
+        // The demoted layer keeps its coordinates; the machine fields stay
+        // file-level.
+        assert_eq!((body.line, body.col), (Some(1), Some(1)));
+        assert!(
+            body.message.starts_with(
+                "content is missing 2 closer(s); mechanical tail (placement is yours to verify): ))"
+            ),
+            "{}",
+            body.message
+        );
+        assert!(
+            body.message.contains(
+                "file-level context: resulting file does not parse: unclosed open-paren (form reaches end of file) @ line 1 col 1"
+            ),
+            "{}",
+            body.message
+        );
+        assert!(body.hint.as_deref().unwrap().starts_with("fix the submitted content:"));
+    }
+
+    #[test]
+    fn write_gate_prepared_mismatch_leads_with_diagnosis() {
+        // `(a [b\nc)` — a closer that is not the innermost opener's partner.
+        let submitted = "(a [b\nc)";
+        let out = write_gate_enrich(
+            resulting_file_fail(),
+            &Some(prepared_payload()),
+            &Some(submitted.to_string()),
+            &None,
+            &None,
+        );
+        let body = &out.1;
+        assert!(
+            body.message.starts_with(
+                "content: mismatch at line 2 col 2: ) closes nothing — innermost open is [ from line 1 col 4; a misplaced closer cannot be fixed by a tail"
+            ),
+            "{}",
+            body.message
+        );
+        assert!(
+            body.hint
+                .as_deref()
+                .unwrap()
+                .starts_with("fix the misplaced closer in the submitted content (named above)")
+        );
+    }
+
+    /// A content that BALANCES (the parse failed for other reasons — a
+    /// splice splitting a string, say): the refusal is untouched,
+    /// byte-identical to the pre-follow-up message.
+    #[test]
+    fn write_gate_balanced_content_passes_through() {
+        let out = write_gate_enrich(
+            resulting_file_fail(),
+            &Some(prepared_payload()),
+            &Some("\"x\"".to_string()),
+            &None,
+            &None,
+        );
+        assert_eq!(
+            out.1.message,
+            "resulting file does not parse: unclosed open-paren (form reaches end of file)"
+        );
+        assert_eq!(
+            out.1.hint.as_deref(),
+            Some("fix the bracket structure first; cljform never writes to a file that does not parse")
+        );
+    }
+
+    /// Non-I1 verify failures (boundary proof, shape, detector gate) never
+    /// take a content verdict — the gate is the resulting-file parse layer
+    /// alone.
+    #[test]
+    fn write_gate_non_parse_error_passes_through() {
+        let fail = Fail(
+            errors::exit::PARSE,
+            ErrorBody::new(
+                "shape-violation",
+                "boundary check failed: the splice changed bytes outside the target range; nothing was written",
+            ),
+        );
+        let out = write_gate_enrich(
+            fail,
+            &Some(prepared_payload()),
+            &Some("(defn f [x]\n  (dec x".to_string()),
+            &None,
+            &None,
+        );
+        assert_eq!(out.1.code, "shape-violation");
+        assert!(out.1.message.starts_with("boundary check failed:"));
+        assert!(out.1.hint.is_none());
+    }
 }
