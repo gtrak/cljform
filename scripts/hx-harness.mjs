@@ -665,6 +665,54 @@ await run("guard-warning-resolved", async () => {
 	check("guard-38r: no WARNING line remains", !r2.includes("WARNING"), r2);
 });
 
+// ─── issue 39 (balance primitive): clj_draft verify-balance line ─────────────
+// When clj_draft applied inference (the diff carries a hunk), the output
+// ends with one line pointing at the mechanical check: `verify balance
+// before use: cljform balance --stdin`. No hunk (draft already canonical)
+// → no line (there was no inference to verify).
+const DRAFT_UNBALANCED = `(defn fix-all [items]
+  (doseq [item items]
+    (swap! state conj
+      (assoc item :done true)
+`;
+const DRAFT_BALANCED = `(defn fix-all [items]
+  (doseq [item items]
+    (assoc item :done true))
+)`;
+
+await run("draft-balance-hint", async () => {
+	const draft = tools.get("clj_draft");
+	const out = await draft.execute("h", { content: DRAFT_UNBALANCED }, null, () => {});
+	check("draft-39: not an error", !out.isError, text(out));
+	check(
+		"draft-39: ends with the verify-balance line when inference applied",
+		text(out).endsWith("verify balance before use: cljform balance --stdin"),
+		text(out),
+	);
+	// The hinted command is real: piping the SAME draft to `cljform balance
+	// --stdin` reports the missing-tail verdict (exit 1) the agent is being
+	// pointed at. (execFileSync, not the async exec: the async input option
+	// never closes the child's stdin, so a stdin-first op would wait for EOF.)
+	let bal = { code: 0, stdout: "" };
+	try {
+		bal.stdout = execFileSync(BIN, ["balance", "--stdin"], { input: DRAFT_UNBALANCED, encoding: "utf8" });
+	} catch (e) {
+		bal = { code: e.status ?? -1, stdout: e.stdout ?? "" };
+	}
+	check(
+		"draft-39: `cljform balance --stdin` on the draft reads missing-tail",
+		bal.code === 1 && bal.stdout.includes('"kind":"missing-tail"') && bal.stdout.includes('"tail":")))"'),
+		`code=${bal.code} ${bal.stdout}`,
+	);
+	const out2 = await draft.execute("h", { content: DRAFT_BALANCED }, null, () => {});
+	check("draft-39b: not an error", !out2.isError, text(out2));
+	check(
+		"draft-39b: no verify-balance line when nothing was inferred",
+		!text(out2).includes("verify balance before use"),
+		text(out2),
+	);
+});
+
 // ─── report ──────────────────────────────────────────────────────────────────
 for (const p of PASS) console.log(`PASS ${p}`);
 for (const f of FAIL) console.log(`FAIL ${f.name}\n${f.evidence}`);

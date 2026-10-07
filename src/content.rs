@@ -50,8 +50,11 @@ pub enum PrepareError {
     RepairRefused { diff: String },
     /// Default (inference off): content is unbalanced. Carries the inferred
     /// candidate and its diff so the caller can review it or apply it with
-    /// `--repair`.
-    Unbalanced { candidate: String, diff: String },
+    /// `--repair`; `submitted` is the fence-stripped/trimmed content as
+    /// submitted — the `balance` primitive runs on it for the refusal
+    /// hint's mechanical facts (issue 39: the exact tail or the line:col
+    /// mismatch diagnosis).
+    Unbalanced { candidate: String, diff: String, submitted: String },
 }
 
 impl PrepareError {
@@ -183,7 +186,11 @@ pub fn prepare(
                 PrepareError::Unparseable(err)
             })?;
             if !repair {
-                return Err(PrepareError::Unbalanced { candidate: cand, diff });
+                return Err(PrepareError::Unbalanced {
+                    candidate: cand,
+                    diff,
+                    submitted: text.clone(),
+                });
             }
             notes.push("content unbalanced; brackets repaired by indentation".to_string());
             finish(&cand, parsed.forms.len(), true, diff, notes)

@@ -183,6 +183,25 @@ pub enum Op {
         /// File, or omit and read stdin.
         file: Option<PathBuf>,
     },
+    /// Bracket-balance the input (read-only, stdin-first; issue 39): missing
+    /// closers → the exact mechanical tail; a misplaced closer → a line:col
+    /// diagnosis (no tail is offered — a tail cannot fix a misplaced
+    /// closer). Exit 0 balanced (incl. an accepted --tail), 1
+    /// unbalanced/mismatch, 2 usage.
+    Balance {
+        /// Clojure/EDN file or fragment (omit, or pass --stdin, to read
+        /// stdin — the primary use).
+        file: Option<PathBuf>,
+        /// Read the fragment from stdin (mutually exclusive with a file
+        /// path).
+        #[arg(long, conflicts_with = "file")]
+        stdin: bool,
+        /// A candidate closing tail to test: appended mechanically, then
+        /// re-walked — accepted iff its chars match the open stack's LIFO
+        /// order exactly.
+        #[arg(long)]
+        tail: Option<String>,
+    },
 }
 
 pub fn static_op_name(op: &Op) -> &'static str {
@@ -195,6 +214,7 @@ pub fn static_op_name(op: &Op) -> &'static str {
         Op::Format { .. } => "format",
         Op::Tree { .. } => "tree",
         Op::Strip { .. } => "strip",
+        Op::Balance { .. } => "balance",
     }
 }
 

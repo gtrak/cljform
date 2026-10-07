@@ -72,7 +72,7 @@ nesting sanity. Neither exists as a first-class tool today.
 │         blake3 hash, contained-kind counts) + annotated tree  │
 │         with content-addressed ⟦handles⟧                      │
 │ ops:    forms · tree · strip · get · check · edit ·           │
-│         materialize · format                                  │
+│         materialize · format · balance                        │
 │ safety: invariants I1–I6, atomic write, nesting detectors     │
 └───────────────────────────────────────────────────────────────┘
 ```
@@ -92,11 +92,14 @@ cljform [--json|--human] <op> [args]
 
 - `--json` (default when stdout is not a TTY, always on for the wrapper): one
   JSON object on stdout. `--human`: plain text with line/col.
-- File argument: `check`, `strip`, and `format` take a path or read stdin when
-  the path is omitted; `forms`, `tree`, `get`, and `edit` require a path.
+- File argument: `check`, `strip`, `format`, and `balance` take a path or
+  read stdin when the path is omitted; `balance` additionally accepts an
+  explicit `--stdin` flag (mutually exclusive with the path, §4.5). `forms`,
+  `tree`, `get`, and `edit` require a path.
   `edit` content arrives via `--content`, `--content-file`, or stdin.
 - **Exit codes** (the wrapper branches on these):
-  - `0` — success (including a clean `--dry-run`)
+  - `0` — success (including a clean `--dry-run`; for `balance`: the
+    fragment is balanced, with or without an accepted `--tail`, §4.5)
   - `1` — parse/structure error: `parse-error`, `not-one-form`,
     `truncated-content`, `shape-violation`, `detector-fatal` (under
     `--strict`), `annotate-conflict` (`tree` view), `materialize-error`,
@@ -104,7 +107,10 @@ cljform [--json|--human] <op> [args]
     markers present — the gate that closes the markers-as-symbols hole,
     §6), `not-supported-broken` (`tree --name` on a broken file) — plus
     `internal-error` (a residual panic caught at the dispatch boundary;
-    see the backstop below)
+    see the backstop below) — and `balance`'s unbalanced verdicts:
+    `kind: "missing-tail" | "mismatch"` on an `ok: true` envelope (the
+    diagnostic is the payload, not an error — the verification outcome
+    carries the exit code, §4.5)
 
   **The broken-file state (issue 31).** A file is BROKEN iff it has
   (a) tree-sitter parse errors or (b) conflict markers; both are
@@ -236,6 +242,7 @@ no derived summary that needs the cross-check, so only `get` drops it.
 | `edit <file>` | whole-form / patch / insert / delete, handle-targeted (§5, §10.3) | yes | `--handle H` (append/prepend excepted), `--mode replace\|patch\|insert-after\|insert-before\|append\|prepend\|delete`, `--content` / `--content-file` / stdin, `--old-text`/`--new-text` (patch), `--strict`, `--repair`, `--dry-run`, `--format-content` / `--no-format-content` (content reindent, §10.3; default on) |
 | `materialize` | draft→candidate via indent mode (§4.4) | no | `--content` / `--content-file` / stdin; emits candidate + unified diff |
 | `format [file]` | parinfer paren-mode reindent, candidate-first (§10.5) | no | file or stdin |
+| `balance [file]` | bracket-balance a fragment, read-only, stdin-first (§4.5): missing closers → the exact mechanical tail; misplaced closer → a line:col diagnosis (no tail offered) | no | file or `--stdin`; `--tail STRING` tests a candidate closing tail |
 
 **Content rule (edit):** content is normalized (markdown fences stripped,
 blank edges trimmed) and may carry several top-level forms — the I3 window
@@ -243,11 +250,17 @@ generalizes to an N-form allowed change (the v1 "exactly one complete
 balanced form" gate is gone; §14). Bracket inference is **opt-in**:
 unbalanced content is refused by default (exit 3, `unbalanced-content`,
 nothing written) with the inferred candidate and its diff attached and the
-hint `pass --repair to apply the inferred brackets, or submit balanced
-content (clj_draft can help)`; `--repair` enables the inference (forced
-missing trailing closers, and mid-file dedent closures at the caller's
-explicit risk); `--strict` + `--repair` refuses it (`repair-refused`, exit
-3, with the declined diff — `--strict` wins). The inference decision and
+hint leading with the `balance` mechanical facts of the SUBMITTED content
+(the candidate is balanced by construction — the walk must see the
+submitted text): missing closers → `content is missing N closer(s);
+mechanical tail (placement is yours to verify): <tail>`; a misplaced
+closer → the line:col diagnosis (`mismatch at line L col C: …`),
+followed by the standing affordance `pass --repair to apply the inferred
+brackets, or submit balanced content (clj_draft can help)` (§4.5);
+`--repair` enables the inference (forced missing trailing closers, and
+mid-file dedent closures at the caller's explicit risk); `--strict` +
+`--repair` refuses it (`repair-refused`, exit 3, with the declined diff —
+`--strict` wins). The inference decision and
 outcome are **independent of indentation**: inference runs on the content
 as submitted (markers/fences stripped only); the base-shift dedent is
 computed from the submitted content and applied after the decision; and
@@ -336,6 +349,95 @@ this is the tool's candidate-only inference mode (the other path, `edit
 and the output is explicitly labeled a candidate. The skill's "never use
 smart mode" rule is preserved as: no inference path exists without an
 explicit, attributable invocation whose output the agent must verify.
+
+### 4.5 balance (the mechanical bracket-balance primitive)
+
+Born from an incident: a worker drafting a deeply-nested replacement form
+got a WRONG draft-mode bracket inference ("closed virtual-future too
+early") and fell back to hand-rolled Python paren counters + clj-kondo on
+a /tmp fragment. Those fallbacks are string-blind when done naively;
+`balance` is not — it walks the SAME lexer as the materialize path
+(strings, comments, char literals, and regex never count: a `(` inside a
+string, a `; ( (` comment, a `\(` charlit, or a `#"…( …"` regex is not
+structure). This is the whole point vs a naive counter, and why the two
+facts below are separable:
+
+1. **MISSING closers** — the open stack at EOF, reported LIFO. A count
+   cannot see ORDER, a stack can; the answer is the exact mechanical tail.
+2. **MISPLACED closers** — a closer that is not the innermost opener's
+   partner. A count cannot see these at all; a stack can. The diagnosis
+   names the closer's line:col AND the innermost opener it failed to
+   close (char + line:col). **No tail is offered for a mismatch**: a tail
+   cannot fix a misplaced closer, so suggesting one would be wrong.
+
+Input: a file path, or `--stdin` (mutually exclusive with the path; with
+neither, stdin is read — stdin fragments are the primary use), and
+optionally `--tail <string>` — a candidate closing tail to TEST
+(appended mechanically, then re-walked; accepted iff its chars match the
+open stack's LIFO order exactly — same length, same partners, same
+order).
+
+Outcomes (the envelope is flat: `kind`/`counts`/`stack`/`tail`/`mismatch`
+beside `ok`/`op` — the diagnostic itself is the payload, not a `result`
+subtree; `ok` is `true` in all three — the verification outcome, not a
+tool error, carries the exit code):
+
+```json
+{ "ok": true, "op": "balance", "kind": "missing-tail",
+  "counts": { "open": 16, "close": 15, "paren": 15, "bracket": 0, "brace": 0 },
+  "stack": [ { "ch": "(", "line": 9, "col": 15 } ], "tail": ")" }
+
+{ "ok": true, "op": "balance", "kind": "mismatch",
+  "counts": { "open": 6, "close": 4, "paren": 1, "bracket": 2, "brace": 0 },
+  "mismatch": { "closer": "]", "line": 12, "col": 3,
+                "innermost": { "ch": "(", "line": 9, "col": 15 },
+                "message": "mismatch at line 12 col 3: ] closes nothing — innermost open is ( from line 9 col 15" },
+  "stack": [ … remaining openers, open order bottom first … ] }
+
+{ "ok": true, "op": "balance", "kind": "balanced",
+  "counts": { "open": 16, "close": 16, "paren": 16, "bracket": 0, "brace": 0 } }
+```
+
+- `kind: "balanced"` — stack empty at EOF, no mismatch. Exit `0`. With an
+  accepted `--tail` (including an empty tail on an already-balanced
+  fragment): still `balanced` (the tail is echoed on `tail`), exit `0`,
+  human `tail accepted — fragment balances`.
+- `kind: "missing-tail"` — openers remain at EOF, no mismatch on the way.
+  Exit `1`. `stack` lists every opener (char, line:col, open order bottom
+  first) and `tail` the EXACT string to append (LIFO order). A `--tail`
+  whose chars all match but is SHORTER is not a mismatch — the fragment
+  still needs its tail — so it stays `missing-tail` (full tail reported,
+  a `notes` line rejects the candidate: `too short`).
+- `kind: "mismatch"` — the FIRST closer that is not the innermost opener's
+  partner (including a `--tail` char: a wrong-order tail, a non-closer in
+  the tail, and an EXTRA tail char on an already-balanced fragment all
+  land here, at the append position, as loud mismatches). Exit `1`.
+  `mismatch.innermost` is `null` when the closer arrived with an empty
+  stack ("closes nothing — no openers remain"). `stack` carries the
+  openers still open after the mismatch. A tail is NEVER offered for a
+  mismatch (and `--tail` on a raw mismatch is not evaluated — a `notes`
+  line says so).
+
+Human lines: `balanced — 16 openers, 16 closers` ·
+`unbalanced — 16 openers, 15 closers (missing 1: ))` ·
+`mismatch at line 12 col 3: ] closes nothing — innermost open is (
+from line 9 col 15` · `tail accepted — fragment balances`.
+
+Read-only, never writes, no file needed. Exit `2` usage (`--stdin` with a
+path; bad flags), `4` I/O (unreadable file / stdin). The op is intercepted
+in `main` before the dispatch backstop on the same basis as `strip`:
+the walker is provably panic-free (byte iteration and `pop()` only).
+
+**Wiring (affordances only; edit semantics unchanged).**
+- `edit` unbalanced-content refusal (§4.3): the hint leads with the
+  mechanical facts of the SUBMITTED content (missing-tail → the `content
+  is missing N closer(s); mechanical tail (placement is yours to verify):
+  <tail>` line; mismatch → the line:col diagnosis); the inferred-candidate
+  display stays as-is — repair stays opt-in and heuristic-labeled.
+- The `clj_draft` extension tool: when inference is applied (a candidate
+  + a hunk-carrying diff returned), one line is appended: `verify balance
+  before use: cljform balance --stdin` (the draft itself is unchanged; it
+  never writes).
 
 ## 5. Addressing
 
@@ -509,7 +611,7 @@ session.
 | `clj_tree` | `{path, name?, depth?, json?, startLine?, endLine?, recover?}` | `cljform tree` — the primary handle-discovery view (`--depth N\|all`); `name` maps to `--name SYM` (the §10.2 selector: matched subtrees at full depth, zero matches is an ok empty result); `json` returns the structured node list; `startLine`/`endLine` map to `--start-line`/`--end-line` (the §10.2 line window: complete forms only, real file line numbers, the effective span echoed — page large files; the window header/echo passes through unchanged); `recover` maps to `--recover` (the §10.2 broken-file recovery view: on a broken file the JSON path renders the diagnostics + intact-form labels + window echo — no handles; on a healthy file the normal view). **Human path (default, `--human`) is a pass-through:** the annotated source is not a JSON envelope, so on exit 0 the wrapper returns `stdout` directly (BOM-stripped, `trimEnd`) with no `isError` — a successful default `clj_tree` is never an error and is never prefixed `cljform failed:`. Only a nonzero exit (or, in `json` mode, an unparseable/`ok:false` envelope) yields `isError`, using `errorText` when the output parses as an error envelope, else the `cljform failed: ${stderr \|\| stdout}` fallback. **Large-file default (issue 33 Part B):** a DEFAULT call (no `name`/`json`/`depth`/`startLine`/`endLine`/`recover`) on a file with MORE than `TREE_INDEX_THRESHOLD_LINES` (300, a wrapper constant) lines returns the compressed **FORM INDEX** instead of the whole annotated dump: a header `large file: N lines, M top-level forms — showing the form index (handles are live). Annotated view: pass startLine/endLine; a specific form: name.` then one `⟦handle⟧ head name (lines X–Y)` row per top-level form, sorted by line (the `--name`-block label style), with NO source body. The rows come from `cljform tree --json --depth 1` (a small payload since issue 33 Part A); a nonzero exit from that call surfaces as the same error result as the normal path. The index scales with form count, the annotated view with file size — the default picks the right tool instead of the biggest dump. Explicit calls are honored exactly and uncapped (`startLine`/`endLine` → the windowed annotated view; `name` → the selector view; `json` → the node table; `depth` → the cutoff), and below the threshold the pass-through is byte-identical (the CLI's own `tree` contract is unchanged — the wrapper owns the agent ergonomics) |
 | `clj_get` | `{path, name? / handle?}` | `cljform get --json` — exact bytes + the form's `⟦handle⟧` |
 | `clj_edit` | `{path, handle?, mode?, content? / oldText? + newText?, dryRun?, strict?, repair?, autoFormat?, ops?}` | `cljform edit --handle …` — mode auto-selects `patch` when `oldText` is present; append/prepend take no handle; `dryRun` ⇒ `--dry-run`, `strict` ⇒ `--strict`, `repair` ⇒ `--repair`; `autoFormat` (default true) maps to the in-edit content reindent: `false` passes `--no-format-content`, `true` (the default) passes nothing and lets `cljform edit` reindent the content itself in parinfer paren mode (§10.3/§10.5; a refused reindent is reported by the CLI as a note, the edit never fails for it); the wrapper no longer runs a separate `cljform format` call; `oldText`/`newText` are exact patch text and are never reformatted. **Batch (issue 36):** `ops` (an array of `{handle?, mode?, content? / oldText? + newText?}`) takes precedence over the single-op params (passing both is a wrapper-side usage error) and maps to `cljform edit --batch <tempfile>` — N ops in one atomic call, every handle resolved against the ORIGINAL file and each target tracked across the batch (§10.3 batch contract); the wrapper validates each op's shape up front (same contract as the single-op params, the error names the op index) and renders `result.text` (the composed per-op blocks + aggregate line) as-is, then appends a `next handles (post-batch):` block sourced from the per-op `result.ops[*].summary` (replaced/patched → the new handle; inserted → the inserted handle) so the agent chases post-batch handles without a `clj_tree` round-trip; a successful multi-op batch's `result.text` carries the end-state echo (the `end state (post-batch):` block, §10.3) which the as-is rendering surfaces; a batch ABORT renders `error.batch_ops` (the relabeled would-apply per-op blocks, §10.3 batch abort rendering) directly under the error line — both sourced from the JSON envelope, never from re-parsing human text. **Issue 37 patch-not-found hints:** the wrapper passes the CLI's `hint`/`message` through verbatim, so the indentation-delta diagnosis (B) and the sub-form steering hint (D) reach the agent without wrapper logic. **Next-handle affordance (issue 35):** on every successful (non-dry-run) edit the wrapper appends a final line sourced from the JSON envelope (`result.summary`), never from re-parsing the human text — `replace`/`patch` append `next handle: ⟦H⟧ — use it for the next edit to this form` (from `summary.handle`; falls back to `summary.wasHandle` only when `handle` is absent) so the agent chases the returned handle instead of re-fetching; `insert-after`/`insert-before` render `summary.inserted` (one labeled entry per top-level inserted form, §10.3 insert response contract) as a self-sufficient block — `inserted after ⟦anchor⟧:` / `  ⟦handle⟧ head name (lines a–b)` per entry / `— use these for the next edit` — and a SINGLE-entry insert collapses to the established `next handle:` line instead; `delete` appends nothing (the form is gone — no stale handle). Old envelopes (pre-issue-35 `summary.handles`) still render the legacy bare list |
-| `clj_draft` | `{content}` | `cljform materialize --content-file …` — returns candidate + diff; never writes |
+| `clj_draft` | `{content}` | `cljform materialize --content-file …` — returns candidate + diff; never writes. When inference is applied (the diff carries a hunk) the wrapper appends one line — `verify balance before use: cljform balance --stdin` (the mechanical balance check, §4.5) — and no line when the draft came back unchanged |
 
 **Fingerprint cache:** in-memory `Map<realpath, forms>`. Refreshed on every
 successful `clj_forms`/`clj_get` and post-edit shape check (the CLI result

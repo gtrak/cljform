@@ -13,12 +13,13 @@
 //! `;`, or `"`) are never treated as code. Balanced input passes through
 //! unchanged, so repair is a no-op on well-formed content.
 //!
-//! The single lexical state machine ([`lex_step`]) underlies all three scan
-//! sites in this module (the indent scanner, the closer-attach point, and the
-//! splicer's trailing-comment guard); [`first_comment`] is the shared
-//! "where does the line's code end" primitive. (format.rs carries a separate
-//! scanner by design: it rewrites bytes and enforces its own failure rules,
-//! so its contract does not match this inference-only scanner.)
+//! The single lexical state machine ([`lex_step`]) underlies all four scan
+//! sites (the indent scanner, the closer-attach point, the splicer's
+//! trailing-comment guard, and `balance`'s raw-delimiter walk in
+//! balance.rs); [`first_comment`] is the shared "where does the line's code
+//! end" primitive. (format.rs carries a separate scanner by design: it
+//! rewrites bytes and enforces its own failure rules, so its contract does
+//! not match this inference-only scanner.)
 
 pub struct MaterializeError {
     pub line: usize,
@@ -33,9 +34,11 @@ struct OpenParen {
     col: usize,
 }
 
-/// Lexical context of a byte within a Clojure source stream.
+/// Lexical context of a byte within a Clojure source stream. `pub(crate)`
+/// so `balance`'s raw-delimiter walk reuses this exact state machine (a
+/// second scanner would drift on strings/regex/charlits).
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Lx {
+pub(crate) enum Lx {
     Code,
     String,
     Regex,
@@ -52,7 +55,7 @@ enum Lx {
 /// keeps a multi-line string open across line boundaries. A `Comment` never
 /// spans lines, so callers pass a line at a time and reset `Comment` to
 /// `Code` between lines.
-fn lex_step(bytes: &[u8], i: &mut usize, state: &mut Lx) -> Option<(usize, Lx)> {
+pub(crate) fn lex_step(bytes: &[u8], i: &mut usize, state: &mut Lx) -> Option<(usize, Lx)> {
     if *i >= bytes.len() || matches!(*state, Lx::Comment) {
         return None; // comment runs to end of line
     }

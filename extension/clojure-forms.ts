@@ -771,6 +771,13 @@ export default function ClojureForms(pi: ExtensionAPI) {
 					"diff (draft → candidate):",
 					r.diff || "(no change)",
 				];
+				// Issue 39: inference applied (the diff carries a hunk) → the
+				// candidate's balance is a mechanical check; point at the
+				// primitive. No hunk = nothing inferred = nothing to verify.
+				if ((r.diff ?? "").includes("@@")) {
+					lines.push("");
+					lines.push("verify balance before use: cljform balance --stdin");
+				}
 				return {
 					content: [{ type: "text", text: lines.join("\n") }],
 					details: { candidate: r.candidate, diff: r.diff, note: r.note },

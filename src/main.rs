@@ -8,6 +8,7 @@
 // constructed once per process and returned, so the large-err lint is noise.
 #![allow(clippy::result_large_err)]
 
+mod balance;
 mod broken;
 mod cli;
 mod content;
@@ -74,6 +75,15 @@ fn main() -> ExitCode {
     // outside the L3 envelope backstop, which shapes an envelope).
     if let cli::Op::Strip { file } = &cli.op {
         return ops::run_strip(file, json);
+    }
+    // `balance` (issue 39) is likewise intercepted: its verification
+    // outcome (ok:true, kind balanced|missing-tail|mismatch) carries the
+    // exit code — 0 balanced / 1 unbalanced-mismatch — which the standard
+    // ok-implies-zero dispatch path cannot express. Its walker is
+    // panic-free (byte iteration, pop only), so it stays outside the L3
+    // backstop on the same basis as strip.
+    if let cli::Op::Balance { file, stdin, tail } = &cli.op {
+        return balance::run_balance(file, *stdin, tail, json);
     }
     match run_dispatch(&cli) {
         Ok(Ok(out)) => {
@@ -202,6 +212,9 @@ fn dispatch(cli: &Cli) -> Result<Output, Fail> {
         // only for match exhaustiveness and is provably unreachable.
         #[allow(clippy::unreachable)]
         cli::Op::Strip { .. } => unreachable!("strip is handled in main() before the envelope"),
+        // Same interception for balance (issue 39; see main()).
+        #[allow(clippy::unreachable)]
+        cli::Op::Balance { .. } => unreachable!("balance is handled in main() before the envelope"),
     }
 }
 

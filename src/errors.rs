@@ -172,18 +172,56 @@ pub fn prepare_fail(p: content::PrepareError) -> Fail {
                 "submit balanced content, or drop --strict to let --repair apply the reported, verified repair",
             ),
         ),
-        content::PrepareError::Unbalanced { candidate, diff } => Fail(
-            exit::TARGET,
-            ErrorBody::new(
-                "unbalanced-content",
-                format!(
-                    "content is unbalanced and bracket inference is off (opt-in)\n{diff}\ncandidate:\n{candidate}"
-                ),
-            )
-            .with_hint(
+        content::PrepareError::Unbalanced { candidate, diff, submitted } => {
+            // Issue 39: the hint gains the mechanical facts from the balance
+            // walk on the content AS SUBMITTED (the candidate is balanced by
+            // construction — the walk must see the submitted text). The
+            // inferred-candidate display in the message stays unchanged
+            // (repair stays opt-in and heuristic-labeled).
+            let facts = match crate::balance::walk(&submitted) {
+                crate::balance::Walk::MissingTail { stack, .. } => {
+                    let n = stack.len();
+                    let tail = crate::balance::tail_for(&stack);
+                    format!(
+                        "content is missing {n} closer(s); mechanical tail (placement is yours to verify): {tail}"
+                    )
+                }
+                crate::balance::Walk::Mismatch {
+                    closer,
+                    line,
+                    col,
+                    innermost,
+                    ..
+                } => {
+                    format!(
+                        "{}; a misplaced closer cannot be fixed by a tail",
+                        crate::balance::mismatch_sentence(closer, line, col, innermost)
+                    )
+                }
+                // A raw walk of submitted content cannot come back balanced
+                // here (balanced content parses and never reaches this
+                // refusal); stand on the plain hint if it ever does.
+                crate::balance::Walk::Balanced { .. } => String::new(),
+            };
+            let hint = if facts.is_empty() {
                 "pass --repair to apply the inferred brackets, or submit balanced content (clj_draft can help)"
-            ),
-        ),
+                    .to_string()
+            } else {
+                format!(
+                    "{facts} — pass --repair to apply the inferred brackets, or submit balanced content (clj_draft can help)"
+                )
+            };
+            Fail(
+                exit::TARGET,
+                ErrorBody::new(
+                    "unbalanced-content",
+                    format!(
+                        "content is unbalanced and bracket inference is off (opt-in)\n{diff}\ncandidate:\n{candidate}"
+                    ),
+                )
+                .with_hint(hint),
+            )
+        },
         content::PrepareError::TruncatedFence => Fail(
             exit::PARSE,
             ErrorBody::new(
