@@ -344,13 +344,20 @@ fn stale_recovery_hint(
             }
         }
     }
-    "no form matches the previous identity \u{2014} re-run tree".to_string()
+    STALE_PLAIN.to_string()
 }
+
+/// The plain-message fallback: no verifiable identity (the pre-42 ending of
+/// every dead end; a fragment needle that matches nothing keeps it, issue 42 C).
+const STALE_PLAIN: &str = "no form matches the previous identity \u{2014} re-run tree";
 
 /// The patch path: identity from `--old-text` — the bytes the agent saw.
 /// Def-like needle → match the current file by var name (duplicates →
 /// candidates, pick nothing); otherwise a structural match by token
 /// stream (oldText vs the current form's own bytes — the reformat case).
+/// Issue 42 (C) stretches the dead end: a FRAGMENT needle (a token stream
+/// that is no whole form) now reports its unique enclosing form by
+/// token-subsequence containment — report-only, never a guess.
 fn stale_recovery_patch(bytes: &[u8], nodes: &[handle::Node], old: &str) -> String {
     let old_tokens = parser::token_stream(old.as_bytes());
     // Def-like needle: the identity is the var name.
@@ -359,8 +366,12 @@ fn stale_recovery_patch(bytes: &[u8], nodes: &[handle::Node], old: &str) -> Stri
             .iter()
             .filter(|n| n.def_name.as_deref() == Some(name.as_str()))
             .collect();
-        return match cands.len() {
-            0 => "no form matches the previous identity \u{2014} re-run tree".to_string(),
+        match cands.len() {
+            0 => {
+                // Zero name matches: a def-like fragment can sit inside a form
+                // that names nothing matching — fall through to the structural
+                // search below (whole-form token match, then containment).
+            }
             1 => {
                 // The whitespace claim needs its own proof: token-stream
                 // equality between the submitted oldText and the current
@@ -375,27 +386,26 @@ fn stale_recovery_patch(bytes: &[u8], nodes: &[handle::Node], old: &str) -> Stri
                     ),
                     _ => false,
                 };
-                recovery_line(bytes, cands[0], claim)
+                return recovery_line(bytes, cands[0], claim);
             }
             _n => {
                 let spans = candidate_spans(&cands);
-                format!(
+                return format!(
                     "{} forms are named {name:?} in the current file \u{2014} {spans} (candidates; none picked \u{2014} run tree to choose one)",
                     cands.len()
-                )
+                );
             }
-        };
+        }
     }
-    // Not def-like (or unparseable): structural match by token stream. A
-    // fragment needle that does not cover a whole form has no match — the
-    // plain message, never a guess.
+    // Not def-like (or unparseable, or a def-like needle with no name match):
+    // structural match by token stream.
     let old_tokens = match old_tokens {
         Some(t) => t,
-        None => return "no form matches the previous identity \u{2014} re-run tree".to_string(),
+        None => return STALE_PLAIN.to_string(),
     };
     let leafs = match parser::leaf_tokens(bytes) {
         Some(l) => l,
-        None => return "no form matches the previous identity \u{2014} re-run tree".to_string(),
+        None => return STALE_PLAIN.to_string(),
     };
     let (starts, texts) = &leafs;
     let cands: Vec<&handle::Node> = nodes
@@ -403,8 +413,25 @@ fn stale_recovery_patch(bytes: &[u8], nodes: &[handle::Node], old: &str) -> Stri
         .filter(|n| parser::node_tokens_equal(starts, texts, n.start_byte, n.end_byte, &old_tokens))
         .collect();
     match cands.len() {
-        0 => "no form matches the previous identity \u{2014} re-run tree".to_string(),
-        1 => recovery_line(bytes, cands[0], true), // token equality is the match itself
+        0 => fragment_containment(bytes, nodes, starts, texts, &old_tokens),
+        1 => {
+            // Issue 42 (owner fix): "this form is now" asserts IDENTITY —
+            // the matched form IS the stale target. That is verifiable
+            // from the bytes: if the matched form's CURRENT bytes are the
+            // needle VERBATIM, the form is unchanged, and the stale
+            // handle cannot have been its (an unchanged form's content
+            // hash still resolves) — the stale target is elsewhere, and
+            // the identity candidates are the ENCLOSING forms. If the
+            // bytes differ (a token-equal match whose bytes rotated —
+            // the 40A reformat), the matched form itself is the plausible
+            // stale target and keeps the assertive report.
+            let verbatim = old.as_bytes() == &bytes[cands[0].start_byte..cands[0].end_byte];
+            if verbatim {
+                enclosing_candidate_report(nodes, cands[0])
+            } else {
+                recovery_line(bytes, cands[0], true) // token equality is the match itself
+            }
+        }
         _n => {
             let spans = candidate_spans(&cands);
             format!(
@@ -412,6 +439,189 @@ fn stale_recovery_patch(bytes: &[u8], nodes: &[handle::Node], old: &str) -> Stri
                 cands.len()
             )
         }
+    }
+}
+
+/// Issue 42 (C): fragment-needle recovery — the needle's token stream as a
+/// CONTIGUOUS RUN inside a current form's token stream (one form → that
+/// enclosing form; several → all candidates with spans, pick nothing;
+/// none → the plain message). Cost guard: the scan runs over the
+/// leaf-token arrays of the ONE parse the caller already did (never a
+/// second parse), early-exiting per form — the deep-tree error path stays
+/// bounded and flat.
+fn fragment_containment(
+    bytes: &[u8],
+    nodes: &[handle::Node],
+    starts: &[usize],
+    texts: &[String],
+    needle: &[String],
+) -> String {
+    // A parseable needle always carries ≥1 token; an empty stream contains
+    // nothing and falls to the plain message.
+    let hits: Vec<&handle::Node> = if needle.is_empty() {
+        Vec::new()
+    } else {
+        nodes
+            .iter()
+            .filter(|n| form_tokens_contain_run(starts, texts, n.start_byte, n.end_byte, needle))
+            .collect()
+    };
+    match hits.len() {
+        0 => STALE_PLAIN.to_string(),
+        1 => fragment_recovery_line(bytes, hits[0], starts, texts, needle),
+        n => {
+            let spans = candidate_spans(&hits);
+            format!(
+                "{n} forms carry your oldText as a contiguous token run \u{2014} {spans} (candidates; none picked \u{2014} run tree to choose one)"
+            )
+        }
+    }
+}
+
+/// True when the form spanning `n..m` bytes contains `needle` as a
+/// contiguous run of its own leaf tokens. The form's tokens are a
+/// binary-search slice of the ONE-parse arrays; the window scan
+/// early-exits at the first hit (a second containment in the same form is
+/// never reported — the enclosing form is what is reported).
+fn form_tokens_contain_run(
+    starts: &[usize],
+    texts: &[String],
+    n: usize,
+    m: usize,
+    needle: &[String],
+) -> bool {
+    let lo = starts.partition_point(|&s| s < n);
+    let hi = starts.partition_point(|&s| s < m);
+    let slice = &texts[lo..hi];
+    if slice.len() < needle.len() {
+        return false;
+    }
+    slice
+        .windows(needle.len())
+        .any(|w| w.iter().zip(needle.iter()).all(|(a, b)| a == b))
+}
+
+/// The unique-containment recovery line: the new handle + the exact current
+/// bytes of the enclosing form (the re-get for free), labeled by the form's
+/// head + var name when present. The 40A whitespace claim rides on the same
+/// verified machinery as the whole-form path — a token-stream EQUALITY, and
+/// a fragment needle's run is proper to the form's stream, so it never
+/// verifies here (the claim stays omitted, never asserted).
+/// Issue 42 (owner fix): "this form is now" is asserted only for a DEF-LIKE
+/// enclosing form (the name pins the plausible stale target); a non-def-like
+/// single hit is phrased as a candidate — "sits inside", pick nothing.
+fn fragment_recovery_line(
+    bytes: &[u8],
+    node: &handle::Node,
+    starts: &[usize],
+    texts: &[String],
+    needle: &[String],
+) -> String {
+    let label = match (&node.head, &node.def_name) {
+        (Some(h), Some(n)) => format!(" ({h} {n})"),
+        (Some(h), None) => format!(" ({h})"),
+        (None, _) => String::new(),
+    };
+    if node.def_name.is_some() {
+        let form = String::from_utf8_lossy(&bytes[node.start_byte..node.end_byte]);
+        let claim = parser::node_tokens_equal(
+            starts,
+            texts,
+            node.start_byte,
+            node.end_byte,
+            needle,
+        );
+        let mut s = format!(
+            "this form is now \u{27E6}{}\u{27E7}{label} \u{2014} your oldText is a fragment inside it; current bytes:\n{form}",
+            node.handle
+        );
+        if claim {
+            s.push_str(
+                "\nyour oldText differs only in whitespace (e.g. a formatter ran) \u{2014} copy the bytes above",
+            );
+        }
+        return s;
+    }
+    // Non-def-like: the needle sits inside a form whose identity is not
+    // pinned by a name — phrase it as a candidate, assert nothing.
+    format!(
+        "your oldText sits inside \u{27E6}{}\u{27E7}{label} (lines {}\u{2013}{}) \u{2014} if that is the form you were editing, use that handle",
+        node.handle, node.line[0], node.line[1]
+    )
+}
+
+/// Issue 42 (owner fix): the whole-inner-node candidate report. The
+/// needle's token run matched a whole node whose CURRENT bytes ARE the
+/// needle verbatim — the form is unchanged, so the stale handle cannot
+/// have been its (its content hash would still resolve); the stale
+/// target is elsewhere. The identity candidates are therefore the node's
+/// ENCLOSING forms (its ancestor chain), preferring def-like ancestors
+/// (a def name pins the plausible target): one enclosing candidate → the
+/// neutral "sits inside … if that is the form you were editing" line;
+/// several → all candidates with spans, pick nothing; none (the match is
+/// top-level) → the matched form itself, phrased as a candidate —
+/// "this form is now" is never asserted here.
+fn enclosing_candidate_report(nodes: &[handle::Node], matched: &handle::Node) -> String {
+    // Byte ranges are unique per node (same range = same node).
+    let idx = nodes
+        .iter()
+        .position(|n| n.start_byte == matched.start_byte && n.end_byte == matched.end_byte)
+        .expect("matched node is in the collected table");
+    let mut chain: Vec<&handle::Node> = Vec::new();
+    let mut p = nodes[idx].parent;
+    while let Some(i) = p {
+        chain.push(&nodes[i]);
+        p = nodes[i].parent;
+    }
+    let deflikes: Vec<&handle::Node> = chain
+        .iter()
+        .filter(|n| n.def_name.is_some())
+        .cloned()
+        .collect();
+    let cands: Vec<&handle::Node> = if !deflikes.is_empty() {
+        deflikes
+    } else if !chain.is_empty() {
+        chain
+    } else {
+        vec![matched]
+    };
+    match cands.len() {
+        1 => format!(
+            "your oldText sits inside {} \u{2014} if that is the form you were editing, use that handle",
+            enclosing_candidate_label(cands[0])
+        ),
+        _n => {
+            let list: Vec<String> = cands.iter().map(|n| enclosing_candidate_label(n)).collect();
+            format!(
+                "your oldText sits inside {} (candidates; none picked \u{2014} run tree to choose one)",
+                list.join(", ")
+            )
+        }
+    }
+}
+
+/// The enclosing-form CANDIDATE label: handle + head/var name when the
+/// form carries them + the line span — the addressable facts.
+fn enclosing_candidate_label(node: &handle::Node) -> String {
+    match (&node.head, &node.def_name) {
+        (Some(h), Some(n)) => format!(
+            "\u{27E6}{}\u{27E7} ({h} {n}, lines {}\u{2013}{})",
+            node.handle,
+            node.line[0],
+            node.line[1]
+        ),
+        (Some(h), None) => format!(
+            "\u{27E6}{}\u{27E7} ({h}, lines {}\u{2013}{})",
+            node.handle,
+            node.line[0],
+            node.line[1]
+        ),
+        (None, _) => format!(
+            "\u{27E6}{}\u{27E7} (lines {}\u{2013}{})",
+            node.handle,
+            node.line[0],
+            node.line[1]
+        ),
     }
 }
 

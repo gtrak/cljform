@@ -693,11 +693,35 @@ fn verify_edit(
 /// resulting-file parse fails (patch reaches it directly — patch is
 /// surgical and carries no content-stage balance gate; the whole-form modes
 /// reach it only via the `--repair` path or a tool bug).
+///
+/// Issue 42 (A+B), patch payloads only (oldText known): the balance walk's
+/// ABSOLUTE verdict is closer-heavy by nature for tail patches, so the
+/// LEAD becomes the RELATIVE delta against the counted oldText —
+/// "newText has N fewer/more closer(s) than the text it replaces
+/// (absolute: …)" — and a zero-relative delta still failing gets
+/// "deltas balance relative to oldText — the mismatch is inside newText
+/// itself" (the absolute/tail/mismatch machinery stays intact under it).
+/// The delta runs on FULL counts (never aborting on a mismatch — the
+/// walk's early-exit scalars undercount after the mismatch point, which
+/// would make the zero-relative reading lie). oldText itself is NOT
+/// assumed balanced: a patch oldText can carry the enclosing form's
+/// closer(s), and that is exactly the tail-fumble hole — when
+/// walk(newText) is BALANCED in isolation but the relative delta is
+/// nonzero, the refusal STILL leads with the relative delta and derives
+/// the tail from the resulting FILE's walk (its EOF stack); the tail is
+/// verified by splice as usual, and the preview + verified claim ride on
+/// the same dry-run candidate. When the missing-tail diagnosis fires,
+/// the mechanical tail appended at END is also previewed as a dry-run
+/// candidate diff (old→new+tail) with the verified-tail claim riding on
+/// THAT splice — stated once, never applied; if the end-append does not
+/// parse, the refusal says so honestly and shows no preview. Whole-form
+/// content modes keep the absolute framing (nothing to be relative to).
 fn write_gate_enrich(
     fail: Fail,
     payload: &Option<content::Payload>,
     content: &Option<String>,
     content_file: &Option<PathBuf>,
+    old_text: &Option<String>,
     new_text: &Option<String>,
     new_bytes: &[u8],
 ) -> Fail {
@@ -725,26 +749,172 @@ fn write_gate_enrich(
         },
         None => return Fail(exit, body),
     };
+    // Issue 42 (A): the patch path has a baseline — the submitted oldText
+    // (the bytes the agent saw — which can carry closers belonging to the
+    // enclosing form, so it is NOT assumed balanced). Content modes have
+    // nothing to be relative to and keep the absolute framing. The delta
+    // runs on FULL counts (never aborting on a mismatch): the walk's
+    // early-exit scalars undercount the text after the mismatch point.
+    let is_patch = field == "newText";
+    let rel: Option<(crate::balance::Counts, crate::balance::Counts)> = (is_patch && old_text.is_some())
+        .then(|| {
+            let old_c = crate::balance::full_counts(
+                old_text.as_ref().expect("old_text is_some gate above"),
+            );
+            let new_c = crate::balance::full_counts(&submitted);
+            (old_c, new_c)
+        });
     let (lead, hint) = match crate::balance::walk(&submitted) {
-        // The content balances: the parse failed for other reasons — the
-        // file-level message stands alone (no behavior change).
-        crate::balance::Walk::Balanced { .. } => return Fail(exit, body),
-        crate::balance::Walk::MissingTail { stack, .. } => {
+        // The content balances in ISOLATION: the parse failed for other
+        // reasons — unless this is a patch whose relative closer delta vs
+        // oldText is nonzero (the owner-verified tail fumble: newText is
+        // balanced but the splice consumed a closer oldText carried for
+        // the enclosing form). Then the refusal still leads with the
+        // relative delta, and the tail is derived from the resulting
+        // FILE's walk (its EOF stack), verified by splice as usual.
+        crate::balance::Walk::Balanced { .. } => {
+            if let Some((old_c, new_c)) = &rel {
+                let delta = patch_delta(new_c, old_c);
+                if delta != 0 {
+                    let rel_line = patch_relative_line(new_c, old_c);
+                    // Lossy: new_bytes came from a parsed file + a UTF-8
+                    // submission; a lossy replacement char can never
+                    // masquerade as an ASCII delimiter.
+                    let file_walk = crate::balance::walk(
+                        &String::from_utf8_lossy(new_bytes),
+                    );
+                    let (absolute, hint) = match file_walk {
+                        crate::balance::Walk::MissingTail {
+                            stack, ..
+                        } => {
+                            let n = stack.len();
+                            let tail = crate::balance::tail_for(&stack);
+                            // Verified by splice, as in the 40B file-level
+                            // arm: the previewed candidate (newText + tail)
+                            // CARRIES the enclosing closer, so it can never
+                            // parse on its own — the splice that proves the
+                            // tail is the resulting FILE + tail at EOF.
+                            if crate::balance::tail_verifies(new_bytes, &tail) {
+                                let candidate = format!("{submitted}{tail}");
+                                let preview = if candidate == old_text.as_deref().expect("rel gate above") {
+                                    // The owner-verified fumble shape: the
+                                    // tail IS the dropped closer(s), so the
+                                    // candidate reproduces oldText exactly —
+                                    // say so instead of printing an empty
+                                    // diff.
+                                    String::from(
+                                        "identical to oldText (restoring the dropped closer)"
+                                    )
+                                } else {
+                                    crate::materialize::unified_diff(
+                                        old_text
+                                            .as_deref()
+                                            .expect("rel gate above"),
+                                        &candidate,
+                                        "oldText",
+                                        "newText+tail",
+                                    )
+                                };
+                                let claim =
+                                    crate::balance::tail_verification_claim(new_bytes, &tail, "file");
+                                (
+                                    format!(
+                                        "resulting file is missing {n} closer(s) at EOF; mechanical tail (placement is yours to verify): {tail}\npreview (tail appended at end \u{2014} verify placement):\n{preview}\n{claim}"
+                                    ),
+                                    format!(
+                                        "fix the submitted {field}: append the missing closer(s) above at its end (they closed the enclosing form that oldText also closed), then resubmit; cljform never writes to a file that does not parse"
+                                    ),
+                                )
+                            } else {
+                                (
+                                    format!(
+                                        "resulting file is missing {n} closer(s) at EOF; mechanical tail (placement is yours to verify): {tail}\ntail at end of file does not parse \u{2014} check the file-level diagnosis below"
+                                    ),
+                                    format!(
+                                        "fix the submitted {field}: place the missing closers where they belong, then resubmit; cljform never writes to a file that does not parse"
+                                    ),
+                                )
+                            }
+                        }
+                        _ => (
+                            String::from(
+                                "resulting file's own balance walk finds no EOF missing tail \u{2014} the problem is not a dropped closer; see the file-level diagnosis below",
+                            ),
+                            format!(
+                                "fix the submitted {field}: it carries {} closer(s) {} than the text it replaces \u{2014} place them where they belong, then resubmit; cljform never writes to a file that does not parse",
+                                delta.abs(),
+                                if delta > 0 { "more" } else { "fewer" }
+                            ),
+                        ),
+                    };
+                    let lead = format!("{rel_line}\n{absolute}");
+                    let (line, col) = (
+                        body.line.unwrap_or_default(),
+                        body.col.unwrap_or_default(),
+                    );
+                    let message = format!(
+                        "{lead}\nfile-level context: {} @ line {line} col {col}",
+                        body.message
+                    );
+                    return Fail(exit, ErrorBody { message, hint: Some(hint), ..body });
+                }
+            }
+            // Zero delta or non-patch: the parse failed for other reasons —
+            // the file-level message stands alone (no behavior change).
+            return Fail(exit, body);
+        }
+        crate::balance::Walk::MissingTail {
+            stack, ..
+        } => {
             let n = stack.len();
             let tail = crate::balance::tail_for(&stack);
-            // Issue 40 (B): the verified-tail claim — the tail is appended
-            // to the RESULTING file's bytes (in memory only) and the
-            // result parsed with the real grammar. The tail was computed
-            // on the SUBMITTED content, and the content sat in a splice
-            // window, so the EOF placement is the candidate, never a
-            // promise: a tail that closes the wrong form early also
-            // parses, and a tail the file's context already covers fails
-            // the parse. Both outcomes are reported as verified facts.
-            let claim = crate::balance::tail_verification_claim(new_bytes, &tail, "file");
-            (
+            let absolute = if rel.is_some() {
+                // Issue 42 (B): the tail's END placement, dry-run — the
+                // verified-tail claim (40B) rides on the PREVIEWED splice
+                // (newText + tail), stated once; the loud caveats stand
+                // unchanged and nothing is ever applied.
+                if crate::balance::tail_verifies(submitted.as_bytes(), &tail) {
+                    let diff = crate::materialize::unified_diff(
+                        old_text.as_deref().expect("old_walk gate above"),
+                        &format!("{submitted}{tail}"),
+                        "oldText",
+                        "newText+tail",
+                    );
+                    let claim = crate::balance::tail_verification_claim(
+                        submitted.as_bytes(),
+                        &tail,
+                        "newText",
+                    );
+                    format!(
+                        "{field} is missing {n} closer(s); mechanical tail (placement is yours to verify): {tail}\npreview (tail appended at end \u{2014} verify placement):\n{diff}\n{claim}"
+                    )
+                } else {
+                    format!(
+                        "{field} is missing {n} closer(s); mechanical tail (placement is yours to verify): {tail}\ntail at end does not parse \u{2014} the correct placement is inside the form; see the mismatch diagnosis"
+                    )
+                }
+            } else {
+                // Issue 40 (B): the verified-tail claim — the tail is
+                // appended to the RESULTING file's bytes (in memory only)
+                // and the result parsed with the real grammar. The tail
+                // was computed on the SUBMITTED content, and the content
+                // sat in a splice window, so the EOF placement is the
+                // candidate, never a promise: a tail that closes the wrong
+                // form early also parses, and a tail the file's context
+                // already covers fails the parse. Both outcomes are
+                // reported as verified facts.
+                let claim =
+                    crate::balance::tail_verification_claim(new_bytes, &tail, "file");
                 format!(
                     "{field} is missing {n} closer(s); mechanical tail (placement is yours to verify): {tail} \u{2014} {claim}"
-                ),
+                )
+            };
+            let lead = match &rel {
+                Some((old_c, new_c)) => patch_relative_lead(new_c, old_c, absolute),
+                None => absolute,
+            };
+            (
+                lead,
                 format!(
                     "fix the submitted {field}: place the missing closers where they belong, then resubmit; cljform never writes to a file that does not parse"
                 ),
@@ -756,15 +926,22 @@ fn write_gate_enrich(
             col,
             innermost,
             ..
-        } => (
-            format!(
+        } => {
+            let absolute = format!(
                 "{field}: {}; a misplaced closer cannot be fixed by a tail",
                 crate::balance::mismatch_sentence(closer, line, col, innermost)
-            ),
-            format!(
-                "fix the misplaced closer in the submitted {field} (named above), then resubmit; cljform never writes to a file that does not parse"
-            ),
-        ),
+            );
+            let lead = match &rel {
+                Some((old_c, new_c)) => patch_relative_lead(new_c, old_c, absolute),
+                None => absolute,
+            };
+            (
+                lead,
+                format!(
+                    "fix the misplaced closer in the submitted {field} (named above), then resubmit; cljform never writes to a file that does not parse"
+                ),
+            )
+        }
     };
     // The file-level coordinates are the parse error's own (parse_or_fail
     // always attaches them); the layer is demoted, not dropped — the
@@ -775,6 +952,61 @@ fn write_gate_enrich(
         body.message
     );
     Fail(exit, ErrorBody { message, hint: Some(hint), ..body })
+}
+
+/// Issue 42 (A): the closer delta of newText relative to oldText — the
+/// difference of their net closer balances (closers minus openers) over
+/// FULL counts. oldText may itself carry a nonzero net (a patch oldText
+/// can swallow the enclosing form's closer), so both sides are counted.
+fn patch_delta(new_counts: &crate::balance::Counts, old_counts: &crate::balance::Counts) -> i64 {
+    i64::try_from(new_counts.close).expect("count fits in i64")
+        - i64::try_from(new_counts.open).expect("count fits in i64")
+        - (i64::try_from(old_counts.close).expect("count fits in i64")
+            - i64::try_from(old_counts.open).expect("count fits in i64"))
+}
+
+/// The relative-delta LEAD LINE ONLY (no diagnosis): the balanced-newText
+/// tail-fumble branch leads with it over the file-level EOF facts.
+fn patch_relative_line(
+    new_counts: &crate::balance::Counts,
+    old_counts: &crate::balance::Counts,
+) -> String {
+    let delta = patch_delta(new_counts, old_counts);
+    match delta {
+        d if d < 0 => format!(
+            "newText has {} fewer closer(s) than the text it replaces (absolute: {} open, {} close)",
+            -d,
+            new_counts.open,
+            new_counts.close
+        ),
+        _ => format!(
+            "newText has {} more closer(s) than the text it replaces (absolute: {} open, {} close)",
+            delta,
+            new_counts.open,
+            new_counts.close
+        ),
+    }
+}
+
+/// Issue 42 (A): the patch-relative lead. The walk's ABSOLUTE verdict is
+/// closer-heavy by nature for tail patches (newText closes what oldText
+/// left open, and more), so the scalar delta against the counted oldText
+/// is the honest signal: negative → "N fewer closer(s)", positive → "N
+/// more", zero → the delta balances and the mismatch is inside newText
+/// itself. The absolute diagnosis rides under the lead, intact. Both count
+/// sets are FULL counts (never aborting) — the early-exit scalars would
+/// make the zero-relative reading lie after a mismatch point.
+fn patch_relative_lead(
+    new_counts: &crate::balance::Counts,
+    old_counts: &crate::balance::Counts,
+    diagnosis: String,
+) -> String {
+    match patch_delta(new_counts, old_counts) {
+        0 => format!(
+            "deltas balance relative to oldText \u{2014} the mismatch is inside newText itself: {diagnosis}"
+        ),
+        _ => format!("{}\n{}", patch_relative_line(new_counts, old_counts), diagnosis),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1128,6 +1360,7 @@ pub(crate) fn run_edit_op(
                 &payload,
                 content,
                 content_file,
+                old_text,
                 new_text,
                 &new_bytes,
             ))
@@ -2586,6 +2819,14 @@ mod tests {
         })
     }
 
+    fn patch_payload() -> content::Payload {
+        content::Payload::Patch {
+            bytes: Vec::new(),
+            diff: String::new(),
+            noop: false,
+        }
+    }
+
     /// The walker sees the SUBMITTED content of the whole-form modes — the
     /// `content` field is named in the lead (the `--content-file` route
     /// re-reads on the failure path; a string-valued `--content` is the
@@ -2601,6 +2842,7 @@ mod tests {
             resulting_file_fail(),
             &Some(prepared_payload()),
             &Some(submitted.to_string()),
+            &None,
             &None,
             &None,
             new_bytes,
@@ -2653,6 +2895,7 @@ mod tests {
             &Some(submitted.to_string()),
             &None,
             &None,
+            &None,
             new_bytes,
         );
         let body = &out.1;
@@ -2687,6 +2930,7 @@ mod tests {
             &Some(submitted.to_string()),
             &None,
             &None,
+            &None,
             b"(ns r)\n(a [b\nc)",
         );
         let body = &out.1;
@@ -2714,6 +2958,7 @@ mod tests {
             resulting_file_fail(),
             &Some(prepared_payload()),
             &Some("\"x\"".to_string()),
+            &None,
             &None,
             &None,
             b"(def s \"x\")",
@@ -2746,10 +2991,395 @@ mod tests {
             &Some("(defn f [x]\n  (dec x".to_string()),
             &None,
             &None,
+            &None,
             b"",
         );
         assert_eq!(out.1.code, "shape-violation");
         assert!(out.1.message.starts_with("boundary check failed:"));
         assert!(out.1.hint.is_none());
+    }
+
+    // ─── issue 42 (A+B): patch payloads — relative delta lead + repair
+    // preview (dry-run, verified, never applied) ───────────────────────────────
+
+    /// The "too few" shape: the relative delta LEADS and now reads
+    /// distinctly; the preview shows the candidate diff with the tail
+    /// appended at end, and the verified claim rides on the previewed
+    /// candidate (newText + tail), stated once.
+    #[test]
+    fn write_gate_patch_missing_tail_leads_relative_and_previews_end_append() {
+        let old = "(a b)";
+        let submitted = "(a b (c"; // walks: 2 open, 0 close — missing 2, tail `))`
+        let out = write_gate_enrich(
+            resulting_file_fail(),
+            &Some(patch_payload()),
+            &None,
+            &None,
+            &Some(old.to_string()),
+            &Some(submitted.to_string()),
+            b"(a b (c",
+        );
+        let body = &out.1;
+        assert_eq!(body.code, "parse-error");
+        assert!(
+            body.message.starts_with(
+                "newText has 2 fewer closer(s) than the text it replaces (absolute: 2 open, 0 close)\nnewText is missing 2 closer(s); mechanical tail (placement is yours to verify): ))"
+            ),
+            "{}",
+            body.message
+        );
+        // The preview: the candidate diff of old→new+tail, dry-run.
+        assert!(
+            body.message.contains("preview (tail appended at end \u{2014} verify placement):"),
+            "{}",
+            body.message
+        );
+        assert!(body.message.contains("--- oldText\n+++ newText+tail"), "{}", body.message);
+        assert!(body.message.contains("+(a b (c))"), "{}", body.message);
+        // The verified claim (40B) rides on the previewed splice, stated once.
+        assert!(
+            body.message.contains("verified: with this tail newText parses"),
+            "{}",
+            body.message
+        );
+        assert!(
+            body.message
+                .contains("placement is yours to verify: parses-ok \u{2260} intended structure (a tail that closes the wrong form early also parses)"),
+            "{}",
+            body.message
+        );
+        assert_eq!(
+            body.message.matches("verified:").count(),
+            1,
+            "the claim is stated once: {}",
+            body.message
+        );
+        // The demoted file layer stands unchanged.
+        assert!(
+            body.message.contains(
+                "file-level context: resulting file does not parse: unclosed open-paren (form reaches end of file) @ line 1 col 1"
+            ),
+            "{}",
+            body.message
+        );
+        assert!(body.hint.as_deref().unwrap().starts_with("fix the submitted newText:"));
+    }
+
+    /// The "too many" shape: an extra closer on an already-closed form.
+    /// Relative delta positive; the identical-absolute "closes nothing" text
+    /// now reads DISTINCTLY from the too-few case.
+    #[test]
+    fn write_gate_patch_mismatch_leads_relative_more_closers() {
+        let old = "(a b)";
+        let submitted = "(a b))"; // walks: mismatch, `)` with no openers remain
+        let out = write_gate_enrich(
+            resulting_file_fail(),
+            &Some(patch_payload()),
+            &None,
+            &None,
+            &Some(old.to_string()),
+            &Some(submitted.to_string()),
+            b"(a b))",
+        );
+        let body = &out.1;
+        assert!(
+            body.message.starts_with(
+                "newText has 1 more closer(s) than the text it replaces (absolute: 1 open, 2 close)\nnewText: mismatch at line 1 col 6: ) closes nothing \u{2014} no openers remain; a misplaced closer cannot be fixed by a tail"
+            ),
+            "{}",
+            body.message
+        );
+        // Mismatch offers no tail and previews nothing.
+        assert!(!body.message.contains("preview"), "{}", body.message);
+        assert!(!body.message.contains("mechanical tail"), "{}", body.message);
+        assert!(
+            body.hint
+                .as_deref()
+                .unwrap()
+                .starts_with("fix the misplaced closer in the submitted newText")
+        );
+    }
+
+    /// Zero relative delta: the counts balance against oldText at the
+    /// mismatch point, so the mismatch is INSIDE newText — said so, with
+    /// the absolute diagnosis riding under the lead.
+    #[test]
+    fn write_gate_patch_zero_relative_delta_names_inside_mismatch() {
+        let old = "(a b)"; // net 0
+        // open 2, close 2 AT THE MISMATCH — net 0 against oldText's net 0:
+        // the `)` sits where the `[`'s partner region should be.
+        let submitted = "(a) [b) c";
+        let out = write_gate_enrich(
+            resulting_file_fail(),
+            &Some(patch_payload()),
+            &None,
+            &None,
+            &Some(old.to_string()),
+            &Some(submitted.to_string()),
+            b"(a) [b) c",
+        );
+        let body = &out.1;
+        assert!(
+            body.message.starts_with(
+                "deltas balance relative to oldText \u{2014} the mismatch is inside newText itself: newText: mismatch at line 1 col 7: ) closes nothing \u{2014} innermost open is [ from line 1 col 5; a misplaced closer cannot be fixed by a tail"
+            ),
+            "{}",
+            body.message
+        );
+        assert!(!body.message.contains("fewer closer"), "{}", body.message);
+        assert!(!body.message.contains("more closer"), "{}", body.message);
+    }
+
+    /// Issue 42 (B) honest branch: a tail appended at END that does NOT
+    /// parse (the walk's missing-tail verdict stands — the string swallows
+    /// the tail — so the end-append cannot be verified) gets the honest
+    /// line and NO preview — never a verified claim.
+    #[test]
+    fn write_gate_patch_tail_at_end_does_not_parse_honest_no_preview() {
+        let old = "(def s \"ok\")";
+        // One `(` open; the string `\"(abc` is unterminated — its `( ` does
+        // not count — so the walk says missing 1, tail `)`. But appending
+        // `)` at end leaves the string unterminated: the candidate does not
+        // parse (no placement of the tail at END can fix it).
+        let submitted = "(def s \"(abc";
+        let out = write_gate_enrich(
+            resulting_file_fail(),
+            &Some(patch_payload()),
+            &None,
+            &None,
+            &Some(old.to_string()),
+            &Some(submitted.to_string()),
+            b"(def s \"(abc",
+        );
+        let body = &out.1;
+        assert!(
+            body.message.starts_with(
+                "newText has 1 fewer closer(s) than the text it replaces (absolute: 1 open, 0 close)\nnewText is missing 1 closer(s); mechanical tail (placement is yours to verify): )"
+            ),
+            "{}",
+            body.message
+        );
+        assert!(
+            body.message.contains(
+                "tail at end does not parse \u{2014} the correct placement is inside the form; see the mismatch diagnosis"
+            ),
+            "{}",
+            body.message
+        );
+        assert!(!body.message.contains("preview"), "{}", body.message);
+        assert!(!body.message.contains("verified:"), "{}", body.message);
+    }
+
+    /// Patch without a known oldText (defensive): the absolute framing
+    /// stands alone (no relative lead, no preview — nothing to compare
+    /// against or diff).
+    #[test]
+    fn write_gate_patch_without_old_text_keeps_absolute() {
+        let out = write_gate_enrich(
+            resulting_file_fail(),
+            &Some(patch_payload()),
+            &None,
+            &None,
+            &None,
+            &Some("(a b (c".to_string()),
+            b"(a b (c",
+        );
+        let body = &out.1;
+        assert!(
+            body.message.starts_with(
+                "newText is missing 2 closer(s); mechanical tail (placement is yours to verify): ))"
+            ),
+            "{}",
+            body.message
+        );
+        assert!(!body.message.contains("fewer closer"), "{}", body.message);
+        assert!(!body.message.contains("preview"), "{}", body.message);
+    }
+
+    // ─── issue 42 owner fixes: the balanced-newText tail fumble + full-
+    // count delta ───────────────────────────────────────────────────────────
+
+    /// The owner-verified fumble: oldText swallows the enclosing form's
+    /// closer, newText is BALANCED in isolation — the pre-fix pass-through
+    /// left the raw file-level message. Now: the relative delta leads, the
+    /// tail is derived from the resulting FILE's EOF stack, verified by
+    /// splice, and the preview says the candidate is identical to oldText
+    /// (restoring the dropped closer).
+    #[test]
+    fn write_gate_patch_balanced_newtext_tail_fumble_leads_relative_and_previews() {
+        let old = "  (helper y))"; // carries outer's closer: 1 open, 2 close
+        let submitted = "  (helper y)"; // balanced in isolation: 1 open, 1 close
+        // The spliced file: outer's closer is gone — EOF stack holds the `(`.
+        let new_bytes = b"(defn outer [x]\n  (helper x)\n  (helper y)\n";
+        let out = write_gate_enrich(
+            resulting_file_fail(),
+            &Some(patch_payload()),
+            &None,
+            &None,
+            &Some(old.to_string()),
+            &Some(submitted.to_string()),
+            new_bytes,
+        );
+        let body = &out.1;
+        assert_eq!(body.code, "parse-error");
+        assert!(
+            body.message.starts_with(
+                "newText has 1 fewer closer(s) than the text it replaces (absolute: 1 open, 1 close)\nresulting file is missing 1 closer(s) at EOF; mechanical tail (placement is yours to verify): )"
+            ),
+            "{}",
+            body.message
+        );
+        // The preview: the candidate IS oldText — say so, no empty diff.
+        assert!(
+            body.message.contains(
+                "preview (tail appended at end \u{2014} verify placement):\nidentical to oldText (restoring the dropped closer)"
+            ),
+            "{}",
+            body.message
+        );
+        // Verified by splice at file level (the candidate itself carries
+        // the enclosing closer and can never parse on its own): 40B claim
+        // on the resulting file, stated once.
+        assert!(
+            body.message.contains("verified: with this tail file parses"),
+            "{}",
+            body.message
+        );
+        assert_eq!(
+            body.message.matches("verified:").count(),
+            1,
+            "{}",
+            body.message
+        );
+        assert!(
+            body.message.contains(
+                "file-level context: resulting file does not parse: unclosed open-paren (form reaches end of file) @ line 1 col 1"
+            ),
+            "{}",
+            body.message
+        );
+        assert!(
+            body.hint
+                .as_deref()
+                .unwrap()
+                .starts_with("fix the submitted newText: append the missing closer(s) above at its end"),
+            "{}",
+            body.hint.as_deref().unwrap()
+        );
+    }
+
+    /// The early-exit undercount: the walk aborts at the mismatch with net
+    /// 0 (which would read "deltas balance"), but the FULL count of the
+    /// trailing `(c d` makes the true delta negative — the lead must say
+    /// "1 fewer", computed from the non-aborting counts.
+    #[test]
+    fn write_gate_patch_delta_uses_full_counts_not_early_exit() {
+        let old = "(a b)"; // net 0
+        let submitted = "(a) [b) (c d"; // early-exit net 0; full: 3 open, 2 close → -1
+        let out = write_gate_enrich(
+            resulting_file_fail(),
+            &Some(patch_payload()),
+            &None,
+            &None,
+            &Some(old.to_string()),
+            &Some(submitted.to_string()),
+            b"(a) [b) (c d",
+        );
+        let body = &out.1;
+        assert!(
+            body.message.starts_with(
+                "newText has 1 fewer closer(s) than the text it replaces (absolute: 3 open, 2 close)\nnewText: mismatch at line 1 col 7: ) closes nothing \u{2014} innermost open is [ from line 1 col 5; a misplaced closer cannot be fixed by a tail"
+            ),
+            "{}",
+            body.message
+        );
+        assert!(!body.message.contains("deltas balance"), "{}", body.message);
+    }
+
+    /// Balanced newText with a POSITIVE delta (oldText carried the
+    /// closer its opener needed away): the surplus lead, and — the file's
+    /// EOF stack yields a tail the end-append does NOT parse (the `]`
+    /// belongs inside the form) — the honest no-preview branch.
+    #[test]
+    fn write_gate_patch_balanced_newtext_surplus_tail_end_does_not_parse() {
+        let old = "[q 1] (helper q"; // 2 open, 1 close → net -1
+        let submitted = "[q 1] (helper q)"; // balanced: 2 open, 2 close
+        // Spliced: the file's EOF stack holds the outer `(` (an
+        // unterminated string swallows the would-be closer), tail `)`;
+        // file + tail still fails the parse (the string stays open) —
+        // the honest no-preview branch.
+        let new_bytes = b"(def s \"(abc";
+        let out = write_gate_enrich(
+            resulting_file_fail(),
+            &Some(patch_payload()),
+            &None,
+            &None,
+            &Some(old.to_string()),
+            &Some(submitted.to_string()),
+            new_bytes,
+        );
+        let body = &out.1;
+        assert!(
+            body.message.starts_with(
+                "newText has 1 more closer(s) than the text it replaces (absolute: 2 open, 2 close)\nresulting file is missing 1 closer(s) at EOF; mechanical tail (placement is yours to verify): )\ntail at end of file does not parse \u{2014} check the file-level diagnosis below"
+            ),
+            "{}",
+            body.message
+        );
+        assert!(!body.message.contains("preview"), "{}", body.message);
+        assert!(!body.message.contains("verified:"), "{}", body.message);
+    }
+
+    /// Balanced newText, nonzero delta, but the FILE walk finds no EOF
+    /// missing tail (the parse fails for other reasons): the relative lead
+    /// still stands, and the refusal says the problem is not a dropped
+    /// closer — no tail, no preview.
+    #[test]
+    fn write_gate_patch_balanced_newtext_file_walk_no_missing_tail() {
+        // oldText carries the closer, newText is balanced, and the FILE
+        // fails for a reason that is NOT an EOF missing tail (a stray
+        // file-level closer — the file walk mismatches, it does not miss
+        // a tail).
+        let old = "x)";
+        let submitted = "x";
+        let new_bytes = b"(a) )"; // parse fails: stray closer; file walk = mismatch
+        let out = write_gate_enrich(
+            resulting_file_fail(),
+            &Some(patch_payload()),
+            &None,
+            &None,
+            &Some(old.to_string()),
+            &Some(submitted.to_string()),
+            new_bytes,
+        );
+        let body = &out.1;
+        assert!(
+            body.message.starts_with(
+                "newText has 1 fewer closer(s) than the text it replaces (absolute: 0 open, 0 close)\nresulting file's own balance walk finds no EOF missing tail \u{2014} the problem is not a dropped closer; see the file-level diagnosis below"
+            ),
+            "{}",
+            body.message
+        );
+        assert!(!body.message.contains("preview"), "{}", body.message);
+        assert!(!body.message.contains("verified:"), "{}", body.message);
+    }
+
+    /// Zero relative delta on a balanced newText (oldText and newText
+    /// both balanced): the pass-through stands — byte-identical refusal.
+    #[test]
+    fn write_gate_patch_balanced_newtext_zero_delta_passes_through() {
+        let out = write_gate_enrich(
+            resulting_file_fail(),
+            &Some(patch_payload()),
+            &None,
+            &None,
+            &Some("x".to_string()),
+            &Some("y".to_string()),
+            b"(def s \"y\")",
+        );
+        assert_eq!(
+            out.1.message,
+            "resulting file does not parse: unclosed open-paren (form reaches end of file)"
+        );
     }
 }

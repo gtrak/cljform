@@ -329,8 +329,35 @@ comes only from what the call submitted:
   form's, the hint adds `your oldText differs only in whitespace (e.g. a
   formatter ran) — copy the bytes above` (token-stream equality is the
   verified basis — unverified, the claim is OMITTED, never asserted).
-  Duplicate names report ALL candidates with spans and pick nothing; a
-  fragment needle that covers no whole form has no match.
+  Duplicate names report ALL candidates with spans and pick nothing.
+  **Whole-inner-node verbatim match (issue 42 owner fix):** a unique
+  token-stream match whose CURRENT bytes ARE the needle verbatim is NOT
+  asserted as identity — an unchanged form's content hash still resolves,
+  so the stale handle cannot have been its; the stale target is
+  elsewhere, and the identity candidates are the node's ENCLOSING forms
+  (its ancestor chain, preferring def-like ancestors): one → `your oldText
+  sits inside ⟦H⟧ (head name, lines a–b) — if that is the form you were
+  editing, use that handle`; several → all candidates with spans, pick
+  nothing; none (the match is top-level) → the matched form itself,
+  phrased as a candidate. `this form is now` is never asserted in this
+  branch. When the matched form's bytes differ from the needle (the 40A
+  reformat: tokens equal, bytes rotated), the matched form itself IS the
+  plausible stale target and keeps the assertive report.
+  A fragment needle that covers no whole form is matched by token-subsequence
+  containment (issue 42 C, report-only): its token stream (delimiters
+  included — the `token_stream` machinery's tokens) as a contiguous run
+  inside EXACTLY ONE current form's stream reports that enclosing form
+  (`this form is now ⟦H⟧ (head name) — your oldText is a fragment inside
+  it; current bytes: <exact bytes>`) when that form is DEF-LIKE (the name
+  pins the plausible stale target); a non-def-like unique containment hit
+  is phrased as a candidate (`your oldText sits inside ⟦H⟧ (head) (lines
+  a–b) — if that is the form you were editing, use that handle`) and never
+  asserts identity. The whitespace claim rides on the same verified
+  token-stream equality, so it never fires for a proper fragment.
+  Several containing forms report all candidates with spans and
+  pick nothing; none → the plain message. Cost guard: the scan runs over
+  the leaf-token arrays of the ONE parse already done (early-exiting per
+  form — the deep-tree error path stays byte-identical and bounded).
 - **replace** — from the content's def name; the content is the NEW bytes,
   so the report stays NEUTRAL (`forms named X in the current file: … — if
   this is the form you were editing, use that handle`) — a rename can
@@ -502,6 +529,45 @@ the walker is provably panic-free (byte iteration and `pop()` only).
   context (still present, with its own coordinates; the refusal itself is
   unchanged). Content that balances is left alone: the parse failed for
   other reasons and the file-level message stands.
+  **Relative delta + repair preview (issue 42 A+B, patch payloads only):**
+  for a patch the walk's ABSOLUTE verdict is closer-heavy by nature (tail
+  patches), so the lead becomes the scalar RELATIVE delta against the
+  COUNTED oldText — `newText has N fewer/more closer(s) than the text it
+  replaces (absolute: …)` — with the existing absolute/tail/mismatch
+  machinery intact under it; a ZERO relative delta that still fails gets
+  `deltas balance relative to oldText — the mismatch is inside newText
+  itself: <existing diagnosis>`. The delta runs on FULL delimiter counts
+  (a never-aborting count: the walk's early-exit scalars undercount the
+  text after a mismatch point, which would make the zero-relative reading
+  lie), and oldText is NOT assumed balanced — a patch oldText can carry
+  the enclosing form's closer(s). **Balanced-newText tail fumble (issue 42
+  owner fix):** when walk(newText) is balanced in ISOLATION but the
+  relative delta is nonzero (oldText carried a closer the splice
+  consumed), the refusal still leads with the relative delta and derives
+  the tail from the resulting FILE's walk (its EOF stack), verified by
+  file-level splice as in 40B — the previewed candidate (newText + tail)
+  carries the enclosing closer and can never parse on its own, so the
+  claim rides on file + tail (`verified: with this tail file parses`);
+  the preview is the dry-run old→new+tail diff, except when the candidate
+  reproduces oldText exactly (restoring the dropped closer), in which
+  case the preview says `identical to oldText (restoring the dropped
+  closer)` instead of printing an empty diff. When the missing-tail
+  diagnosis fires, the mechanical tail appended at END is also previewed
+  as a dry-run candidate diff — `preview (tail appended at end — verify
+  placement):` + the unified diff of old→new+tail — with the verified-tail
+  claim (40B) riding on THAT splice, stated once (`verified: with this
+  tail newText parses` + the standing loud caveat); if the end-append does
+  not parse, the refusal says so honestly (`tail at end does not parse —
+  the correct placement is inside the form; see the mismatch diagnosis`)
+  and shows no preview. Never applied: the refusal is a refusal; whole-form
+  content modes keep the absolute framing (nothing to be relative to).
+- **No new extension tools (DECISION, issue 42 D):** the extension's
+  stale-handle guidance was updated to the post-40A truth (the refusal
+  REPORTS the recovered form when identity is verifiable — read the
+  refusal before re-running `clj_tree`), and `clj_balance` stays OFF the
+  extension tool surface: the CLI (`cljform balance`) remains the
+  canonical surface for the balance primitive (tool lists freeze at
+  session start anyway; the bash-hop is the designed fallback).
 - The `clj_draft` extension tool (issue 41: dual-artifact handoff + the
   prepare-time vote): draft NEVER touches the repo or any user file — the
   scratch artifacts in the system temp dir are its ONLY writes. The

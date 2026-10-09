@@ -432,7 +432,8 @@ fn edit_hint_mismatch_line_col_diagnosis() {
     assert_eq!(d2["result"]["repaired"], true, "{d2}");
 }
 
-// ─── write-gate diagnosis (issue 39 follow-up) ──────────────────────────────
+// ─── write-gate diagnosis (issue 39 follow-up) + relative delta and
+// repair preview for patch payloads (issue 42 A+B) ─────────────────────
 //
 // Second incident: a replacement with unbalanced content was correctly
 // refused by the WRITE gate ("resulting file does not parse: … @ line 1
@@ -446,9 +447,11 @@ fn edit_hint_mismatch_line_col_diagnosis() {
 // --new-text lands exactly here.
 
 /// The incident shape (missing-tail branch): an unbalanced replacement
-/// that reaches the write gate — the refusal LEADS with the content-side
-/// mechanical tail (field named, exact tail, placement caveat), not with
-/// the "line 1 col 1" file-level pointer.
+/// that reaches the write gate — the refusal LEADS with the relative
+/// closer delta (issue 42 A), then the content-side mechanical tail
+/// (field named, exact tail, placement caveat), then the dry-run preview
+/// of the tail appended at end (issue 42 B), not with the "line 1 col 1"
+/// file-level pointer.
 #[test]
 fn write_gate_missing_tail_leads_content_side() {
     let p = f("wg-tail.clj");
@@ -463,13 +466,28 @@ fn write_gate_missing_tail_leads_content_side() {
     assert_eq!(code, 1, "{d} {err}");
     assert_eq!(d["error"]["code"], "parse-error");
     let msg = d["error"]["message"].as_str().unwrap();
-    // The content-side verdict leads; the walker runs on the SUBMITTED
-    // new_text (the spliced bytes would read differently).
+    // Issue 42 (A): the relative delta LEADS — "too few" now reads
+    // distinctly (the absolute counts ride in the same line), and the
+    // content-side verdict stands under it, field named.
     assert!(
         msg.starts_with(
-            "newText is missing 2 closer(s); mechanical tail (placement is yours to verify): )]"
+            "newText has 2 fewer closer(s) than the text it replaces (absolute: 2 open, 0 close)\nnewText is missing 2 closer(s); mechanical tail (placement is yours to verify): )]"
         ),
         "{msg}"
+    );
+    // Issue 42 (B): the preview — the candidate diff of old→new+tail,
+    // dry-run, with the verified claim riding on the previewed splice,
+    // stated once.
+    assert!(
+        msg.contains("preview (tail appended at end \u{2014} verify placement):"),
+        "{msg}"
+    );
+    assert!(msg.contains("--- oldText\n+++ newText+tail"), "{msg}");
+    assert!(msg.contains("verified: with this tail newText parses"), "{msg}");
+    assert_eq!(
+        msg.matches("verified:").count(),
+        1,
+        "stated once: {msg}"
     );
     // The file-level layer is demoted to context — still present, with its
     // own coordinates.
@@ -480,31 +498,20 @@ fn write_gate_missing_tail_leads_content_side() {
     assert_eq!(d["error"]["col"].as_u64(), Some(1));
     let hint = d["error"]["hint"].as_str().unwrap();
     assert!(hint.starts_with("fix the submitted newText:"), "{hint}");
-    // Issue 40 (B) honest branch: the tail was computed on the SUBMITTED
-    // content, but the content sat in a splice window — appending `)]` to
-    // the resulting file's EOF does not parse (the `]` closes nothing
-    // there), so the claim says exactly that, never `verified`.
-    assert!(
-        msg.contains(
-            "with this tail file still does not parse \u{2014} check for a misplaced closer"
-        ),
-        "{msg}"
-    );
-    assert!(!msg.contains("verified:"), "{msg}");
-    // Nothing written: the gate still refuses.
+    // Nothing written: the gate still refuses (the preview is dry-run).
     check_ok(&p);
 }
 
-/// Issue 40 (B) write-gate verified branch: the same missing-tail
-/// diagnosis where appending the tail to the RESULTING file's bytes
-/// parses (the spliced content's missing closers sit at the file's EOF):
-/// the claim is `verified` + the loud caveat.
+/// Issue 42 (B) verified branch: the same missing-tail diagnosis where the
+/// mechanical tail appended at END of the SUBMITTED newText parses — the
+/// preview shows the candidate diff and the claim is `verified` (on the
+/// previewed splice) + the loud caveat (parses-ok ≠ intended structure).
 #[test]
-fn write_gate_missing_tail_verified_when_file_parses() {
+fn write_gate_patch_preview_verified_on_candidate() {
     let p = f("wg-tail-verified.clj");
     let h = handle_of(&p, "target");
-    // The submitted newText misses two closers; the spliced file misses
-    // exactly those, at its EOF, so the tail lands and parses.
+    // The submitted newText misses two closers; the tail appended at end
+    // of the SUBMITTED text parses, so the preview is shown and verified.
     let new_text = "dec x\n  (let [y 1]\n    (inc y";
     let (code, d, err) = edit_args(
         &p,
@@ -522,13 +529,17 @@ fn write_gate_missing_tail_verified_when_file_parses() {
     let msg = d["error"]["message"].as_str().unwrap();
     assert!(
         msg.starts_with(
-            "newText is missing 2 closer(s); mechanical tail (placement is yours to verify): ))"
+            "newText has 2 fewer closer(s) than the text it replaces (absolute: 3 open, 1 close)\nnewText is missing 2 closer(s); mechanical tail (placement is yours to verify): ))"
         ),
         "{msg}"
     );
     assert!(
+        msg.contains("preview (tail appended at end \u{2014} verify placement):"),
+        "{msg}"
+    );
+    assert!(
         msg.contains(
-            "verified: with this tail file parses \u{2014} placement is yours to verify: parses-ok \u{2260} intended structure (a tail that closes the wrong form early also parses)"
+            "verified: with this tail newText parses \u{2014} placement is yours to verify: parses-ok \u{2260} intended structure (a tail that closes the wrong form early also parses)"
         ),
         "{msg}"
     );
@@ -537,8 +548,9 @@ fn write_gate_missing_tail_verified_when_file_parses() {
 }
 
 /// The incident shape (mismatch branch): a misplaced closer in the
-/// replacement — the refusal leads with the line:col diagnosis naming the
-/// closer and the innermost opener; no tail is offered.
+/// replacement — the refusal leads with the RELATIVE delta (issue 42 A;
+/// "too many" reads distinctly from "too few") and then the line:col
+/// diagnosis naming the closer; no tail is offered and nothing previews.
 #[test]
 fn write_gate_mismatch_leads_content_side() {
     let p = f("wg-mismatch.clj");
@@ -556,10 +568,12 @@ fn write_gate_mismatch_leads_content_side() {
     let msg = d["error"]["message"].as_str().unwrap();
     assert!(
         msg.starts_with(
-            "newText: mismatch at line 1 col 7: ) closes nothing — no openers remain; a misplaced closer cannot be fixed by a tail"
+            "newText has 1 more closer(s) than the text it replaces (absolute: 0 open, 1 close)\nnewText: mismatch at line 1 col 7: ) closes nothing — no openers remain; a misplaced closer cannot be fixed by a tail"
         ),
         "{msg}"
     );
+    // A mismatch previews nothing (no tail to place).
+    assert!(!msg.contains("preview"), "{msg}");
     assert!(msg.contains("file-level context: resulting file does not parse"), "{msg}");
     let hint = d["error"]["hint"].as_str().unwrap();
     assert!(hint.starts_with("fix the misplaced closer in the submitted newText (named above)"), "{hint}");
@@ -590,6 +604,61 @@ fn write_gate_balanced_content_keeps_file_level_message() {
         "fix the bracket structure first; cljform never writes to a file that does not parse"
     );
     check_ok(&p);
+}
+
+/// The owner-verified tail fumble (issue 42 owner fix, end-to-end):
+/// oldText swallows the enclosing form's closer, so newText is balanced
+/// in ISOLATION and the pre-fix pass-through left the raw file-level
+/// "unclosed open-paren" message. Now: the relative delta leads, the tail
+/// is derived from the resulting file's EOF stack, verified by file-level
+/// splice, and the preview says the candidate is identical to oldText.
+#[test]
+fn write_gate_balanced_newtext_tail_fumble_leads_relative_and_previews() {
+    let p = fixture(
+        "wg-tail-fumble.clj",
+        b"(ns ex)\n\n(defn outer [x]\n  (helper x)\n  (helper y))\n",
+    );
+    let h = handle_of(&p, "outer");
+    // oldText carries the defn's own closer; newText drops it. newText is
+    // balanced on its own; the spliced file reaches EOF with the `(` open.
+    let (code, d, err) = edit_args(
+        &p,
+        Some("patch"),
+        Some(&h),
+        &[
+            "--old-text",
+            "  (helper y))",
+            "--new-text",
+            "  (helper y)",
+        ],
+    );
+    assert_eq!(code, 1, "{d} {err}");
+    assert_eq!(d["error"]["code"], "parse-error");
+    let msg = d["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.starts_with(
+            "newText has 1 fewer closer(s) than the text it replaces (absolute: 1 open, 1 close)\nresulting file is missing 1 closer(s) at EOF; mechanical tail (placement is yours to verify): )\npreview (tail appended at end \u{2014} verify placement):\nidentical to oldText (restoring the dropped closer)\nverified: with this tail file parses"
+        ),
+        "{msg}"
+    );
+    // The verified claim rides on the file-level splice, stated once.
+    assert_eq!(
+        msg.matches("verified:").count(),
+        1,
+        "{msg}"
+    );
+    assert!(
+        msg.contains("file-level context: resulting file does not parse:"),
+        "{msg}"
+    );
+    let hint = d["error"]["hint"].as_str().unwrap();
+    assert!(
+        hint.starts_with(
+            "fix the submitted newText: append the missing closer(s) above at its end"
+        ),
+        "{hint}"
+    );
+    check_ok(&p); // the refusal stands; the file was never written
 }
 
 /// The content-stage unbalanced refusal is a DIFFERENT gate and stays

@@ -78,6 +78,36 @@ pub(crate) enum Walk {
     },
 }
 
+/// The FULL delimiter counts of a text: the same lexer walk as `walk`, but
+/// WITHOUT the stack — a misplaced closer never aborts, so every
+/// opener/closer in code context is counted (the issue-42 relative-delta
+/// lead runs on these, because `walk`'s early-exit counts undercount the
+/// text after the mismatch point: `(a) [b) (c d` reads net 0 early-exit
+/// but is net -1 in full — the zero-relative reading would lie).
+pub(crate) fn full_counts(text: &str) -> Counts {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut lex = Lx::Code;
+    let mut counts = Counts::default();
+    for line in &lines {
+        if lex == Lx::Comment {
+            lex = Lx::Code;
+        }
+        let bytes = line.as_bytes();
+        let mut i = 0usize;
+        while let Some((idx, ctx)) = lex_step(bytes, &mut i, &mut lex) {
+            if ctx != Lx::Code {
+                continue;
+            }
+            match bytes[idx] {
+                b'(' | b'[' | b'{' => counts.open += 1,
+                b')' | b']' | b'}' => counts.close += 1,
+                _ => {}
+            }
+        }
+    }
+    counts
+}
+
 /// The raw-delimiter stack walk: the materialize lexer's exact state
 /// machine, line by line (a comment never spans lines; a multi-line string
 /// stays open and its interior never counts).

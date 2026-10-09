@@ -296,7 +296,8 @@ fn balance_machinery_fires_on_file_content() {
 /// The write-gate enrichment fires on file-sourced patch text: an
 /// unbalanced `--new-text-file` reaches the resulting-file parse gate and
 /// the refusal leads with the content-side verdict (same shape as the
-/// inline route's, tests/balance.rs).
+/// inline route's, tests/balance.rs) — now with the issue-42 relative
+/// delta lead + dry-run preview for patch payloads.
 #[test]
 fn write_gate_enrichment_fires_on_file_content() {
     let p = f("cf-wg.clj");
@@ -313,8 +314,13 @@ fn write_gate_enrichment_fires_on_file_content() {
     let msg = d["error"]["message"].as_str().unwrap();
     assert!(
         msg.starts_with(
-            "newText is missing 2 closer(s); mechanical tail (placement is yours to verify): )]"
+            "newText has 2 fewer closer(s) than the text it replaces (absolute: 2 open, 0 close)\nnewText is missing 2 closer(s); mechanical tail (placement is yours to verify): )]"
         ),
+        "{msg}"
+    );
+    // The file-sourced route carries the same issue-42 preview.
+    assert!(
+        msg.contains("preview (tail appended at end \u{2014} verify placement):"),
         "{msg}"
     );
     assert!(msg.contains("file-level context: resulting file does not parse"), "{msg}");

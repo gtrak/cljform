@@ -513,7 +513,7 @@ export default function ClojureForms(pi: ExtensionAPI) {
 			"Run clj_tree before any clj_edit; copy the ⟦handle⟧ you want to edit and pass it as handle.",
 			"Two cases for nested content: a NAMED nested form (defn/def/deftest… inside another form) → call with name: <that name> and copy the handle from the full-depth block; ANONYMOUS nested content (let/when bodies, vectors, maps) → patch within the enclosing form's handle (oldText/newText).",
 			"Single-line forms usually have no handle: address them by text (oldText/newText patch) inside their parent form.",
-			"A stale-handle error means the form changed — re-run clj_tree, never retry the old handle.",
+			"A stale-handle error means the form changed — read the refusal first: when the submitted identity is verifiable (a patch oldText, or the content's def name), it reports the recovered form for free (new handle + exact current bytes); re-run clj_tree only when it does not. Never retry the old handle.",
 			"Large file (> 300 lines): the default call returns the form index — one live-handle row per top-level form, no source. Edit by a row's handle; page with startLine/endLine (or select with name) to see a region's source.",
 			"On large files, page with startLine/endLine: windows expand to complete forms, and the echo tells you the effective span (real file lines).",
 			"Broken file (git conflict markers or broken brackets): the normal ops refuse (conflict-markers / parse-error). Call with recover: true — it shows the verbatim source, each conflict region's per-side line spans, the parse-error spans, and the intact top-level forms. Resolve the conflict with a TEXT edit (no handles are shown — the write path stays gated); once the file parses, cljform resumes normally.",
@@ -928,7 +928,7 @@ export default function ClojureForms(pi: ExtensionAPI) {
 			"create-then-edit stays separate calls (use the handle the result reports).",
 		promptGuidelines: [
 			"Read the file with clj_tree first; copy a ⟦handle⟧ and pass it as handle — handles are the only edit target.",
-			"Handles are content-addressed: an unchanged form keeps its handle across edits elsewhere; if it changed, the edit refuses with stale-handle — re-run clj_tree.",
+			"Handles are content-addressed: an unchanged form keeps its handle across edits elsewhere; if it changed, the edit refuses with stale-handle — the refusal reports the recovered form (new handle + current bytes) when your oldText pins its identity; read it before re-running clj_tree.",
 			"Send content as an isolated form; the tool reindents it to the target.",
 			"Small change in a big form → patch mode (oldText/newText); full rewrite → content.",
 			"Fetch exact bytes with clj_get first; edit against them, never re-type from memory.",
@@ -1376,7 +1376,7 @@ edits: clj_tree annotates the source with ⟦handles⟧ — the only edit target
 across edits elsewhere); clj_edit replaces, patches (oldText/newText), inserts, or deletes whole forms by
 handle, reindents submitted content to the target, infers unbalanced brackets by indentation when
 repair is requested (unbalanced content is otherwise refused with the candidate), and never writes a file that does not parse. A stale-handle refusal means the form changed —
-re-run clj_tree. clj_draft recovers brackets from an indentation-only draft (candidate + diff; scratch artifacts
+it reports the recovered form (new handle + current bytes) when the submitted oldText pins the identity; read the refusal before re-running clj_tree. clj_draft recovers brackets from an indentation-only draft (candidate + diff; scratch artifacts
 in the system temp dir are its only writes — the repo is never touched, so edit the reported artifact with
 cljform edit --content-file instead of re-typing the candidate). Shape reports in tool results are binding: a "BLOCKING: the file no longer parses" line, lost forms
 in the guard report, or D1–D3 nesting warnings must be fixed or explicitly justified in your next action.

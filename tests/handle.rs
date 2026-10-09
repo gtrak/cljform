@@ -1534,3 +1534,367 @@ fn stale_handle_batch_plain_message() {
         "no form matches the previous identity \u{2014} re-run tree"
     );
 }
+
+// ─── issue 42 (C): stale recovery for fragment needles (token-subsequence
+// containment; report-only, never auto-retry) ────────────────────────────────
+//
+// 40A recovers when oldText is def-like or covers a whole form; a FRAGMENT
+// needle used to fall to the plain message. The stretch: the needle's token
+// stream (delimiters included — the token_stream machinery's notion of a
+// token) as a contiguous run inside a current form's token stream. A
+// single-list needle's stream is always a whole node (the whole-form path
+// already claims it), so the reachable fragment shape is a MULTI-FORM
+// needle whose run spans a node boundary — e.g. `"(x) (inc y)"` inside a
+// body carrying both forms. Exactly one enclosing form → report it (new
+// handle + exact bytes; the 40A whitespace-claim rules ride on the same
+// verified machinery); several → all candidates with spans, pick nothing;
+// none → the existing plain message. Cost guard: the scan runs over the
+// leaf-token arrays of the one parse already done — the deep-tree error
+// path stays byte-identical and bounded.
+
+#[test]
+fn stale_handle_fragment_needle_reports_enclosing_form() {
+    // The needle `"(x) (inc y)"` (two forms; its run `( x ) ( inc y )`
+    // spans the boundary between the body's two forms) sits inside exactly
+    // ONE current form's stream — the host defn, never the `"(x)"` or
+    // `"(inc y)"` nodes themselves (their streams are shorter than the
+    // run). It parses, is not def-like, and no whole form carries its
+    // token stream: a pure fragment.
+    let needle = "(x) (inc y)";
+    let src = b"(ns ex)\n\n(defn frag-host [x]\n  (x)\n  (inc y))\n";
+    let f = fixture("i42-1.clj", src);
+    let h = handle_at_full(&f, 3, 1); // the defn
+    // A re-indent out-of-band: the form's bytes (and handle) rotate while
+    // its token stream does not.
+    let mangled = "(ns ex)\n\n(defn frag-host [x]\n      (x)\n      (inc y))\n";
+    std::fs::write(&f, mangled).unwrap();
+    let h_new = handle_at_full(&f, 3, 1);
+    assert_ne!(h, h_new, "the reformat must rotate the handle");
+    let (code, d, _) = run_json(
+        &[
+            "edit",
+            &f,
+            "--handle",
+            &h,
+            "--mode",
+            "patch",
+            "--old-text",
+            needle,
+            "--new-text",
+            "x",
+            "--json",
+        ],
+        None,
+    );
+    assert_eq!(code, 3, "{d}");
+    assert_eq!(d["error"]["code"], "stale-handle");
+    let hint = d["error"]["hint"].as_str().unwrap();
+    // The enclosing form, not the fragment: new handle + the EXACT current
+    // bytes of the whole form (the re-get for free).
+    assert!(
+        hint.starts_with(&format!(
+            "this form is now \u{27E6}{h_new}\u{27E7} (defn frag-host) \u{2014} your oldText is a fragment inside it; current bytes:\n(defn frag-host [x]\n      (x)\n      (inc y))"
+        )),
+        "{hint}"
+    );
+    // The 40A whitespace claim rides on verified token-stream equality;
+    // a fragment's run is proper to the form's stream, so the claim is
+    // omitted (never asserted).
+    assert!(!hint.contains("differs only in whitespace"), "{hint}");
+    // Report-only: the refusal stands and nothing was written.
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), mangled);
+}
+
+#[test]
+fn stale_handle_fragment_needle_multiple_containment_reports_candidates() {
+    // The needle `"(x) (inc y)"` is contained in TWO forms' streams (both
+    // hosts; their other bytes differ, so the handles stay distinct) —
+    // report all candidates with spans, pick nothing.
+    let src = b"(ns ex)\n\n(defn h1 [x]\n  (x)\n  (inc y))\n\n(defn h2 [x]\n  (x)\n  (inc y)\n  (identity 1))\n";
+    let f = fixture("i42-2.clj", src);
+    let h = handle_at_full(&f, 3, 1);
+    let mangled = "(ns ex)\n\n(defn h1 [x]\n    (x)\n    (inc y))\n\n(defn h2 [x]\n  (x)\n  (inc y)\n  (identity 1))\n";
+    std::fs::write(&f, mangled).unwrap();
+    let (code, d, _) = run_json(
+        &[
+            "edit",
+            &f,
+            "--handle",
+            &h,
+            "--mode",
+            "patch",
+            "--old-text",
+            "(x) (inc y)",
+            "--new-text",
+            "x",
+            "--json",
+        ],
+        None,
+    );
+    assert_eq!(code, 3, "{d}");
+    assert_eq!(d["error"]["code"], "stale-handle");
+    let hint = d["error"]["hint"].as_str().unwrap();
+    assert!(
+        hint.starts_with("2 forms carry your oldText as a contiguous token run \u{2014} "),
+        "{hint}"
+    );
+    assert!(hint.contains("candidates; none picked \u{2014} run tree to choose one"), "{hint}");
+    // Report-only: nothing written.
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), mangled);
+}
+
+#[test]
+fn stale_handle_fragment_needle_zero_containment_plain_message() {
+    // A fragment needle that no current form contains: the existing plain
+    // message, byte-identical to the pre-42 ending.
+    let f = fixture("i42-3.clj", I40_SRC);
+    let h = handle_at_full(&f, 3, 1);
+    std::fs::write(&f, I40_REFORMATTED).unwrap();
+    let (code, d, _) = run_json(
+        &[
+            "edit",
+            &f,
+            "--handle",
+            &h,
+            "--mode",
+            "patch",
+            "--old-text",
+            "(zz omega)",
+            "--new-text",
+            "x",
+            "--json",
+        ],
+        None,
+    );
+    assert_eq!(code, 3, "{d}");
+    assert_eq!(d["error"]["code"], "stale-handle");
+    assert_eq!(
+        d["error"]["hint"].as_str().unwrap(),
+        "no form matches the previous identity \u{2014} re-run tree"
+    );
+}
+
+#[test]
+fn stale_handle_fragment_needle_deep_tree_error_path_stays_plain() {
+    // Cost guard: on a 20k-deep file the containment scan runs over the
+    // one parse's token arrays (early-exiting per form) — a needle nothing
+    // contains keeps the plain message, byte-identical to pre-42, and the
+    // error path stays bounded.
+    let payload = deep_payload(20_000);
+    let f = fixture("i42-4.clj", payload.as_bytes());
+    let h = handle_at_full(&f, 2, 1); // the deep `(def payload …)` form
+    // Out-of-band whitespace change: the form's bytes (and handle) rotate
+    // while its token stream does not.
+    let mangled = payload.replacen("(def payload [", "(def payload [ ", 1);
+    assert_ne!(mangled, payload, "the rewrite must change the bytes");
+    std::fs::write(&f, &mangled).unwrap();
+    let (code, d, _) = run_json(
+        &[
+            "edit",
+            &f,
+            "--handle",
+            &h,
+            "--mode",
+            "patch",
+            "--old-text",
+            "(zz omega)",
+            "--new-text",
+            "x",
+            "--json",
+        ],
+        None,
+    );
+    assert_eq!(code, 3, "{d}");
+    assert_eq!(d["error"]["code"], "stale-handle");
+    assert_eq!(
+        d["error"]["hint"].as_str().unwrap(),
+        "no form matches the previous identity \u{2014} re-run tree"
+    );
+    // Report-only: nothing written.
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), mangled.as_str());
+}
+
+#[test]
+fn stale_handle_whole_inner_node_verbatim_match_reports_enclosing_form() {
+    // The owner-verified false-identity repro: the stale patch's needle
+    // EXACTLY equals the current bytes of an inner node ((step-two x)
+    // inside defn frag-host). The inner form is UNCHANGED, so the stale
+    // handle cannot have been its (its content hash still resolves) — the
+    // stale target is the enclosing form. Recovery must NOT assert
+    // identity to the inner node; it reports the enclosing form (handle +
+    // span), phrased as a candidate, and picks nothing.
+    let src = b"(ns ex)\n\n(defn frag-host [x]\n  (step-one x)\n  (step-two x))\n";
+    let f = fixture("i42-5.clj", src);
+    let h = handle_at_full(&f, 3, 1); // the defn frag-host
+    // A re-indent out-of-band: frag-host's bytes (and handle) rotate while
+    // the inner node (step-two x) keeps its exact bytes.
+    let mangled = "(ns ex)\n\n(defn frag-host [x]\n      (step-one x)\n      (step-two x))\n";
+    std::fs::write(&f, mangled).unwrap();
+    let h_host = handle_at_full(&f, 3, 1);
+    assert_ne!(h, h_host, "the reformat must rotate the handle");
+    let (code, d, _) = run_json(
+        &[
+            "edit",
+            &f,
+            "--handle",
+            &h,
+            "--mode",
+            "patch",
+            "--old-text",
+            "(step-two x)",
+            "--new-text",
+            "(step-two x y)",
+            "--json",
+        ],
+        None,
+    );
+    assert_eq!(code, 3, "{d}");
+    assert_eq!(d["error"]["code"], "stale-handle");
+    let hint = d["error"]["hint"].as_str().unwrap();
+    // The enclosing form, with handle + span, phrased as a candidate —
+    // never "this form is now" (identity to the inner node is not
+    // verifiable: the inner form is unchanged).
+    assert!(
+        hint.starts_with(&format!(
+            "your oldText sits inside \u{27E6}{h_host}\u{27E7} (defn frag-host, lines 3\u{2013}5) \u{2014} if that is the form you were editing, use that handle"
+        )),
+        "{hint}"
+    );
+    assert!(!hint.contains("this form is now"), "{hint}");
+    assert!(!hint.contains("differs only in whitespace"), "{hint}");
+    // Report-only: nothing written.
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), mangled);
+}
+
+#[test]
+fn stale_handle_whole_inner_node_multiple_def_like_ancestors_pick_nothing() {
+    // The matched inner node has TWO def-like ancestors (the nested defn
+    // chain) — several identity candidates: report all with spans, pick
+    // nothing, assert nothing.
+    let src = b"(ns ex)\n\n(defn outer-fn [x]\n  (defn inner-fn [y]\n    (zeta y)))\n";
+    let f = fixture("i42-6.clj", src);
+    let h = handle_at_full(&f, 3, 1); // the outer defn
+    let mangled = "(ns ex)\n\n(defn outer-fn [x]\n      (defn inner-fn [y]\n        (zeta y)))\n";
+    std::fs::write(&f, mangled).unwrap();
+    let h_inner = handle_at_full(&f, 4, 2);
+    let h_outer = handle_at_full(&f, 3, 1);
+    assert_ne!(h, h_outer, "the reformat must rotate the handle");
+    let (code, d, _) = run_json(
+        &[
+            "edit",
+            &f,
+            "--handle",
+            &h,
+            "--mode",
+            "patch",
+            "--old-text",
+            "(zeta y)",
+            "--new-text",
+            "(zeta y z)",
+            "--json",
+        ],
+        None,
+    );
+    assert_eq!(code, 3, "{d}");
+    assert_eq!(d["error"]["code"], "stale-handle");
+    let hint = d["error"]["hint"].as_str().unwrap();
+    assert!(
+        hint.starts_with(&format!(
+            "your oldText sits inside \u{27E6}{h_inner}\u{27E7} (defn inner-fn, lines 4\u{2013}5), \u{27E6}{h_outer}\u{27E7} (defn outer-fn, lines 3\u{2013}5) (candidates; none picked \u{2014} run tree to choose one)"
+        )),
+        "{hint}"
+    );
+    assert!(!hint.contains("this form is now"), "{hint}");
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), mangled);
+}
+
+#[test]
+fn stale_handle_whole_inner_node_whitespace_rotated_keeps_assertive_reformat_report() {
+    // The 40A reformat shape at inner depth: the needle's tokens equal the
+    // inner form's stream but its BYTES differ (whitespace rotated) — the
+    // matched form itself changed, so it IS the plausible stale target and
+    // keeps the assertive "this form is now" report with the whitespace
+    // claim (identity verified by the bytes, not the name).
+    let src = b"(ns ex)\n\n(defn frag-host [x]\n  (step-one x)\n  (step-two x))\n";
+    let f = fixture("i42-7.clj", src);
+    let h = handle_at_full(&f, 3, 1); // the defn frag-host
+    // Rotate ONLY the inner form's whitespace: the enclosing defn keeps
+    // its bytes/handle… so the stale handle must be something else. Rotate
+    // both: the defn's handle rotates (stale), and the inner form's bytes
+    // rotate too (token-equal, not verbatim).
+    let mangled = "(ns ex)\n\n(defn frag-host [x]\n      (step-one x)\n      (step-two\n         x))\n";
+    std::fs::write(&f, mangled).unwrap();
+    let (code, d, _) = run_json(
+        &[
+            "edit",
+            &f,
+            "--handle",
+            &h,
+            "--mode",
+            "patch",
+            "--old-text",
+            "(step-two x)",
+            "--new-text",
+            "(step-two x y)",
+            "--json",
+        ],
+        None,
+    );
+    assert_eq!(code, 3, "{d}");
+    assert_eq!(d["error"]["code"], "stale-handle");
+    let hint = d["error"]["hint"].as_str().unwrap();
+    // The inner form's own bytes rotated: the assertive 40A report stands
+    // (it is the form whose bytes the old handle saw, up to whitespace).
+    assert!(
+        hint.starts_with("this form is now \u{27E6}"),
+        "{hint}"
+    );
+    assert!(hint.contains("(step-two)"), "{hint}");
+    assert!(
+        hint.contains("differs only in whitespace"),
+        "token equality is the match itself: {hint}"
+    );
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), mangled);
+}
+
+#[test]
+fn stale_handle_fragment_needle_non_def_like_top_level_sits_inside() {
+    // A fragment run contained in exactly ONE current form — a top-level
+    // NON-DEF-LIKE form. Its identity is not pinned by a name: phrase it
+    // as a candidate ("sits inside … if that is the form you were
+    // editing"), never "this form is now".
+    let src = b"(comment (a b) (c d))\n";
+    let f = fixture("i42-8.clj", src);
+    let h = handle_at_full(&f, 1, 1); // the comment form
+    let mangled = "(comment  (a b) (c d))\n"; // re-indent: handle rotates
+    std::fs::write(&f, mangled).unwrap();
+    let h_new = handle_at_full(&f, 1, 1);
+    assert_ne!(h, h_new, "the reformat must rotate the handle");
+    let (code, d, _) = run_json(
+        &[
+            "edit",
+            &f,
+            "--handle",
+            &h,
+            "--mode",
+            "patch",
+            "--old-text",
+            "(a b) (c d)",
+            "--new-text",
+            "(a b) (c d)",
+            "--json",
+        ],
+        None,
+    );
+    assert_eq!(code, 3, "{d}");
+    assert_eq!(d["error"]["code"], "stale-handle");
+    let hint = d["error"]["hint"].as_str().unwrap();
+    assert!(
+        hint.starts_with(&format!(
+            "your oldText sits inside \u{27E6}{h_new}\u{27E7} (comment) (lines 1\u{2013}1) \u{2014} if that is the form you were editing, use that handle"
+        )),
+        "{hint}"
+    );
+    assert!(!hint.contains("this form is now"), "{hint}");
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), mangled);
+}
