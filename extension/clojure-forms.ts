@@ -737,7 +737,13 @@ export default function ClojureForms(pi: ExtensionAPI) {
 		},
 	});
 
-	// ─── clj_draft ───────────────────────────────────────────────────────────
+	// ─── clj_draft ─────────────────────────────────────────────────────────────
+
+	// Issue 41 (A/C): per-session artifact counter (session = extension
+	// load). The artifacts are NEVER deleted — unlike clj_edit's withTempFile
+	// scratch they are the HANDOFF: the commit call references them via
+	// cljform edit --content-file, so they must outlive the tool call.
+	let draftSeq = 0;
 
 	pi.registerTool({
 		name: "clj_draft",
@@ -747,42 +753,148 @@ export default function ClojureForms(pi: ExtensionAPI) {
 			"closing brackets and get back a bracketed CANDIDATE plus a unified diff. It completes missing " +
 			"closers implied by indentation. It does NOT invent missing openers, so a fully bracket-less draft " +
 			"is returned unchanged with a note (a guessed bracketing would be worse than an obvious no-op). " +
-			"Never writes to a file — verify nesting before use.",
-		promptSnippet: "Recover bracket structure from an indentation-only draft (candidate + diff, never writes).",
+			"Draft never touches the repo or any user file: the ONLY writes it performs are scratch artifacts in " +
+			"the system temp dir — cljform-draft-<n>-sent.clj (the draft verbatim, exact bytes as submitted) and " +
+			"cljform-draft-<n>-rebalanced.clj (the completed candidate; when inference is a no-op, sent only — " +
+			"one file, said so). Both paths are reported: the handoff is a REFERENCE (clj_edit or cljform edit " +
+			"--content-file <artifact>), never a re-typed payload — corrections are cheap deltas on the artifact. " +
+			"Optional target (path + handle, from clj_tree): when given, the extension runs the splice dry-run " +
+			"vote (cljform edit <file> --handle <h> --content-file <artifact> --dry-run) AT PREPARE TIME — vote " +
+			"yes → 'prepared — commit-ready: edit --content-file <path>' (the commit is a formality modulo the " +
+			"between-phases window); vote no → the dry-run diagnosis surfaces here, at the cheapest possible " +
+			"moment. The vote is opt-in by supplying a target; without one there is no vote. Never auto-commits: " +
+			"the commit call stays the agent's. Verify nesting before use.",
+		promptSnippet: "Recover bracket structure from an indentation-only draft (candidate + diff + temp-dir artifacts, never writes to the repo).",
 		promptGuidelines: [
 			"Use clj_draft when the draft's brackets are the problem: it infers missing closers from indentation and shows the diff.",
-			"Its output is a candidate — verify nesting, then feed it to clj_edit.",
-			"It will not guess missing OPEN brackets; if the note says nothing was inferred, add the open brackets yourself.",
+			"Its output is a candidate — verify nesting, then edit the REPORTED artifact (cljform edit --content-file <path>, or clj_edit against the target with the fixed content) — never re-type the candidate.",
+			"The sent/rebalanced artifacts live in the system temp dir (the repo is never touched); a refused vote or edit says what is missing — fix the artifact with a tiny delta and resubmit it by path.",
+			"Pass path + handle (from clj_tree) to have the splice dry-run voted at prepare time: 'prepared — commit-ready' means the commit is a formality; a refused vote surfaces the diagnosis before any commit attempt.",
+			"It will not guess missing OPEN brackets; if the note says nothing was inferred, add the open brackets yourself (to the sent artifact).",
 		],
 		parameters: Type.Object({
 			content: Type.String({ description: "The draft s-expression (indentation is the structural signal)" }),
+			path: Type.Optional(
+				Type.String({
+					description:
+						"Optional splice target (the prepare-time vote): the file the candidate would be spliced into; requires handle. No target → artifacts only",
+				}),
+			),
+			handle: Type.Optional(
+				Type.String({
+					description:
+						"The ⟦handle⟧ of the target form in path (from clj_tree; required together with path)",
+				}),
+			),
 		}),
 
 		async execute(_toolCallId, params, _signal, _onUpdate) {
-			return await withTempFile("draft", params.content, async (tmp) => {
-				const run = await runClj(["materialize", "--content-file", tmp, "--json"], 15_000);
-				if (!run.ok) return run.result;
-				const r = run.out.result ?? {};
-				const lines = [
-					`candidate (${r.note ?? "brackets inferred from indentation"}):`,
-					"",
-					r.candidate ?? "",
-					"",
-					"diff (draft → candidate):",
-					r.diff || "(no change)",
-				];
-				// Issue 39: inference applied (the diff carries a hunk) → the
-				// candidate's balance is a mechanical check; point at the
-				// primitive. No hunk = nothing inferred = nothing to verify.
-				if ((r.diff ?? "").includes("@@")) {
-					lines.push("");
-					lines.push("verify balance before use: cljform balance --stdin");
-				}
+			// Target validation: the vote is (path, handle) as a pair.
+			if ((params.path === undefined) !== (params.handle === undefined)) {
 				return {
-					content: [{ type: "text", text: lines.join("\n") }],
-					details: { candidate: r.candidate, diff: r.diff, note: r.note },
+					content: [
+						{
+							type: "text",
+							text: "clj_draft target: path and handle must be given together (both, or neither — no target means artifacts only)",
+						},
+					],
+					isError: true,
 				};
-			});
+			}
+			const { writeFileSync } = await import("node:fs");
+			const { tmpdir } = await import("node:os");
+			const { join } = await import("node:path");
+			draftSeq += 1;
+			const sentPath = join(tmpdir(), `cljform-draft-${draftSeq}-sent.clj`);
+			const rebalancedPath = join(tmpdir(), `cljform-draft-${draftSeq}-rebalanced.clj`);
+			// The sent artifact is the draft VERBATIM (exact bytes as
+			// submitted) — materialize reads it via --content-file, the
+			// same route the commit will use later.
+			writeFileSync(sentPath, params.content);
+			const run = await runClj(["materialize", "--content-file", sentPath, "--json"], 15_000);
+			if (!run.ok) return run.result;
+			const r = run.out.result ?? {};
+			const inferred = (r.diff ?? "").includes("@@");
+			// Inference applied → the completed candidate is the SECOND
+			// artifact (its exact bytes from the envelope). No-op inference
+			// → rebalanced == sent: ONE file, said so.
+			let rebalanced: string | null = null;
+			if (inferred) {
+				writeFileSync(rebalancedPath, r.candidate ?? "");
+				rebalanced = rebalancedPath;
+			}
+			const lines = [
+				`candidate (${r.note ?? "brackets inferred from indentation"}):`,
+				"",
+				r.candidate ?? "",
+				"",
+				"diff (draft → candidate):",
+				r.diff || "(no change)",
+				"",
+				"artifacts (system temp dir — the repo is never touched; these files are clj_draft's only writes):",
+				`  sent: ${sentPath}`,
+				inferred
+					? `  rebalanced: ${rebalancedPath}`
+					: "  rebalanced: (no-op — the draft already balanced; the sent file IS the candidate)",
+			];
+			// Issue 41 (C): the 2PC phase-1 vote — the splice dry-run against
+			// the supplied target, run AT PREPARE TIME (lock-free: a dry run
+			// writes nothing, so aborting here is always clean). Opt-in by
+			// supplying a target; the commit call itself is never made here.
+			let vote: "yes" | "no" | undefined;
+			if (params.path !== undefined) {
+				const artifact = inferred ? rebalancedPath : sentPath;
+				const v = await runClj(
+					[
+						"edit",
+						params.path,
+						"--handle",
+						params.handle!,
+						"--mode",
+						"replace",
+						"--content-file",
+						artifact,
+						"--dry-run",
+						"--json",
+					],
+					20_000,
+				);
+				if (v.ok) {
+					vote = "yes";
+					lines.push("");
+					lines.push(
+						`prepared — commit-ready: cljform edit ${params.path} --handle ${params.handle} --mode replace --content-file ${artifact}`,
+					);
+					lines.push(
+						"(the dry-run vote passed at prepare time; nothing was written — the commit call stays yours)",
+					);
+				} else {
+					vote = "no";
+					lines.push("");
+					lines.push(
+						"vote: the splice dry-run REFUSED — diagnosis at prepare time (fix the artifact with a tiny delta and resubmit; nothing was written to the target):",
+					);
+					lines.push(v.result.content[0].text);
+				}
+			}
+			// Issue 39: inference applied (the diff carries a hunk) → the
+			// candidate's balance is a mechanical check; point at the
+			// primitive. No hunk = nothing inferred = nothing to verify.
+			if (inferred) {
+				lines.push("");
+				lines.push("verify balance before use: cljform balance --stdin");
+			}
+			return {
+				content: [{ type: "text", text: lines.join("\n") }],
+				details: {
+					candidate: r.candidate,
+					diff: r.diff,
+					note: r.note,
+					sentPath,
+					rebalancedPath: rebalanced,
+					vote,
+				},
+			};
 		},
 	});
 
@@ -1264,8 +1376,9 @@ edits: clj_tree annotates the source with ⟦handles⟧ — the only edit target
 across edits elsewhere); clj_edit replaces, patches (oldText/newText), inserts, or deletes whole forms by
 handle, reindents submitted content to the target, infers unbalanced brackets by indentation when
 repair is requested (unbalanced content is otherwise refused with the candidate), and never writes a file that does not parse. A stale-handle refusal means the form changed —
-re-run clj_tree. clj_draft recovers brackets from an indentation-only draft (candidate + diff, never
-writes). Shape reports in tool results are binding: a "BLOCKING: the file no longer parses" line, lost forms
+re-run clj_tree. clj_draft recovers brackets from an indentation-only draft (candidate + diff; scratch artifacts
+in the system temp dir are its only writes — the repo is never touched, so edit the reported artifact with
+cljform edit --content-file instead of re-typing the candidate). Shape reports in tool results are binding: a "BLOCKING: the file no longer parses" line, lost forms
 in the guard report, or D1–D3 nesting warnings must be fixed or explicitly justified in your next action.
 After editing, prefer clj-check semantics already built into clj_edit's output over re-reading the whole file.`,
 		};

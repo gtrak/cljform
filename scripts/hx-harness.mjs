@@ -714,6 +714,210 @@ await run("draft-balance-hint", async () => {
 });
 
 // ─── report ──────────────────────────────────────────────────────────────────
+// ─── issue 41 (draft dual-artifact handoff + content-from-path): clj_draft cells ───
+// A: the draft writes BOTH artifacts to the system temp dir (sent = the draft
+// verbatim, rebalanced = the completed candidate; one file on a no-op),
+// reports both paths, and never touches the repo. C: the optional target
+// (path + handle) runs the splice dry-run vote AT PREPARE TIME — yes →
+// "prepared — commit-ready", no → the dry-run diagnosis at prepare time.
+const fs41 = await import("node:fs");
+const VOTE_FIXTURE = `(ns vote-demo)
+
+(defn target [x]
+  (inc x))
+
+(def tail 1)
+`;
+
+await run("draft-artifacts", async () => {
+	const { readdirSync, readFileSync } = fs41;
+	// The "repo": a scratch dir with one file — it must come out untouched.
+	const repo = join(tmp, "draft-repo-41");
+	fs41.mkdirSync(repo, { recursive: true });
+	const repoFile = join(repo, "repo.clj");
+	writeFileSync(repoFile, VOTE_FIXTURE);
+	const before = readdirSync(repo).sort();
+	const draft = tools.get("clj_draft");
+	const out = await draft.execute("h", { content: DRAFT_UNBALANCED }, null, () => {});
+	check("draft-41: not an error", !out.isError, text(out));
+	const t = text(out);
+	const sent = out.details?.sentPath;
+	const rebalanced = out.details?.rebalancedPath;
+	check("draft-41: both artifact paths reported", typeof sent === "string" && typeof rebalanced === "string", JSON.stringify(out.details));
+	check("draft-41: both paths in the response text", t.includes(`sent: ${sent}`) && t.includes(`rebalanced: ${rebalanced}`), t);
+	check(
+		"draft-41: the artifacts exist in the system temp dir",
+		readFileSync(sent, "utf8").length > 0 && readFileSync(rebalanced, "utf8").length > 0,
+		`sent=${sent} rebalanced=${rebalanced}`,
+	);
+	check(
+		"draft-41: sent is byte-identical to the submitted draft",
+		readFileSync(sent, "utf8") === DRAFT_UNBALANCED,
+		readFileSync(sent, "utf8"),
+	);
+	check(
+		"draft-41: rebalanced is exactly the candidate",
+		readFileSync(rebalanced, "utf8") === out.details.candidate,
+		out.details.candidate,
+	);
+	// The rebalanced artifact parses (the completed candidate is real code).
+	let chk = { code: -1, stdout: "" };
+	try {
+		chk.stdout = execFileSync(BIN, ["check", rebalanced, "--json"], { encoding: "utf8" });
+		chk.code = 0;
+	} catch (e) {
+		chk = { code: e.status ?? -1, stdout: e.stdout ?? "" };
+	}
+	check("draft-41: the rebalanced artifact parses", chk.code === 0 && chk.stdout.includes('"ok":true'), `code=${chk.code} ${chk.stdout}`);
+	check(
+		"draft-41: the repo is untouched (the artifacts are draft's ONLY writes)",
+		JSON.stringify(readdirSync(repo).sort()) === JSON.stringify(before),
+		`${before} -> ${readdirSync(repo)}`,
+	);
+});
+
+await run("draft-noop-single-artifact", async () => {
+	const draft = tools.get("clj_draft");
+	const out = await draft.execute("h", { content: DRAFT_BALANCED }, null, () => {});
+	check("draft-41noop: not an error", !out.isError, text(out));
+	const sent = out.details?.sentPath;
+	check(
+		"draft-41noop: no-op writes sent only (rebalancedPath null)",
+		out.details?.rebalancedPath === null && sent !== undefined,
+		JSON.stringify(out.details),
+	);
+	check(
+		"draft-41noop: the response says sent IS the candidate",
+		text(out).includes("no-op — the draft already balanced; the sent file IS the candidate"),
+		text(out),
+	);
+	check(
+		"draft-41noop: sent is the draft verbatim",
+		fs41.readFileSync(sent, "utf8") === DRAFT_BALANCED,
+		fs41.readFileSync(sent, "utf8"),
+	);
+});
+
+await run("draft-vote-yes", async () => {
+	const file = writeEditFixture("vote-yes.clj");
+	writeFileSync(file, VOTE_FIXTURE);
+	const h = await handleFor(tools, file, /\(\u27E6([0-9a-f]+)\u27E7defn target \[x\]/);
+	const out = await tools.get("clj_draft").execute("h", { content: DRAFT_UNBALANCED, path: file, handle: h }, null, () => {});
+	check("draft-41vote-y: not an error", !out.isError, text(out));
+	check("draft-41vote-y: vote yes", out.details?.vote === "yes", JSON.stringify(out.details));
+	const t = text(out);
+	check(
+		"draft-41vote-y: 'prepared — commit-ready' names the artifact",
+		t.includes("prepared — commit-ready:") && t.includes(`--content-file ${out.details.rebalancedPath}`),
+		t,
+	);
+	check("draft-41vote-y: no auto-commit (the target is untouched)", fs41.readFileSync(file, "utf8") === VOTE_FIXTURE, fs41.readFileSync(file, "utf8"));
+});
+
+await run("draft-vote-no-stale", async () => {
+	const file = writeEditFixture("vote-no.clj");
+	writeFileSync(file, VOTE_FIXTURE);
+	const h = await handleFor(tools, file, /\(\u27E6([0-9a-f]+)\u27E7defn target \[x\]/);
+	// The form changes AFTER the handle was copied — the dry-run vote must
+	// refuse with stale-handle AT PREPARE TIME (the diagnosis surfaces here,
+	// not at commit time).
+	writeFileSync(file, VOTE_FIXTURE.replace("(inc x)", "(inc (mod x 2))"));
+	const out = await tools.get("clj_draft").execute("h", { content: DRAFT_UNBALANCED, path: file, handle: h }, null, () => {});
+	const t = text(out);
+	check("draft-41vote-n: the draft itself succeeds (artifacts written)", !out.isError && out.details?.sentPath, t);
+	check("draft-41vote-n: vote no", out.details?.vote === "no", JSON.stringify(out.details));
+	check("draft-41vote-n: the dry-run diagnosis surfaces at prepare time", t.includes("vote: the splice dry-run REFUSED") && t.includes("stale-handle"), t);
+	check("draft-41vote-n: nothing written to the target", fs41.readFileSync(file, "utf8").includes("(inc (mod x 2))"), fs41.readFileSync(file, "utf8"));
+});
+
+await run("draft-no-target-no-vote", async () => {
+	const file = writeEditFixture("no-vote.clj");
+	writeFileSync(file, VOTE_FIXTURE);
+	const mark = pi.execCalls.length;
+	const out = await tools.get("clj_draft").execute("h", { content: DRAFT_UNBALANCED }, null, () => {});
+	check("draft-41nt: not an error", !out.isError, text(out));
+	check("draft-41nt: no vote without a target", out.details?.vote === undefined, JSON.stringify(out.details));
+	check("draft-41nt: no commit-ready line", !text(out).includes("commit-ready"), text(out));
+	const newCalls = pi.execCalls.slice(mark);
+	check(
+		"draft-41nt: the only CLI call was materialize (no edit dry-run)",
+		newCalls.length === 1 && newCalls.every((c) => c.args[0] === "materialize"),
+		JSON.stringify(newCalls.map((c) => c.args[0])),
+	);
+});
+
+await run("draft-between-phases-stale", async () => {
+	// The 2PC residual: the target moves BETWEEN the prepare vote and the
+	// commit — the commit hits stale-handle and issue 40A's recovery report
+	// turns it into a re-vote (never an abort). The draft's rebalanced
+	// candidate names the SAME form as the target (the neutral candidate
+	// report, §4.5/40A: a replace's new bytes can only earn a candidate
+	// report, never an identity claim).
+	const DRAFT_TARGET = "(defn target [x]\n  (dec x"; // missing one closer
+	const file = writeEditFixture("between-phases.clj");
+	writeFileSync(file, VOTE_FIXTURE);
+	const h = await handleFor(tools, file, /\(\u27E6([0-9a-f]+)\u27E7defn target \[x\]/);
+	const out = await tools.get("clj_draft").execute("h", { content: DRAFT_TARGET, path: file, handle: h }, null, () => {});
+	check("draft-41bp: vote yes at prepare time", out.details?.vote === "yes", JSON.stringify(out.details));
+	const artifact = out.details.rebalancedPath;
+	// Between-phases window: an external edit moves the target form.
+	writeFileSync(file, VOTE_FIXTURE.replace("(inc x)", "(inc (mod x 2))"));
+	// The commit (what the agent now does): edit by path + the vote handle.
+	let commit = { code: -1, stdout: "" };
+	try {
+		commit.stdout = execFileSync(BIN, ["edit", file, "--handle", h, "--mode", "replace", "--content-file", artifact, "--json"], { encoding: "utf8" });
+		commit.code = 0;
+	} catch (e) {
+		commit = { code: e.status ?? -1, stdout: e.stdout ?? "" };
+	}
+	check("draft-41bp: the commit is refused (stale-handle, exit 3)", commit.code === 3, `code=${commit.code} ${commit.stdout}`);
+	const env = JSON.parse(commit.stdout);
+	check(
+		"draft-41bp: the 40A recovery report carries the candidate report (re-vote affordance)",
+		env.error?.code === "stale-handle" && (env.error?.hint ?? "").includes('forms named "target" in the current file'),
+		JSON.stringify(env.error ?? {}),
+	);
+	check("draft-41bp: the target file is unchanged by the refusal", fs41.readFileSync(file, "utf8").includes("(inc (mod x 2))"), fs41.readFileSync(file, "utf8"));
+});
+
+await run("draft-round-trip-delta", async () => {
+	// The cheap loop end-to-end: a draft materialize CANNOT complete (missing
+	// openers — it never invents them) → no-op → sent only → the agent-style
+	// tiny delta on the artifact (the missing opening paren) →
+	// edit --content-file succeeds and verifies.
+	const file = writeEditFixture("round-trip-41.clj");
+	writeFileSync(file, VOTE_FIXTURE);
+	const h = await handleFor(tools, file, /\(\u27E6([0-9a-f]+)\u27E7defn target \[x\]/);
+	const draftText = `defn target [x]
+  (swap! state conj x)`;
+	const out = await tools.get("clj_draft").execute("h", { content: draftText }, null, () => {});
+	check("draft-41rt: not an error", !out.isError, text(out));
+	check("draft-41rt: no-op → sent only", out.details?.rebalancedPath === null, JSON.stringify(out.details));
+	const sent = out.details.sentPath;
+	// The tiny delta: the missing opening paren + closing paren, applied to
+	// the artifact (the cheap loop: fix the file, resubmit by path).
+	fs41.writeFileSync(sent, `(${fs41.readFileSync(sent, "utf8")})`);
+	let commit = { code: -1, stdout: "" };
+	try {
+		commit.stdout = execFileSync(BIN, ["edit", file, "--handle", h, "--mode", "replace", "--content-file", sent, "--json"], { encoding: "utf8" });
+		commit.code = 0;
+	} catch (e) {
+		commit = { code: e.status ?? -1, stdout: e.stdout ?? "" };
+	}
+	check("draft-41rt: edit --content-file on the fixed artifact succeeds", commit.code === 0, `code=${commit.code} ${commit.stdout}`);
+	const env = JSON.parse(commit.stdout);
+	check("draft-41rt: the envelope echoes the file provenance", env.result?.contentSource === `path:${sent}`, JSON.stringify(env.result ?? {}));
+	check("draft-41rt: the new body landed and the file parses", fs41.readFileSync(file, "utf8").includes("swap! state conj x"), fs41.readFileSync(file, "utf8"));
+	let chk = { code: -1, stdout: "" };
+	try {
+		chk.stdout = execFileSync(BIN, ["check", file, "--json"], { encoding: "utf8" });
+		chk.code = 0;
+	} catch (e) {
+		chk = { code: e.status ?? -1, stdout: e.stdout ?? "" };
+	}
+	check("draft-41rt: post-commit check ok (untouched forms intact)", chk.code === 0 && chk.stdout.includes('"ok":true'), `code=${chk.code} ${chk.stdout}`);
+});
+
 for (const p of PASS) console.log(`PASS ${p}`);
 for (const f of FAIL) console.log(`FAIL ${f.name}\n${f.evidence}`);
 console.log(`${PASS.length} passed, ${FAIL.length} failed`);

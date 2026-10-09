@@ -76,18 +76,29 @@ pub enum Op {
         mode: Option<Mode>,
         /// Replacement/insertion content (else --content-file or stdin).
         /// Not used by patch (use --old-text/--new-text) or delete.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "content_file")]
         content: Option<String>,
-        /// Read content from this file (wrapper path; avoids argv limits).
-        #[arg(long)]
+        /// Read content from this file (mutually exclusive with --content;
+        /// the file must exist and be valid UTF-8 — exit 4 `io` otherwise;
+        /// bytes are taken verbatim, no trimming, no BOM stripping).
+        #[arg(long, conflicts_with = "content")]
         content_file: Option<PathBuf>,
         /// Patch mode: exact text to find inside the target form (must occur
         /// exactly once there; occurrences elsewhere are ignored).
-        #[arg(long, requires = "new_text")]
+        #[arg(long, requires = "new_text", conflicts_with = "old_text_file")]
         old_text: Option<String>,
         /// Patch mode: replacement text (may be empty to delete).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "new_text_file")]
         new_text: Option<String>,
+        /// Patch mode: read the exact text to find from this file (the
+        /// --old-text route from a path; same exclusivity/UTF-8/verbatim
+        /// contract as --content-file).
+        #[arg(long, conflicts_with = "old_text")]
+        old_text_file: Option<PathBuf>,
+        /// Patch mode: read the replacement text from this file (the
+        /// --new-text route from a path; same contract as --content-file).
+        #[arg(long, conflicts_with = "new_text")]
+        new_text_file: Option<PathBuf>,
         /// The single edit target (SPEC §5): the `tree` handle of the
         /// collection to replace/patch/delete or to insert next to. append
         /// and prepend are file-level and take no target.
@@ -99,7 +110,7 @@ pub enum Op {
         /// handle resolves against the ORIGINAL file and each target is
         /// tracked across the batch's own ops. Composes with --dry-run,
         /// --strict, --repair, --format-content/--no-format-content.
-        #[arg(long, conflicts_with_all = ["mode", "handle", "content", "content_file", "old_text", "new_text"])]
+        #[arg(long, conflicts_with_all = ["mode", "handle", "content", "content_file", "old_text", "new_text", "old_text_file", "new_text_file"])]
         batch: Option<PathBuf>,
         /// Validate only; write nothing.
         #[arg(long)]

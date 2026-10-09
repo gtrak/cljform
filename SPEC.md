@@ -96,7 +96,21 @@ cljform [--json|--human] <op> [args]
   read stdin when the path is omitted; `balance` additionally accepts an
   explicit `--stdin` flag (mutually exclusive with the path, §4.5). `forms`,
   `tree`, `get`, and `edit` require a path.
-  `edit` content arrives via `--content`, `--content-file`, or stdin.
+  `edit` content arrives via `--content`, `--content-file`, or stdin, and
+  patch text via `--old-text`/`--old-text-file` and `--new-text`/
+  `--new-text-file` (issue 41: content-from-path is a first-class twin of
+  the inline route, not a draft-specific escape hatch). File routes are
+  mutually exclusive with their inline twins (both given → exit 2 `usage`);
+  the file must exist and be valid UTF-8 (exit 4 `io` envelope — a BOM or
+  other invalid bytes surface as the honest UTF-8 error, never a silent
+  strip); bytes are taken verbatim (no trimming, no BOM stripping — content
+  is content) and the shared content pipeline (fence strip, edge trim,
+  balance walk with its verified-tail claim, write-gate enrichment,
+  stale-handle recovery) fires identically to the inline route. Provenance
+  is echoed in the success envelope as additive result keys: `contentSource`
+  (`inline` | `stdin` | `path:…`) for the content modes and
+  `oldTextSource`/`newTextSource` for patch (batch ops are inline-only and
+  carry none).
 - **Exit codes** (the wrapper branches on these):
   - `0` — success (including a clean `--dry-run`; for `balance`: the
     fragment is balanced, with or without an accepted `--tail`, §4.5)
@@ -128,7 +142,8 @@ cljform [--json|--human] <op> [args]
   present only when non-empty).
   - `2` — usage error: `usage` (bad args, unknown op, target required but
     missing, `--handle` shorter than 6 hex chars, `--handle` with
-    append/prepend)
+    append/prepend, a content field given BOTH inline and from a file —
+    the file/inline twins are mutually exclusive, issue 41)
   - `3` — targeting/refusal: `form-not-found`, `ambiguous`, `stale-handle`,
     `ambiguous-handle`, `patch-not-found`, `patch-ambiguous`,
     `unbalanced-content` (unbalanced content, inference is opt-in),
@@ -239,7 +254,7 @@ no derived summary that needs the cross-check, so only `get` drops it.
 | `strip [file]` | delete every `⟦…⟧` marker → the exact original bytes; pure stdout filter, no envelope (§10.2) | no | file or stdin |
 | `get <file>` | one form's exact bytes + metadata, including its handle | no | `--name sym` \| `--handle H` |
 | `check [file]` | parse + form table + nesting warnings | no | file or stdin |
-| `edit <file>` | whole-form / patch / insert / delete, handle-targeted (§5, §10.3) | yes | `--handle H` (append/prepend excepted), `--mode replace\|patch\|insert-after\|insert-before\|append\|prepend\|delete`, `--content` / `--content-file` / stdin, `--old-text`/`--new-text` (patch), `--strict`, `--repair`, `--dry-run`, `--format-content` / `--no-format-content` (content reindent, §10.3; default on) |
+| `edit <file>` | whole-form / patch / insert / delete, handle-targeted (§5, §10.3) | yes | `--handle H` (append/prepend excepted), `--mode replace\|patch\|insert-after\|insert-before\|append\|prepend\|delete`, `--content` / `--content-file` / stdin (mutually exclusive with the inline twin, §4.1), `--old-text`/`--new-text` (patch) or `--old-text-file`/`--new-text-file` (patch, from a path — same exclusivity/UTF-8/verbatim contract, issue 41), `--strict`, `--repair`, `--dry-run`, `--format-content` / `--no-format-content` (content reindent, §10.3; default on) |
 | `materialize` | draft→candidate via indent mode (§4.4) | no | `--content` / `--content-file` / stdin; emits candidate + unified diff |
 | `format [file]` | parinfer paren-mode reindent, candidate-first (§10.5) | no | file or stdin |
 | `balance [file]` | bracket-balance a fragment, read-only, stdin-first (§4.5): missing closers → the exact mechanical tail; misplaced closer → a line:col diagnosis (no tail offered) | no | file or `--stdin`; `--tail STRING` tests a candidate closing tail |
@@ -279,6 +294,15 @@ kind. `patch` mode is exact-match:
 `--new-text` may be empty; there is no repair. `patch-not-found` (exit 3)
 returns the form's exact bytes; `patch-ambiguous` (exit 3) names the
 occurrence count.
+
+**Content provenance (issue 41):** the single-op edit success envelope
+additionally carries the content provenance — `result.contentSource`
+(`inline` | `stdin` | `path:…`) for the content modes, and
+`result.oldTextSource`/`newTextSource` for patch — additive keys, absent
+from every other envelope (batch ops are inline-only; delete takes no
+payload). The file route is a REFERENCE, not a payload: a `path:…` value
+names a scratch file (the draft artifacts, §4.5), so the caller can correct
+the content as a tiny delta on the file and resubmit the same path.
 
 **Handle resolution (replaces the v1 `--expect` generation guard):** every
 form-targeting mode resolves `--handle H` content-addressedly (§5, §10.1):
@@ -478,10 +502,33 @@ the walker is provably panic-free (byte iteration and `pop()` only).
   context (still present, with its own coordinates; the refusal itself is
   unchanged). Content that balances is left alone: the parse failed for
   other reasons and the file-level message stands.
-- The `clj_draft` extension tool: when inference is applied (a candidate
-  + a hunk-carrying diff returned), one line is appended: `verify balance
-  before use: cljform balance --stdin` (the draft itself is unchanged; it
-  never writes).
+- The `clj_draft` extension tool (issue 41: dual-artifact handoff + the
+  prepare-time vote): draft NEVER touches the repo or any user file — the
+  scratch artifacts in the system temp dir are its ONLY writes. The
+  extension writes `cljform-draft-<n>-sent.clj` (the draft verbatim, exact
+  bytes as submitted; `<n>` a per-session counter) and, when inference
+  applies, `cljform-draft-<n>-rebalanced.clj` (the completed candidate);
+  a no-op inference writes sent only (rebalanced == sent, said so in the
+  response). Both paths are reported; the artifacts are additive to the
+  candidate + diff + (if landed) structural echo, and they are NEVER
+  deleted — the commit is a REFERENCE (`cljform edit <file> --handle <h>
+  --content-file <artifact>`), not a re-typed payload, and corrections are
+  cheap deltas on the artifact. **The vote (2PC phase 1):** when the agent
+  supplies a target (`path` + `handle`, opt-in by giving one; no target →
+  artifacts only), the extension runs the splice dry-run — `cljform edit
+  <file> --handle <h> --mode replace --content-file <artifact> --dry-run` —
+  AT PREPARE TIME: phase 1 carries every check doable without the target,
+  abort is always clean (lock-free, nothing written), and the ONLY residual
+  commit failure is the between-phases window (target moved → `stale-handle`
+  → the §4.5/issue-40A recovery report re-votes rather than aborting). Vote
+  yes → `prepared — commit-ready: edit --content-file <path>` (the commit is
+  a formality modulo the window); vote no → the dry-run diagnosis surfaces
+  AT PREPARE TIME (the cheapest possible moment: the fix is a tiny delta on
+  the artifact), with the same recovery affordances as any edit refusal.
+  Never auto-commits — the commit call stays the agent's. When inference is
+  applied (a candidate + a hunk-carrying diff returned), one line is
+  appended: `verify balance before use: cljform balance --stdin` (the draft
+  itself is unchanged; it never writes).
 
 ## 5. Addressing
 
@@ -655,7 +702,7 @@ session.
 | `clj_tree` | `{path, name?, depth?, json?, startLine?, endLine?, recover?}` | `cljform tree` — the primary handle-discovery view (`--depth N\|all`); `name` maps to `--name SYM` (the §10.2 selector: matched subtrees at full depth, zero matches is an ok empty result); `json` returns the structured node list; `startLine`/`endLine` map to `--start-line`/`--end-line` (the §10.2 line window: complete forms only, real file line numbers, the effective span echoed — page large files; the window header/echo passes through unchanged); `recover` maps to `--recover` (the §10.2 broken-file recovery view: on a broken file the JSON path renders the diagnostics + intact-form labels + window echo — no handles; on a healthy file the normal view). **Human path (default, `--human`) is a pass-through:** the annotated source is not a JSON envelope, so on exit 0 the wrapper returns `stdout` directly (BOM-stripped, `trimEnd`) with no `isError` — a successful default `clj_tree` is never an error and is never prefixed `cljform failed:`. Only a nonzero exit (or, in `json` mode, an unparseable/`ok:false` envelope) yields `isError`, using `errorText` when the output parses as an error envelope, else the `cljform failed: ${stderr \|\| stdout}` fallback. **Large-file default (issue 33 Part B):** a DEFAULT call (no `name`/`json`/`depth`/`startLine`/`endLine`/`recover`) on a file with MORE than `TREE_INDEX_THRESHOLD_LINES` (300, a wrapper constant) lines returns the compressed **FORM INDEX** instead of the whole annotated dump: a header `large file: N lines, M top-level forms — showing the form index (handles are live). Annotated view: pass startLine/endLine; a specific form: name.` then one `⟦handle⟧ head name (lines X–Y)` row per top-level form, sorted by line (the `--name`-block label style), with NO source body. The rows come from `cljform tree --json --depth 1` (a small payload since issue 33 Part A); a nonzero exit from that call surfaces as the same error result as the normal path. The index scales with form count, the annotated view with file size — the default picks the right tool instead of the biggest dump. Explicit calls are honored exactly and uncapped (`startLine`/`endLine` → the windowed annotated view; `name` → the selector view; `json` → the node table; `depth` → the cutoff), and below the threshold the pass-through is byte-identical (the CLI's own `tree` contract is unchanged — the wrapper owns the agent ergonomics) |
 | `clj_get` | `{path, name? / handle?}` | `cljform get --json` — exact bytes + the form's `⟦handle⟧` |
 | `clj_edit` | `{path, handle?, mode?, content? / oldText? + newText?, dryRun?, strict?, repair?, autoFormat?, ops?}` | `cljform edit --handle …` — mode auto-selects `patch` when `oldText` is present; append/prepend take no handle; `dryRun` ⇒ `--dry-run`, `strict` ⇒ `--strict`, `repair` ⇒ `--repair`; `autoFormat` (default true) maps to the in-edit content reindent: `false` passes `--no-format-content`, `true` (the default) passes nothing and lets `cljform edit` reindent the content itself in parinfer paren mode (§10.3/§10.5; a refused reindent is reported by the CLI as a note, the edit never fails for it); the wrapper no longer runs a separate `cljform format` call; `oldText`/`newText` are exact patch text and are never reformatted. **Batch (issue 36):** `ops` (an array of `{handle?, mode?, content? / oldText? + newText?}`) takes precedence over the single-op params (passing both is a wrapper-side usage error) and maps to `cljform edit --batch <tempfile>` — N ops in one atomic call, every handle resolved against the ORIGINAL file and each target tracked across the batch (§10.3 batch contract); the wrapper validates each op's shape up front (same contract as the single-op params, the error names the op index) and renders `result.text` (the composed per-op blocks + aggregate line) as-is, then appends a `next handles (post-batch):` block sourced from the per-op `result.ops[*].summary` (replaced/patched → the new handle; inserted → the inserted handle) so the agent chases post-batch handles without a `clj_tree` round-trip; a successful multi-op batch's `result.text` carries the end-state echo (the `end state (post-batch):` block, §10.3) which the as-is rendering surfaces; a batch ABORT renders `error.batch_ops` (the relabeled would-apply per-op blocks, §10.3 batch abort rendering) directly under the error line — both sourced from the JSON envelope, never from re-parsing human text. **Issue 37 patch-not-found hints:** the wrapper passes the CLI's `hint`/`message` through verbatim, so the indentation-delta diagnosis (B) and the sub-form steering hint (D) reach the agent without wrapper logic. **Next-handle affordance (issue 35):** on every successful (non-dry-run) edit the wrapper appends a final line sourced from the JSON envelope (`result.summary`), never from re-parsing the human text — `replace`/`patch` append `next handle: ⟦H⟧ — use it for the next edit to this form` (from `summary.handle`; falls back to `summary.wasHandle` only when `handle` is absent) so the agent chases the returned handle instead of re-fetching; `insert-after`/`insert-before` render `summary.inserted` (one labeled entry per top-level inserted form, §10.3 insert response contract) as a self-sufficient block — `inserted after ⟦anchor⟧:` / `  ⟦handle⟧ head name (lines a–b)` per entry / `— use these for the next edit` — and a SINGLE-entry insert collapses to the established `next handle:` line instead; `delete` appends nothing (the form is gone — no stale handle). Old envelopes (pre-issue-35 `summary.handles`) still render the legacy bare list |
-| `clj_draft` | `{content}` | `cljform materialize --content-file …` — returns candidate + diff; never writes. When inference is applied (the diff carries a hunk) the wrapper appends one line — `verify balance before use: cljform balance --stdin` (the mechanical balance check, §4.5) — and no line when the draft came back unchanged |
+| `clj_draft` | `{content, path?, handle?}` | `cljform materialize --content-file <sent-artifact> --json` — returns candidate + diff (it never invents missing open brackets; a fully bracket-less draft comes back unchanged with a note). **Dual-artifact handoff (issue 41):** the extension ALSO writes the scratch artifacts to the system temp dir — `cljform-draft-<n>-sent.clj` (the draft verbatim, exact bytes as submitted) and `cljform-draft-<n>-rebalanced.clj` (the completed candidate; when inference is a no-op, sent only — one file, said so) — and reports both paths; these temp files are the ONLY writes draft performs (the repo and every user file are never touched), they are never deleted, and the response still carries candidate + diff + note (the files are additive). **The prepare-time vote (issue 41 C):** when `path` + `handle` are supplied (opt-in; both or neither — one without the other is a wrapper usage error), the extension runs the splice dry-run against the target — `cljform edit <path> --handle <handle> --mode replace --content-file <artifact> --dry-run` — after writing the rebalanced artifact: vote yes → the response says `prepared — commit-ready: cljform edit <path> --handle <handle> --mode replace --content-file <artifact>` (the commit is a formality modulo the between-phases window); vote no → the dry-run diagnosis surfaces AT PREPARE TIME (the fix is a tiny delta on the artifact; nothing was written to the target); no target → no vote, artifacts only. Never auto-commits — the commit call stays the agent's. When inference is applied (the diff carries a hunk) the wrapper appends one line — `verify balance before use: cljform balance --stdin` (the mechanical balance check, §4.5) — and no line when the draft came back unchanged |
 
 **Fingerprint cache:** in-memory `Map<realpath, forms>`. Refreshed on every
 successful `clj_forms`/`clj_get` and post-edit shape check (the CLI result
@@ -1253,7 +1300,8 @@ design):
   deliberately conservative: it completes missing **closers** from
   indentation; it does **not** invent missing openers, so a fully
   bracket-less draft is returned as-is with a note. Exposed to agents as
-  `clj_draft` (candidate + diff, never writes).
+  `clj_draft` (candidate + diff, never writes to the repo — its only writes
+  are the temp-dir scratch artifacts, §4.5/issue 41).
 - **`--expect` is advisory by default (v1; removed with the v2 handle design).**
   A stale address was re-aimed by hash when the expected form was still
   uniquely findable; `--strict` restored the hard stop (exit 3). Staleness is

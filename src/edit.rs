@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::Mode;
 use crate::errors::{self, ErrorBody, Fail, Output};
-use crate::ops::{parse_or_fail, read_content, read_file, resolve_handle, StaleRecovery, with_bom};
+use crate::ops::{
+    parse_or_fail, read_content, read_file, read_text_file, resolve_handle, StaleRecovery, with_bom,
+};
 use crate::content;
 use crate::format;
 use crate::handle;
@@ -783,6 +785,8 @@ pub fn run_edit(
     content_file: &Option<PathBuf>,
     old_text: &Option<String>,
     new_text: &Option<String>,
+    old_text_file: &Option<PathBuf>,
+    new_text_file: &Option<PathBuf>,
     handle_opt: &Option<String>,
     dry_run: bool,
     strict: bool,
@@ -795,6 +799,28 @@ pub fn run_edit(
     // the same bytes for its form table; the gate keeps the contract.
     parse_or_fail(&bytes, "file")?;
 
+    // Issue 41 (B): file-sourced PATCH text is resolved up front — the exit-4
+    // I/O envelope fires before target resolution (the payload must exist
+    // before the handle is chased), and the RESOLVED old text is what the
+    // issue-40 stale-handle recovery report reads (the bytes the agent saw,
+    // regardless of route). Inline-only modes keep their Option shapes; the
+    // resolved strings are only the patch's.
+    let (resolved_old, resolved_new): (Option<String>, Option<String>) = match mode {
+        Mode::Patch => (
+            match (old_text, old_text_file) {
+                (Some(t), _) => Some(t.clone()),
+                (None, Some(p)) => Some(read_text_file(p)?),
+                (None, None) => None,
+            },
+            match (new_text, new_text_file) {
+                (Some(t), _) => Some(t.clone()),
+                (None, Some(p)) => Some(read_text_file(p)?),
+                (None, None) => None,
+            },
+        ),
+        _ => (None, None),
+    };
+
     // Target (SPEC §5/§10.3): --handle for replace/patch/delete/
     // insert-before/insert-after; append and prepend are file-level and
     // take no target.
@@ -805,7 +831,7 @@ pub fn run_edit(
     // with a different form after a rename).
     let recovery = match mode {
         Mode::Patch => StaleRecovery {
-            old_text: old_text.as_deref(),
+            old_text: resolved_old.as_deref(),
             content: None,
             content_file: None,
         },
@@ -818,15 +844,15 @@ pub fn run_edit(
     };
     let (handle_node, handle_stripped) =
         resolve_edit_target(&bytes, mode, handle_opt, file, &recovery)?;
-    run_edit_op(
+    let outcome = run_edit_op(
         file,
         &bytes,
         had_bom,
         mode,
         content,
         content_file,
-        old_text,
-        new_text,
+        &resolved_old,
+        &resolved_new,
         handle_node,
         handle_stripped,
         dry_run,
@@ -834,8 +860,61 @@ pub fn run_edit(
         strict,
         repair,
         format_content,
-    )
-    .map(|o| o.output)
+    )?;
+
+    // Issue 41 (B): the content-provenance echo — an ADDITIVE result key on
+    // the single-op edit envelope (batch ops are inline-only and carry
+    // none): `contentSource` for the content modes (inline | stdin |
+    // path:…), `oldTextSource`/`newTextSource` for patch. clap's conflicts
+    // guarantee at most one route per field, so the match is total.
+    let mut output = outcome.output;
+    if let Some(result) = output.result.as_mut() {
+        if let Some(obj) = result.as_object_mut() {
+            match mode {
+                Mode::Patch => {
+                    obj.insert(
+                        "oldTextSource".to_string(),
+                        serde_json::Value::String(content_source_label(
+                            old_text.is_some(),
+                            old_text_file.as_ref(),
+                        )),
+                    );
+                    obj.insert(
+                        "newTextSource".to_string(),
+                        serde_json::Value::String(content_source_label(
+                            new_text.is_some(),
+                            new_text_file.as_ref(),
+                        )),
+                    );
+                }
+                Mode::Delete => {}
+                _ => {
+                    obj.insert(
+                        "contentSource".to_string(),
+                        serde_json::Value::String(content_source_label(
+                            content.is_some(),
+                            content_file.as_ref(),
+                        )),
+                    );
+                }
+            }
+        }
+    }
+    Ok(output)
+}
+
+/// The provenance label for a content route: `path:<display>` when the
+/// file route was taken, `inline` when the inline twin was (or, for a
+/// patch field, when nothing was read from a path), `stdin` when neither
+/// route was given and the content modes fall back to stdin.
+fn content_source_label(inline_given: bool, file: Option<&PathBuf>) -> String {
+    if let Some(p) = file {
+        format!("path:{}", p.display())
+    } else if inline_given {
+        "inline".to_string()
+    } else {
+        "stdin".to_string()
+    }
 }
 
 /// One fully-verified op, in memory. The shared per-op pipeline (issue 36):

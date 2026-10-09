@@ -98,15 +98,7 @@ pub fn read_content(
         return Ok(c.clone());
     }
     if let Some(p) = content_file {
-        return std::fs::read_to_string(p).map_err(|e| {
-            Fail(
-                errors::exit::IO,
-                ErrorBody::new(
-                    "io",
-                    format!("cannot read content file {}: {e}", p.display()),
-                ),
-            )
-        });
+        return read_text_file(p);
     }
     let mut buf = String::new();
     std::io::stdin().read_to_string(&mut buf).map_err(|e| {
@@ -117,6 +109,31 @@ pub fn read_content(
         )
     })?;
     Ok(buf)
+}
+
+/// Read a content/patch-text FILE source (issue 41 B): the file must exist
+/// and be valid UTF-8 (exit 4 `io` envelope on failure — a BOM or other
+/// invalid bytes surface as the honest UTF-8 error, not a silent strip).
+/// Bytes are taken verbatim (no trimming, no BOM stripping — content is
+/// content); the shared content pipeline (fence strip, edge trim, balance
+/// walk, write gate) applies exactly as it does to inline content.
+pub fn read_text_file(p: &Path) -> Result<String, Fail> {
+    let bytes = std::fs::read(p).map_err(|e| {
+        Fail(
+            errors::exit::IO,
+            ErrorBody::new("io", format!("cannot read content file {}: {e}", p.display())),
+        )
+    })?;
+    String::from_utf8(bytes).map_err(|e| {
+        Fail(
+            errors::exit::IO,
+            ErrorBody::new(
+                "io",
+                format!("content file {} is not valid UTF-8: {e}", p.display()),
+            )
+            .with_hint("the file is read verbatim (no BOM stripping) — fix the file and resubmit"),
+        )
+    })
 }
 
 struct Target {
