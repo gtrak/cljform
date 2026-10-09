@@ -329,6 +329,85 @@ fn innermost_named_containing(node: Node, offset: usize) -> Option<Node> {
     Some(node)
 }
 
+/// The leaf token stream of a successful parse (issue 40 A): every
+/// leaf node's text, trimmed, in document order. tree-sitter makes
+/// whitespace implicit (never a node), so two texts with the same token
+/// stream differ only in whitespace — and comments ARE nodes, so a
+/// comment change is a token difference, never "whitespace". None when
+/// the bytes do not parse (an unparseable text has no token stream, and
+/// no equality claim may be built on one).
+pub fn token_stream(bytes: &[u8]) -> Option<Vec<String>> {
+    leaf_tokens(bytes).map(|(_, texts)| texts)
+}
+
+/// The leaf tokens WITH their byte start offsets (issue 40 A): the
+/// `token_stream` data plus the per-token start offsets — ascending,
+/// because leaves come out of the tree in document order — so a node's
+/// own token stream is a contiguous range extractable by binary search
+/// from ONE file parse (never one parse per node).
+pub fn leaf_tokens(bytes: &[u8]) -> Option<(Vec<usize>, Vec<String>)> {
+    let owned = bytes.to_vec();
+    with_big_stack(move || leaf_tokens_inner(&owned))
+}
+
+fn leaf_tokens_inner(bytes: &[u8]) -> Option<(Vec<usize>, Vec<String>)> {
+    let mut parser = Parser::new();
+    // Fresh parser with no open tree: set_language cannot fail (see
+    // parse_inner).
+    #[allow(clippy::expect_used)]
+    parser
+        .set_language(&tree_sitter_clojure::LANGUAGE.into())
+        .expect("clojure grammar language");
+    let tree = parser.parse(bytes, None)?;
+    let root = tree.root_node();
+    if root.has_error() {
+        return None;
+    }
+    let mut starts: Vec<usize> = Vec::new();
+    let mut texts: Vec<String> = Vec::new();
+    // Iterative walk: a per-level recursive frame is what the deep-data
+    // risk is about; an explicit stack carries it instead.
+    let mut stack: Vec<Node> = Vec::new();
+    stack.push(root);
+    while let Some(node) = stack.pop() {
+        let children: Vec<Node> = {
+            let mut cursor = node.walk();
+            node.children(&mut cursor).collect()
+        };
+        if children.is_empty() {
+            let text = String::from_utf8_lossy(&bytes[node.start_byte()..node.end_byte()]);
+            let text = text.trim();
+            if !text.is_empty() {
+                starts.push(node.start_byte());
+                texts.push(text.to_string());
+            }
+        } else {
+            for child in children.into_iter().rev() {
+                stack.push(child);
+            }
+        }
+    }
+    Some((starts, texts))
+}
+
+/// True when the node spanning `n..m` bytes has exactly the token stream
+/// `expected` (issue 40 A: the verifiable basis for the "differs only in
+/// whitespace" claim and the non-def-like structural match). `starts` is
+/// ascending, so the node's tokens are a binary-search slice; the
+/// comparison is early-exiting (token count, then pairwise).
+pub fn node_tokens_equal(
+    starts: &[usize],
+    texts: &[String],
+    n: usize,
+    m: usize,
+    expected: &[String],
+) -> bool {
+    let lo = starts.partition_point(|&s| s < n);
+    let hi = starts.partition_point(|&s| s < m);
+    let slice = &texts[lo..hi];
+    slice.len() == expected.len() && slice.iter().zip(expected).all(|(a, b)| a == b)
+}
+
 /// Head symbol of a form node as written, including any `ns/` qualifier:
 /// the leading `sym_lit` child's text (`sym_name` + optional `/sym_name`).
 pub fn head_symbol(node: Node, bytes: &[u8]) -> Option<String> {

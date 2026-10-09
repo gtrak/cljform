@@ -166,6 +166,36 @@ pub(crate) fn tail_for(stack: &[Opener]) -> String {
         .collect()
 }
 
+/// Issue 40 (B): verify a mechanical tail with the REAL check — append it
+/// in memory and parse the result with the actual grammar. The stack walk
+/// proves the count, not the placement: a tail can balance the stack while
+/// the splice still leaves the file unparseable (an unterminated string
+/// that swallows the tail, a closer landing in the wrong region). That is
+/// exactly why the claim is verified, never tautological.
+pub fn tail_verifies(bytes: &[u8], tail: &str) -> bool {
+    let mut v = Vec::with_capacity(bytes.len() + tail.len());
+    v.extend_from_slice(bytes);
+    v.extend_from_slice(tail.as_bytes());
+    crate::parser::parse(&v).is_ok()
+}
+
+/// The verified-tail claim line, shared by the content-stage hint and the
+/// write-gate lead (issue 40 B): parses → `verified` + the standing loud
+/// caveat (never softened — parses-ok ≠ intended structure, and a tail
+/// that closes the wrong form early also parses); does not parse → the
+/// honest still-does-not-parse line. `target` names what was parsed
+/// ("content" at the content stage, "file" at the write gate) — the claim
+/// must name the real check's input.
+pub fn tail_verification_claim(bytes: &[u8], tail: &str, target: &str) -> String {
+    if tail_verifies(bytes, tail) {
+        format!(
+            "verified: with this tail {target} parses \u{2014} placement is yours to verify: parses-ok \u{2260} intended structure (a tail that closes the wrong form early also parses)"
+        )
+    } else {
+        format!("with this tail {target} still does not parse — check for a misplaced closer")
+    }
+}
+
 /// The one-sentence mismatch diagnosis, shared by the balance human line
 /// and the `edit` unbalanced-refusal hint (issue 39 wiring): closer char +
 /// line:col, and the innermost opener it failed to close (char + line:col,
@@ -610,5 +640,30 @@ mod tests {
         assert_eq!(append_pos("a\nb"), (2, 2));
         assert_eq!(append_pos("a\nb\n"), (3, 1));
         assert_eq!(tail_char_pos("a\nb", "  )", 2), (2, 4));
+    }
+
+    /// Issue 40 (B): the verified-tail claim is the REAL check — an actual
+    /// in-memory splice + parse of the result, never the walk's tautology.
+    /// Verified: the tail parses the spliced bytes; honest: a tail that
+    /// still does not parse (an unterminated regex swallows it) must say
+    /// so, and must never carry the verified claim or soften the caveat.
+    #[test]
+    fn tail_verification_claim_verified_and_honest() {
+        let ok = tail_verification_claim(b"(a (b", "))", "content");
+        assert!(ok.starts_with("verified: with this tail content parses"), "{ok}");
+        assert!(
+            ok.contains(
+                "placement is yours to verify: parses-ok \u{2260} intended structure (a tail that closes the wrong form early also parses)"
+            ),
+            "the loud caveat travels with the claim: {ok}"
+        );
+        // Honest: `(def r #"(( ` walks as one open paren; appending `)`
+        // leaves the regex unterminated — the result does not parse.
+        let bad = tail_verification_claim(b"(def r #\"(( ", ")", "file");
+        assert_eq!(
+            bad,
+            "with this tail file still does not parse \u{2014} check for a misplaced closer"
+        );
+        assert!(!bad.contains("verified:"), "{bad}");
     }
 }

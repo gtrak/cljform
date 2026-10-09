@@ -383,6 +383,15 @@ fn edit_hint_missing_tail_mechanical_facts() {
         ),
         "{hint}"
     );
+    // Issue 40 (B): the verified-tail claim — the tail is appended to the
+    // SUBMITTED content and the result parsed for real; here it parses,
+    // so the claim is `verified`, with the loud caveat traveling with it.
+    assert!(
+        hint.contains(
+            "verified: with this tail content parses \u{2014} placement is yours to verify: parses-ok \u{2260} intended structure (a tail that closes the wrong form early also parses)"
+        ),
+        "{hint}"
+    );
     assert!(hint.contains("--repair"), "{hint}");
     // The candidate display stays as-is (heuristic-labeled, opt-in).
     let msg = d["error"]["message"].as_str().unwrap();
@@ -471,7 +480,59 @@ fn write_gate_missing_tail_leads_content_side() {
     assert_eq!(d["error"]["col"].as_u64(), Some(1));
     let hint = d["error"]["hint"].as_str().unwrap();
     assert!(hint.starts_with("fix the submitted newText:"), "{hint}");
+    // Issue 40 (B) honest branch: the tail was computed on the SUBMITTED
+    // content, but the content sat in a splice window — appending `)]` to
+    // the resulting file's EOF does not parse (the `]` closes nothing
+    // there), so the claim says exactly that, never `verified`.
+    assert!(
+        msg.contains(
+            "with this tail file still does not parse \u{2014} check for a misplaced closer"
+        ),
+        "{msg}"
+    );
+    assert!(!msg.contains("verified:"), "{msg}");
     // Nothing written: the gate still refuses.
+    check_ok(&p);
+}
+
+/// Issue 40 (B) write-gate verified branch: the same missing-tail
+/// diagnosis where appending the tail to the RESULTING file's bytes
+/// parses (the spliced content's missing closers sit at the file's EOF):
+/// the claim is `verified` + the loud caveat.
+#[test]
+fn write_gate_missing_tail_verified_when_file_parses() {
+    let p = f("wg-tail-verified.clj");
+    let h = handle_of(&p, "target");
+    // The submitted newText misses two closers; the spliced file misses
+    // exactly those, at its EOF, so the tail lands and parses.
+    let new_text = "dec x\n  (let [y 1]\n    (inc y";
+    let (code, d, err) = edit_args(
+        &p,
+        Some("patch"),
+        Some(&h),
+        &[
+            "--old-text",
+            "inc x",
+            "--new-text",
+            new_text,
+        ],
+    );
+    assert_eq!(code, 1, "{d} {err}");
+    assert_eq!(d["error"]["code"], "parse-error");
+    let msg = d["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.starts_with(
+            "newText is missing 2 closer(s); mechanical tail (placement is yours to verify): ))"
+        ),
+        "{msg}"
+    );
+    assert!(
+        msg.contains(
+            "verified: with this tail file parses \u{2014} placement is yours to verify: parses-ok \u{2260} intended structure (a tail that closes the wrong form early also parses)"
+        ),
+        "{msg}"
+    );
+    assert!(msg.contains("file-level context: resulting file does not parse"), "{msg}");
     check_ok(&p);
 }
 

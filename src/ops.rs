@@ -171,9 +171,49 @@ fn resolve_target(forms: &[Form], name: &str) -> Result<Target, Fail> {
     }
 }
 
+/// The identity signal for the issue-40-A stale-handle recovery report —
+/// REPORT-ONLY: the refusal stays a refusal (the staleness refusal IS the
+/// freshness guard; nothing here retries the edit), the hint just re-gets
+/// the form for free (kills the re-tree→re-get loop). The hex handle is a
+/// one-way content hash — it names no form, so identity can only come
+/// from what the caller submitted with the call.
+pub struct StaleRecovery<'a> {
+    /// Patch mode: the submitted `--old-text` (the bytes the agent actually
+    /// saw — the strongest signal). Def-like needle → identity by var name;
+    /// otherwise a structural token-stream match against the current
+    /// forms. A fragment needle that does not cover a whole form has no
+    /// match and gets the plain message (honest, not a guess).
+    pub old_text: Option<&'a str>,
+    /// Replace mode: the submitted content (inline or file route). The
+    /// content is the NEW bytes — after a rename its name may collide with
+    /// a stranger — so it can ground a NEUTRAL candidate report only, never
+    /// an identity assertion.
+    pub content: Option<&'a String>,
+    pub content_file: Option<&'a PathBuf>,
+}
+
+impl StaleRecovery<'static> {
+    /// No identity signal (get, delete, insert, batch): the stale hint
+    /// carries the plain message only.
+    pub fn none() -> Self {
+        Self {
+            old_text: None,
+            content: None,
+            content_file: None,
+        }
+    }
+}
+
 /// Resolve a `tree` handle to its node (SPEC §10.3): content-addressed, so a
-/// moved form still resolves, but a changed or absent one refuses.
-pub fn resolve_handle(bytes: &[u8], h: &str, file: &Path) -> Result<handle::Node, Fail> {
+/// moved form still resolves, but a changed or absent one refuses. On the
+/// stale refusal the hint carries the issue-40-A recovery report built
+/// from `rec` (report-only — the refusal is never retried here).
+pub fn resolve_handle(
+    bytes: &[u8],
+    h: &str,
+    file: &Path,
+    rec: &StaleRecovery,
+) -> Result<handle::Node, Fail> {
     if h.len() < 6 {
         return Err(Fail(
             errors::exit::USAGE,
@@ -220,7 +260,7 @@ pub fn resolve_handle(bytes: &[u8], h: &str, file: &Path) -> Result<handle::Node
                             file.display()
                         ),
                     )
-                    .with_hint("re-run tree to get current handles"),
+                    .with_hint(stale_recovery_hint(bytes, &nodes, rec)),
                 )),
                 1 => resolve_at(&nodes, content_hits[0]),
                 _n => Err(Fail(
@@ -251,6 +291,150 @@ pub fn resolve_handle(bytes: &[u8], h: &str, file: &Path) -> Result<handle::Node
             ))
         }
     }
+}
+
+/// The `stale-handle` hint (issue 40 A): the recovery report. Re-tree is
+/// done — `nodes` IS the current file's node table — so this only matches
+/// the submitted identity signal against it. Verifiable facts only: the
+/// whitespace claim needs a token-stream equality, the candidate reports
+/// list what was actually found, and an unverifiable identity falls to the
+/// plain message. Never auto-retries, never softens the refusal.
+fn stale_recovery_hint(
+    bytes: &[u8],
+    nodes: &[handle::Node],
+    rec: &StaleRecovery,
+) -> String {
+    if let Some(old) = rec.old_text {
+        return stale_recovery_patch(bytes, nodes, old);
+    }
+    if rec.content.is_some() || rec.content_file.is_some() {
+        // Replace: the NEW content's def name — a neutral candidate report
+        // at best (a rename can point the name at a different form).
+        let inline: Option<String> = rec.content.cloned();
+        let file: Option<PathBuf> = rec.content_file.cloned();
+        if let Ok(text) = read_content(&inline, &file) {
+            if let Some(name) = single_form_def_name(&text) {
+                let cands: Vec<&handle::Node> = nodes
+                    .iter()
+                    .filter(|n| n.def_name.as_deref() == Some(name.as_str()))
+                    .collect();
+                if !cands.is_empty() {
+                    return format!(
+                        "forms named {name:?} in the current file: {} \u{2014} if this is the form you were editing, use that handle",
+                        candidate_spans(&cands)
+                    );
+                }
+            }
+        }
+    }
+    "no form matches the previous identity \u{2014} re-run tree".to_string()
+}
+
+/// The patch path: identity from `--old-text` — the bytes the agent saw.
+/// Def-like needle → match the current file by var name (duplicates →
+/// candidates, pick nothing); otherwise a structural match by token
+/// stream (oldText vs the current form's own bytes — the reformat case).
+fn stale_recovery_patch(bytes: &[u8], nodes: &[handle::Node], old: &str) -> String {
+    let old_tokens = parser::token_stream(old.as_bytes());
+    // Def-like needle: the identity is the var name.
+    if let Some(name) = single_form_def_name(old) {
+        let cands: Vec<&handle::Node> = nodes
+            .iter()
+            .filter(|n| n.def_name.as_deref() == Some(name.as_str()))
+            .collect();
+        return match cands.len() {
+            0 => "no form matches the previous identity \u{2014} re-run tree".to_string(),
+            1 => {
+                // The whitespace claim needs its own proof: token-stream
+                // equality between the submitted oldText and the current
+                // form's bytes (a name match alone does not verify it).
+                let claim = match (old_tokens.as_ref(), parser::leaf_tokens(bytes)) {
+                    (Some(t), Some((starts, texts))) => parser::node_tokens_equal(
+                        &starts,
+                        &texts,
+                        cands[0].start_byte,
+                        cands[0].end_byte,
+                        t,
+                    ),
+                    _ => false,
+                };
+                recovery_line(bytes, cands[0], claim)
+            }
+            _n => {
+                let spans = candidate_spans(&cands);
+                format!(
+                    "{} forms are named {name:?} in the current file \u{2014} {spans} (candidates; none picked \u{2014} run tree to choose one)",
+                    cands.len()
+                )
+            }
+        };
+    }
+    // Not def-like (or unparseable): structural match by token stream. A
+    // fragment needle that does not cover a whole form has no match — the
+    // plain message, never a guess.
+    let old_tokens = match old_tokens {
+        Some(t) => t,
+        None => return "no form matches the previous identity \u{2014} re-run tree".to_string(),
+    };
+    let leafs = match parser::leaf_tokens(bytes) {
+        Some(l) => l,
+        None => return "no form matches the previous identity \u{2014} re-run tree".to_string(),
+    };
+    let (starts, texts) = &leafs;
+    let cands: Vec<&handle::Node> = nodes
+        .iter()
+        .filter(|n| parser::node_tokens_equal(starts, texts, n.start_byte, n.end_byte, &old_tokens))
+        .collect();
+    match cands.len() {
+        0 => "no form matches the previous identity \u{2014} re-run tree".to_string(),
+        1 => recovery_line(bytes, cands[0], true), // token equality is the match itself
+        _n => {
+            let spans = candidate_spans(&cands);
+            format!(
+                "{} forms carry the same token stream as your oldText \u{2014} {spans} (candidates; none picked \u{2014} run tree to choose one)",
+                cands.len()
+            )
+        }
+    }
+}
+
+/// The unique-match recovery line: the new handle + the exact current bytes
+/// (the re-get for free), labeled by the form's head + var name when the
+/// current form carries them, plus the whitespace claim — fired ONLY when
+/// token-stream equality was verified.
+fn recovery_line(bytes: &[u8], node: &handle::Node, claim: bool) -> String {
+    let label = match (&node.head, &node.def_name) {
+        (Some(h), Some(n)) => format!(" ({h} {n})"),
+        (Some(h), None) => format!(" ({h})"),
+        (None, _) => String::new(),
+    };
+    let form = String::from_utf8_lossy(&bytes[node.start_byte..node.end_byte]);
+    let mut s = format!(
+        "this form is now \u{27E6}{}\u{27E7}{label} \u{2014} current bytes:\n{form}",
+        node.handle
+    );
+    if claim {
+        s.push_str(
+            "\nyour oldText differs only in whitespace (e.g. a formatter ran) \u{2014} copy the bytes above",
+        );
+    }
+    s
+}
+
+/// The candidate list with spans (the ambiguity report — nothing picked).
+fn candidate_spans(cands: &[&handle::Node]) -> String {
+    cands
+        .iter()
+        .map(|n| format!("\u{27E6}{}\u{27E7} lines {}\u{2013}{}", n.handle, n.line[0], n.line[1]))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The var name of a text that is exactly ONE def-like form, else None
+/// (multi-form or non-def-like text names nothing verifiable).
+fn single_form_def_name(text: &str) -> Option<String> {
+    let parsed = parser::parse(text.as_bytes()).ok()?;
+    (parsed.forms.len() == 1).then(|| parsed.forms[0].name.clone())?
 }
 
 /// Clone the node at `idx` and fill its position chain (issue 22: the
@@ -295,7 +479,7 @@ pub fn run_get(file: &Path, name: &Option<String>, handle: &Option<String>) -> R
         // view is the marker span itself; drop the glyphs, keep
         // the bare handle.
         let (bare, _extracted) = handle::bare_handle(h);
-        let node = resolve_handle(&bytes, &bare, file)?;
+        let node = resolve_handle(&bytes, &bare, file, &StaleRecovery::none())?;
         let form =
             String::from_utf8_lossy(&bytes[node.start_byte..node.end_byte]).to_string();
         let hash = hashutil::file_hash(&bytes[node.start_byte..node.end_byte]);

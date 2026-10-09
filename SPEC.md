@@ -291,6 +291,32 @@ matches; extend the prefix). A moved form still resolves; a changed or
 deleted one does not; there is no third outcome. `append`/`prepend` are
 file-level and take no target.
 
+**Stale-handle recovery report (issue 40 A, report-only):** the stale
+refusal is NEVER retried (the refusal is the freshness guard) — but the
+hint re-trees the CURRENT file in the same response and, when the
+submitted identity signal finds the form, re-gets it for free (kills the
+re-tree→re-get loop). The hex handle is a one-way content hash, so identity
+comes only from what the call submitted:
+- **patch** — from `--old-text` (the bytes the agent saw): def-like needle
+  → match by var name; otherwise a structural token-stream match of
+  oldText against the current form's own bytes (the reformat case). A
+  unique match reports `this form is now ⟦H⟧ (head name) — current bytes:
+  <exact current bytes>`; when oldText's token stream equals the current
+  form's, the hint adds `your oldText differs only in whitespace (e.g. a
+  formatter ran) — copy the bytes above` (token-stream equality is the
+  verified basis — unverified, the claim is OMITTED, never asserted).
+  Duplicate names report ALL candidates with spans and pick nothing; a
+  fragment needle that covers no whole form has no match.
+- **replace** — from the content's def name; the content is the NEW bytes,
+  so the report stays NEUTRAL (`forms named X in the current file: … — if
+  this is the form you were editing, use that handle`) — a rename can
+  point the name at a different form, and an identity assertion would be
+  unverifiable.
+- **get / delete / insert / batch** — no identity signal: the hint is the
+  plain message `no form matches the previous identity — re-run tree`.
+Nothing is written on any branch; the refusal, exit code, and message are
+unchanged.
+
 **Boundary check (the I2 extension for nested edits, §10.3):** the splice may
 only touch its window — the node's byte range for replace/patch/delete, the
 insert position for inserts. Prefix and suffix equality are verified after
@@ -434,6 +460,16 @@ the walker is provably panic-free (byte iteration and `pop()` only).
   is missing N closer(s); mechanical tail (placement is yours to verify):
   <tail>` line; mismatch → the line:col diagnosis); the inferred-candidate
   display stays as-is — repair stays opt-in and heuristic-labeled.
+  **Verified-tail claim (issue 40 B):** after computing the mechanical
+  tail, it is VERIFIED by an actual in-memory splice + parse of the
+  resulting bytes (content stage: submitted content + tail; write gate:
+  resulting file + tail — the real check, not the walk's tautology).
+  Parses → `verified: with this tail <content|file> parses` + the standing
+  loud caveat `placement is yours to verify: parses-ok ≠ intended
+  structure (a tail that closes the wrong form early also parses)` (never
+  softened); does not parse → the honest `with this tail <content|file>
+  still does not parse — check for a misplaced closer`. The claim never
+  auto-applies; the mismatch path never offers tails, as before.
 - `edit` resulting-file parse refusal (I1 write gate): the SAME walk runs
   on the submitted content (every mode that takes content) and its verdict
   LEADS the message — the field named, the exact mechanical tail
@@ -889,8 +925,9 @@ collection delimiter:
     check**: every byte outside the replaced range is unchanged (prefix and
     suffix equality), which is what covers nested edits inside a changed form;
   - **I3** form-count window.
-- Unknown or stale handle -> `stale-handle`, exit 3, nothing written, with a
-  "re-run `tree`" note.
+- Unknown or stale handle -> `stale-handle`, exit 3, nothing written, with
+  the issue-40-A recovery report in the hint (re-tree + re-get for free,
+  report-only, never retried; §4.3 stale-handle recovery report).
 - **In-edit reindent (issue 11):** for content modes (replace / insert-
   before / insert-after / append / prepend — never patch or delete), the
   prepared content is reindented with the `format` parinfer paren-mode pass

@@ -182,8 +182,15 @@ pub fn prepare_fail(p: content::PrepareError) -> Fail {
                 crate::balance::Walk::MissingTail { stack, .. } => {
                     let n = stack.len();
                     let tail = crate::balance::tail_for(&stack);
+                    // Issue 40 (B): the verified-tail claim — the tail is
+                    // appended to the SUBMITTED content and the result
+                    // parsed for real (the content is what would be spliced;
+                    // no file bytes exist at this gate, so the claim names
+                    // the content, not a file).
+                    let claim =
+                        crate::balance::tail_verification_claim(submitted.as_bytes(), &tail, "content");
                     format!(
-                        "content is missing {n} closer(s); mechanical tail (placement is yours to verify): {tail}"
+                        "content is missing {n} closer(s); mechanical tail (placement is yours to verify): {tail} \u{2014} {claim}"
                     )
                 }
                 crate::balance::Walk::Mismatch {

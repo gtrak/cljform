@@ -403,9 +403,14 @@ fn edit_handle_stale_is_refused() {
     assert_eq!(code, 3, "{d}");
     assert_eq!(d["error"]["code"], "stale-handle");
     assert!(d["error"]["message"].as_str().unwrap().contains(&f));
+    // Issue 40 (A): the stale hint carries the recovery report. This
+    // replace names `a` in its NEW content, and `def a 1` still exists —
+    // the neutral candidate report (never an identity assertion).
     assert!(
-        d["error"]["hint"].as_str().unwrap().contains("tree"),
-        "hint says re-run tree: {d}"
+        d["error"]["hint"].as_str().unwrap().starts_with(
+            "forms named \"a\" in the current file:"
+        ),
+        "neutral candidate report: {d}"
     );
     assert_eq!(std::fs::read(&f).unwrap(), before, "nothing written");
 }
@@ -1228,4 +1233,304 @@ fn nested_char_literal_stays_byte_identical() {
     let (scode, stripped, _serr) = run_bytes(&["strip"], Some(out.as_bytes()));
     assert_eq!(scode, 0);
     assert_eq!(&stripped[..], src, "round trip");
+}
+
+// ─── issue 40 (A): stale-handle recovery report (report-only) ─────────────
+//
+// On a stale-handle refusal the hint re-trees the CURRENT file and, when the
+// submitted identity signal can find the same form, reports the new handle +
+// the exact current bytes (the re-get for free). Verifiable facts only: the
+// whitespace claim needs a verified token-stream equality; an unverifiable
+// identity gets the plain message. Never auto-retries; nothing is written.
+// Report-only.
+
+const I40_SRC: &[u8] = b"(ns ex)\n\n(defn helper [x]\n  (let [q 5]\n    (+ x q)))\n";
+const I40_REFORMATTED: &str = "(ns ex)\n\n(defn helper [x]\n  (let [q 5]\n    (+ x\n       q)))\n";
+const I40_REFORMATTED_FORM: &str = "(defn helper [x]\n  (let [q 5]\n    (+ x\n       q)))";
+const I40_ORIG_FORM: &str = "(defn helper [x]\n  (let [q 5]\n    (+ x q)))";
+
+#[test]
+fn stale_handle_patch_recovery_reports_new_handle_and_bytes() {
+    // The formatter case: an external formatter re-indents the file, so the
+    // form's bytes (and handle) rotate while its token stream does not.
+    let f = fixture("i40-1.clj", I40_SRC);
+    let h = handle_at_full(&f, 3, 1); // the defn
+    std::fs::write(&f, I40_REFORMATTED).unwrap();
+    let h_new = handle_at_full(&f, 3, 1);
+    assert_ne!(h, h_new, "the reformat must rotate the handle");
+    let (code, d, _) = run_json(
+        &[
+            "edit",
+            &f,
+            "--handle",
+            &h,
+            "--mode",
+            "patch",
+            "--old-text",
+            I40_ORIG_FORM,
+            "--new-text",
+            "(+ x q)",
+            "--json",
+        ],
+        None,
+    );
+    assert_eq!(code, 3, "{d}");
+    assert_eq!(d["error"]["code"], "stale-handle");
+    let hint = d["error"]["hint"].as_str().unwrap();
+    // The re-get for free: new handle + the exact current bytes.
+    assert!(
+        hint.starts_with(&format!(
+            "this form is now \u{27E6}{h_new}\u{27E7} (defn helper) \u{2014} current bytes:\n{I40_REFORMATTED_FORM}"
+        )),
+        "{hint}"
+    );
+    // The whitespace claim: token-stream equality is its verified basis.
+    assert!(
+        hint.contains(
+            "your oldText differs only in whitespace (e.g. a formatter ran) \u{2014} copy the bytes above"
+        ),
+        "{hint}"
+    );
+    // Report-only: the refusal stands and nothing was written.
+    assert_eq!(
+        std::fs::read_to_string(&f).unwrap(),
+        I40_REFORMATTED,
+        "nothing written, no auto-retry"
+    );
+}
+
+#[test]
+fn stale_handle_patch_recovery_omits_claim_when_tokens_differ() {
+    // Out-of-band change altered the BODY (q 5 -> q 6): the name still
+    // matches, the recovery line stands, but the whitespace claim is
+    // unverifiable and must be omitted (never asserted).
+    let f = fixture("i40-2.clj", I40_SRC);
+    let h = handle_at_full(&f, 3, 1);
+    let mangled = "(ns ex)\n\n(defn helper [x]\n  (let [q 6]\n    (+ x\n       q)))\n";
+    std::fs::write(&f, mangled).unwrap();
+    let h_new = handle_at_full(&f, 3, 1);
+    let (code, d, _) = run_json(
+        &[
+            "edit",
+            &f,
+            "--handle",
+            &h,
+            "--mode",
+            "patch",
+            "--old-text",
+            I40_ORIG_FORM,
+            "--new-text",
+            "(+ x q)",
+            "--json",
+        ],
+        None,
+    );
+    assert_eq!(code, 3, "{d}");
+    assert_eq!(d["error"]["code"], "stale-handle");
+    let hint = d["error"]["hint"].as_str().unwrap();
+    assert!(
+        hint.starts_with(&format!(
+            "this form is now \u{27E6}{h_new}\u{27E7} (defn helper) \u{2014} current bytes:\n"
+        )),
+        "{hint}"
+    );
+    assert!(
+        !hint.contains("differs only in whitespace"),
+        "the claim fires only on verified token-stream equality: {hint}"
+    );
+}
+
+#[test]
+fn stale_handle_patch_recovery_structural_match_non_def_like() {
+    // Non-def-like needle (a whole-form `let` snippet): identity by token
+    // stream against the current form's own bytes — the reformat case.
+    let f = fixture(
+        "i40-3.clj",
+        b"(ns ex)\n\n(def result\n  (let [a 1 b 2]\n    (+ a b)))\n",
+    );
+    let h = handle_at_full(&f, 4, 2); // the nested let
+    std::fs::write(&f, "(ns ex)\n\n(def result\n  (let [a 1\n        b 2]\n    (+ a b)))\n").unwrap();
+    let h_new = handle_at_full(&f, 4, 2);
+    assert_ne!(h, h_new);
+    let (code, d, _) = run_json(
+        &[
+            "edit",
+            &f,
+            "--handle",
+            &h,
+            "--mode",
+            "patch",
+            "--old-text",
+            "(let [a 1 b 2]\n    (+ a b))",
+            "--new-text",
+            "(+ a b)",
+            "--json",
+        ],
+        None,
+    );
+    assert_eq!(code, 3, "{d}");
+    assert_eq!(d["error"]["code"], "stale-handle");
+    let hint = d["error"]["hint"].as_str().unwrap();
+    assert!(
+        hint.starts_with(&format!(
+            "this form is now \u{27E6}{h_new}\u{27E7} (let) \u{2014} current bytes:\n(let [a 1\n        b 2]\n    (+ a b))"
+        )),
+        "{hint}"
+    );
+    assert!(
+        hint.contains("your oldText differs only in whitespace"),
+        "token-stream equality IS the structural match, so the claim stands: {hint}"
+    );
+}
+
+#[test]
+fn stale_handle_deleted_form_plain_message() {
+    // The form is gone: no identity signal can match — the plain message,
+    // never a guess.
+    let f = fixture("i40-4.clj", b"(ns ex)\n\n(defn gone [] 1)\n\n(defn keep [] 2)\n");
+    let h = handle_at_full(&f, 3, 1); // the defn gone
+    let (code, _, stderr) = run_json(
+        &["edit", &f, "--handle", &h, "--mode", "delete", "--json"],
+        None,
+    );
+    assert_eq!(code, 0, "{stderr}");
+    let (code, d, _) = run_json(
+        &[
+            "edit",
+            &f,
+            "--handle",
+            &h,
+            "--mode",
+            "patch",
+            "--old-text",
+            "(defn gone [] 1)",
+            "--new-text",
+            "x",
+            "--json",
+        ],
+        None,
+    );
+    assert_eq!(code, 3, "{d}");
+    assert_eq!(d["error"]["code"], "stale-handle");
+    assert_eq!(
+        d["error"]["hint"].as_str().unwrap(),
+        "no form matches the previous identity \u{2014} re-run tree"
+    );
+}
+
+#[test]
+fn stale_handle_get_plain_message() {
+    // `get` carries no identity signal (the hex handle is one-way): the
+    // stale hint is the plain message.
+    let f = fixture("i40-5.clj", b"(ns ex)\n\n(defn a [] 1)\n");
+    let h = handle_at_full(&f, 3, 1);
+    std::fs::write(&f, "(ns ex)\n\n(defn a [] 2)\n").unwrap();
+    let (code, d, _) = run_json(&["get", &f, "--handle", &h, "--json"], None);
+    assert_eq!(code, 3, "{d}");
+    assert_eq!(d["error"]["code"], "stale-handle");
+    assert_eq!(
+        d["error"]["hint"].as_str().unwrap(),
+        "no form matches the previous identity \u{2014} re-run tree"
+    );
+}
+
+#[test]
+fn stale_handle_duplicate_names_report_candidates_pick_nothing() {
+    // def-likes with duplicate names: report ALL candidates with spans,
+    // pick nothing.
+    let f = fixture("i40-6.clj", b"(ns ex)\n\n(defn dup [] :one)\n\n(defn dup [] :two)\n");
+    let h = handle_at_full(&f, 3, 1);
+    // Reformat the FIRST dup out-of-band: its handle rotates.
+    std::fs::write(&f, "(ns ex)\n\n(defn dup []\n  :one)\n\n(defn dup [] :two)\n").unwrap();
+    let h1 = handle_at_full(&f, 3, 1);
+    let h2 = handle_at_full(&f, 6, 1);
+    assert_ne!(h, h1);
+    let (code, d, _) = run_json(
+        &[
+            "edit",
+            &f,
+            "--handle",
+            &h,
+            "--mode",
+            "patch",
+            "--old-text",
+            "(defn dup [] :one)",
+            "--new-text",
+            "x",
+            "--json",
+        ],
+        None,
+    );
+    assert_eq!(code, 3, "{d}");
+    assert_eq!(d["error"]["code"], "stale-handle");
+    let hint = d["error"]["hint"].as_str().unwrap();
+    assert!(
+        hint.starts_with("2 forms are named \"dup\" in the current file \u{2014} "),
+        "{hint}"
+    );
+    assert!(hint.contains(&format!("\u{27E6}{h1}\u{27E7} lines 3\u{2013}4")), "{hint}");
+    assert!(hint.contains(&format!("\u{27E6}{h2}\u{27E7} lines 6\u{2013}6")), "{hint}");
+    assert!(hint.contains("none picked"), "{hint}");
+    assert!(
+        !hint.contains("this form is now"),
+        "no candidate may be picked: {hint}"
+    );
+}
+
+#[test]
+fn stale_handle_replace_neutral_candidate_report() {
+    // replace: the content is the NEW bytes, so its def name can ground a
+    // NEUTRAL candidate report only — never the assertive "this form is
+    // now" line (a rename can point the name at a different form).
+    let f = fixture("i40-7.clj", I40_SRC);
+    let h = handle_at_full(&f, 3, 1);
+    std::fs::write(&f, I40_REFORMATTED).unwrap();
+    let h_new = handle_at_full(&f, 3, 1);
+    let (code, d, _) = run_json(
+        &[
+            "edit",
+            &f,
+            "--handle",
+            &h,
+            "--content",
+            "(defn helper [x]\n  (inc x))",
+            "--json",
+        ],
+        None,
+    );
+    assert_eq!(code, 3, "{d}");
+    assert_eq!(d["error"]["code"], "stale-handle");
+    let hint = d["error"]["hint"].as_str().unwrap();
+    assert!(
+        hint.starts_with(&format!(
+            "forms named \"helper\" in the current file: \u{27E6}{h_new}\u{27E7} lines 3\u{2013}6 \u{2014} if this is the form you were editing, use that handle"
+        )),
+        "{hint}"
+    );
+    assert!(
+        !hint.contains("this form is now"),
+        "replace must stay neutral: {hint}"
+    );
+}
+
+#[test]
+fn stale_handle_batch_plain_message() {
+    // Batch: the stale refusal names the op and carries the plain message
+    // (no payload-based recovery is wired into the batch path).
+    let f = fixture("i40-8.clj", I40_SRC);
+    let h = handle_at_full(&f, 3, 1);
+    std::fs::write(&f, I40_REFORMATTED).unwrap();
+    let ops = format!(
+        "[{{\"handle\":\"{h}\",\"mode\":\"patch\",\"oldText\":\"(defn helper [x]\",\"newText\":\"x\"}}]"
+    );
+    let batch = fixture("i40-8.json", ops.as_bytes());
+    let (code, d, _) = run_json(&["edit", &f, "--batch", &batch, "--json"], None);
+    assert_eq!(code, 3, "{d}");
+    assert_eq!(d["error"]["code"], "stale-handle");
+    let msg = d["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("op 1 of 1"), "{msg}");
+    assert_eq!(
+        d["error"]["hint"].as_str().unwrap(),
+        "no form matches the previous identity \u{2014} re-run tree"
+    );
 }

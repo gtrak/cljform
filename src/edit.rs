@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::Mode;
 use crate::errors::{self, ErrorBody, Fail, Output};
-use crate::ops::{parse_or_fail, read_content, read_file, resolve_handle, with_bom};
+use crate::ops::{parse_or_fail, read_content, read_file, resolve_handle, StaleRecovery, with_bom};
 use crate::content;
 use crate::format;
 use crate::handle;
@@ -48,6 +48,7 @@ fn resolve_edit_target(
     mode: Mode,
     handle_opt: &Option<String>,
     file: &Path,
+    recovery: &StaleRecovery,
 ) -> Result<(Option<handle::Node>, bool), Fail> {
     let mut handle_stripped = false;
     let handle_node: Option<handle::Node> = match handle_opt {
@@ -67,7 +68,7 @@ fn resolve_edit_target(
             if extracted {
                 handle_stripped = true;
             }
-            Some(resolve_handle(bytes, &bare, file)?)
+            Some(resolve_handle(bytes, &bare, file, recovery)?)
         }
         None if matches!(mode, Mode::Append | Mode::Prepend) => None,
         None => {
@@ -696,6 +697,7 @@ fn write_gate_enrich(
     content: &Option<String>,
     content_file: &Option<PathBuf>,
     new_text: &Option<String>,
+    new_bytes: &[u8],
 ) -> Fail {
     let Fail(exit, body) = fail;
     // Only the resulting-file parse layer qualifies: the other verify_edit
@@ -728,9 +730,18 @@ fn write_gate_enrich(
         crate::balance::Walk::MissingTail { stack, .. } => {
             let n = stack.len();
             let tail = crate::balance::tail_for(&stack);
+            // Issue 40 (B): the verified-tail claim — the tail is appended
+            // to the RESULTING file's bytes (in memory only) and the
+            // result parsed with the real grammar. The tail was computed
+            // on the SUBMITTED content, and the content sat in a splice
+            // window, so the EOF placement is the candidate, never a
+            // promise: a tail that closes the wrong form early also
+            // parses, and a tail the file's context already covers fails
+            // the parse. Both outcomes are reported as verified facts.
+            let claim = crate::balance::tail_verification_claim(new_bytes, &tail, "file");
             (
                 format!(
-                    "{field} is missing {n} closer(s); mechanical tail (placement is yours to verify): {tail}"
+                    "{field} is missing {n} closer(s); mechanical tail (placement is yours to verify): {tail} \u{2014} {claim}"
                 ),
                 format!(
                     "fix the submitted {field}: place the missing closers where they belong, then resubmit; cljform never writes to a file that does not parse"
@@ -787,8 +798,26 @@ pub fn run_edit(
     // Target (SPEC §5/§10.3): --handle for replace/patch/delete/
     // insert-before/insert-after; append and prepend are file-level and
     // take no target.
+    // Issue 40 (A): the stale-handle recovery signal (report-only): patch
+    // carries the submitted oldText (the bytes the agent saw — the
+    // strongest identity signal); replace carries the content route
+    // (neutral candidate report only — the new bytes' name can collide
+    // with a different form after a rename).
+    let recovery = match mode {
+        Mode::Patch => StaleRecovery {
+            old_text: old_text.as_deref(),
+            content: None,
+            content_file: None,
+        },
+        Mode::Replace => StaleRecovery {
+            old_text: None,
+            content: content.as_ref(),
+            content_file: content_file.as_ref(),
+        },
+        _ => StaleRecovery::none(),
+    };
     let (handle_node, handle_stripped) =
-        resolve_edit_target(&bytes, mode, handle_opt, file)?;
+        resolve_edit_target(&bytes, mode, handle_opt, file, &recovery)?;
     run_edit_op(
         file,
         &bytes,
@@ -1015,7 +1044,14 @@ pub(crate) fn run_edit_op(
     ) {
         Ok(ok) => ok,
         Err(fail) => {
-            return Err(write_gate_enrich(fail, &payload, content, content_file, new_text))
+            return Err(write_gate_enrich(
+                fail,
+                &payload,
+                content,
+                content_file,
+                new_text,
+                &new_bytes,
+            ))
         }
     };
 
@@ -1754,7 +1790,8 @@ pub fn run_batch_edit(
                     Some(n) => n.clone(),
                     None => {
                         let n =
-                            resolve_handle(&bytes, h, file).map_err(|f| wrap_op_error(f, i, &ops))?;
+                            resolve_handle(&bytes, h, file, &StaleRecovery::none())
+                                .map_err(|f| wrap_op_error(f, i, &ops))?;
                         cache.insert(h.clone(), n.clone());
                         n
                     }
@@ -2477,12 +2514,17 @@ mod tests {
     #[test]
     fn write_gate_prepared_missing_tail_names_content_field() {
         let submitted = "(defn f [x]\n  (dec x";
+        // The resulting file as the splice produced it (the content window
+        // is where the submitted content landed): appending the tail
+        // parses, so the claim is the verified one.
+        let new_bytes = b"(ns r)\n(defn f [x]\n  (dec x";
         let out = write_gate_enrich(
             resulting_file_fail(),
             &Some(prepared_payload()),
             &Some(submitted.to_string()),
             &None,
             &None,
+            new_bytes,
         );
         let body = &out.1;
         assert_eq!(body.code, "parse-error");
@@ -2492,6 +2534,19 @@ mod tests {
         assert!(
             body.message.starts_with(
                 "content is missing 2 closer(s); mechanical tail (placement is yours to verify): ))"
+            ),
+            "{}",
+            body.message
+        );
+        // Issue 40 (B): the verified-tail claim + the loud caveat.
+        assert!(
+            body.message.contains("verified: with this tail file parses"),
+            "{}",
+            body.message
+        );
+        assert!(
+            body.message.contains(
+                "placement is yours to verify: parses-ok \u{2260} intended structure (a tail that closes the wrong form early also parses)"
             ),
             "{}",
             body.message
@@ -2506,6 +2561,43 @@ mod tests {
         assert!(body.hint.as_deref().unwrap().starts_with("fix the submitted content:"));
     }
 
+    /// Issue 40 (B) honest branch: a tail that does NOT parse the resulting
+    /// file (an unterminated string swallows it) gets the still-does-not-
+    /// parse line — never the verified claim.
+    #[test]
+    fn write_gate_missing_tail_honest_when_tail_does_not_parse() {
+        let submitted = "(def f x \"((";
+        let new_bytes = b"(ns r)\n(def f x \"((";
+        let out = write_gate_enrich(
+            resulting_file_fail(),
+            &Some(prepared_payload()),
+            &Some(submitted.to_string()),
+            &None,
+            &None,
+            new_bytes,
+        );
+        let body = &out.1;
+        assert!(
+            body.message.starts_with(
+                "content is missing 1 closer(s); mechanical tail (placement is yours to verify): )"
+            ),
+            "{}",
+            body.message
+        );
+        assert!(
+            body.message.contains(
+                "with this tail file still does not parse \u{2014} check for a misplaced closer"
+            ),
+            "{}",
+            body.message
+        );
+        assert!(
+            !body.message.contains("verified:"),
+            "the verified claim must not fire when the parse fails: {}",
+            body.message
+        );
+    }
+
     #[test]
     fn write_gate_prepared_mismatch_leads_with_diagnosis() {
         // `(a [b\nc)` — a closer that is not the innermost opener's partner.
@@ -2516,11 +2608,12 @@ mod tests {
             &Some(submitted.to_string()),
             &None,
             &None,
+            b"(ns r)\n(a [b\nc)",
         );
         let body = &out.1;
         assert!(
             body.message.starts_with(
-                "content: mismatch at line 2 col 2: ) closes nothing — innermost open is [ from line 1 col 4; a misplaced closer cannot be fixed by a tail"
+                "content: mismatch at line 2 col 2: ) closes nothing \u{2014} innermost open is [ from line 1 col 4; a misplaced closer cannot be fixed by a tail"
             ),
             "{}",
             body.message
@@ -2544,6 +2637,7 @@ mod tests {
             &Some("\"x\"".to_string()),
             &None,
             &None,
+            b"(def s \"x\")",
         );
         assert_eq!(
             out.1.message,
@@ -2573,6 +2667,7 @@ mod tests {
             &Some("(defn f [x]\n  (dec x".to_string()),
             &None,
             &None,
+            b"",
         );
         assert_eq!(out.1.code, "shape-violation");
         assert!(out.1.message.starts_with("boundary check failed:"));
