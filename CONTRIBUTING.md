@@ -44,3 +44,15 @@ Panicking constructs are lint-denied; surviving sites carry written
 justifications. Release builds run with `overflow-checks = true`. SPEC.md
 is the contract — envelope shapes, the addressing model, and the safety
 invariants (I1–I6) are not advisory.
+
+## Third-party format references
+
+The `format` op ports two external formatters natively (no shared code):
+[parinfer-rust](https://github.com/eraserhd/parinfer-rust) (ISC; pinned
+checkout commit `1a0647d`) for the default paren-mode regime, and
+[cljfmt](https://github.com/weavejester/cljfmt) 0.16.6 (EPL-1.0, pinned
+commit `baab500`) for the `--fmt cljfmt` regime, whose node/zipper model
+mirrors [rewrite-clj](https://github.com/fenil/rewrite-clj) 1.2.50
+(Apache-2.0). Behavioral parity is pinned by the committed differential
+suite (`tests/cljfmt-diff/` + `scripts/cljfmt-diff.mjs`); provenance and
+the re-run recipe are in `tests/cljfmt-diff/manifest.edn`.

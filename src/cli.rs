@@ -6,6 +6,7 @@ use std::process::ExitCode;
 
 use clap::{Parser as ClapParser, Subcommand, ValueEnum};
 
+use crate::cljfmt;
 use crate::errors::{ErrorBody, Output};
 
 #[derive(ClapParser)]
@@ -150,6 +151,13 @@ pub enum Op {
     Format {
         /// File, or omit and read stdin.
         file: Option<PathBuf>,
+        /// Formatting regime (issue 43): `parinfer` (default — the
+        /// existing paren-mode reindent) or `cljfmt` (native port of
+        /// cljfmt 0.16.6's default-rule whitespace semantics). The
+        /// CLJFORM_FMT environment variable (cljfmt|parinfer) applies
+        /// when the flag is absent.
+        #[arg(long, value_enum)]
+        fmt: Option<cljfmt::FmtRegime>,
     },
     /// Annotated form view: the source with `⟦handle⟧` after each marked
     /// collection's opening delimiter, or the node table with --json.

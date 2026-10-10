@@ -1,0 +1,60 @@
+;; cljfmt-diff suite manifest (issue 43)
+;;
+;; Committed differential corpus for BOTH format regimes. The regression
+;; mode (tests/cljfmt-diff-regression.rs, in the default cargo suite) needs
+;; no external tool: it runs the cljform binary (built by cargo) and
+;; compares candidates byte-for-byte against the committed snapshots.
+;;
+;; Snapshots were generated on 2026-09-30 by:
+;;   cljfmt regime:  real cljfmt 0.16.6 (weavejester/cljfmt, EPL-1.0, pinned
+;;     commit baab5008032945434cbca23ef5eda516e3ea97b0) + rewrite-clj
+;;     1.2.50, via a clojure CLI probe:
+;;       (c/replace-newlines (c/normalize-newlines (c/reformat-string s {})) sep)
+;;     i.e. the documented `cljfmt fix` pipeline on the whole file.
+;;   parinfer regime: parinfer-rust (eraserhd/parinfer-rust local checkout,
+;;     commit 1a0647d "Add check mode"), paren mode via its JSON protocol:
+;;       parinfer-rust --input-format json --output-format text
+;;
+;; Re-run recipe (see also scripts/cljfmt-diff.mjs header):
+;;   1. cljfmt: `clojure -M -m cljfmt.tool` (or babashka with a deps.edn
+;;      pinning cljfmt "0.16.6") over each corpus file; or the probe
+;;      harness form above. Regenerate snapshots/cljfmt/*.
+;;   2. parinfer: `cargo build --release` in a parinfer-rust checkout and
+;;      run the JSON command above over each corpus file; regenerate
+;;      snapshots/parinfer/*.
+;;   3. Verify the reference tool still emits the committed bytes
+;;      (runner mode `snapshots` reports upstream drift — a finding, not
+;;      a cljform bug).
+;;
+;; Corpus provenance:
+;;   block-inner-basic .. let-destructure — synthetic rule fixtures
+;;     (block, inner, arg-align, nested, each whitespace transform,
+;;      CRLF, comments/strings/charlits/regex, reader macros, deep
+;;      nesting, the indents table incl. compojure + fuzzy patterns).
+;;   bench-ring-cookies.clj — ring-core 1.10.1
+;;     (https://github.com/ring-clojure/ring, MIT),
+;;     ring-core/src/ring/middleware/cookies.clj, verbatim from
+;;     bench/starter-src/ring.
+;;   bench-cljkondo-analysis.clj — clj-kondo 2025.x
+;;     (https://github.com/clj-kondo/clj-kondo, EPL-1.0),
+;;     src/clj_kondo/impl/analysis.clj, verbatim from
+;;     bench/starter-src/clj-kondo.
+{:generated "2026-09-30"
+ :references
+ {:cljfmt {:repo "https://github.com/weavejester/cljfmt"
+           :version "0.16.6"
+           :commit "baab5008032945434cbca23ef5eda516e3ea97b0"
+           :license "EPL-1.0"}
+  :parinfer-rust {:repo "https://github.com/eraserhd/parinfer-rust"
+                  :commit "1a0647d"
+                  :note "local checkout /home/gary/dev/parinfer-rust; installed binary ~/.cargo/bin/parinfer-rust"}}
+ :regimes
+ {:cljfmt {:status :live
+           :note "byte-equal bar; all 16 corpus files match"}
+  :parinfer {:status :live
+             :note "byte-equal bar modulo the enumerated divergence.edn entries"}}
+ :files
+ #{"comma-preserved" "block-inner-basic" "core-defs" "blank-lines-crlf" "letfn-nested"
+   "comments" "literals" "reader-macros" "deep-nesting" "indents-table"
+   "crlf" "whitespace-passes" "flow-forms" "let-destructure"
+   "bench-ring-cookies" "bench-cljkondo-analysis"}}

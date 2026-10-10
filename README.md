@@ -173,7 +173,7 @@ stays separate calls). Full contract: SPEC §10.3 (batch).
 | `check <file>` | Parse + form table + detector warnings (file or stdin) |
 | `materialize --content C` | Indent-mode bracket completion → candidate + diff, never writes |
 | `balance [file]` | Bracket-balance a fragment (read-only, stdin-first, `--tail T` tests a candidate tail): missing closers → the exact mechanical tail (strings/comments/charlits/regex don't count); a misplaced closer → a line:col diagnosis, no tail offered. Exit 0 balanced / 1 unbalanced or mismatch |
-| `format <file>` | Reindent like parinfer paren mode → candidate + diff, never writes |
+| `format <file>` | Reindent → candidate + diff, never writes. Two regimes: parinfer paren mode (default) and a native cljfmt 0.16.6 port (`--fmt cljfmt`, or `CLJFORM_FMT=cljfmt`) |
 | `strip` | Remove `⟦…⟧` markers → exact original bytes (pure filter, file or stdin) |
 
 `--json` works on every envelope op; `--human` (or a TTY) for the readable
@@ -251,13 +251,25 @@ ln -s "$PWD/extension/agents/clojure-worker.md"  ~/.pi/agent/agents/clojure-work
 
 ## Acknowledgements
 
-The `format` engine reimplements parinfer's paren-mode indentation
-semantics; the behavioral reference was
-[parinfer-rust](https://github.com/eraserhd/parinfer-rust) — Jason
-Felice's Rust implementation (ISC), carrying Shaun Lebron's original
-parinfer design. No code is shared —
-but if you want battle-tested parinfer as a library rather than a
-form-editing tool, use parinfer-rust.
+The `format` op has two regimes, each a native port (no shared code, no
+runtime dependency on the reference tool):
+
+- **parinfer regime (default):** reimplements parinfer's paren-mode
+  indentation semantics; the behavioral reference was
+  [parinfer-rust](https://github.com/eraserhd/parinfer-rust) — Jason
+  Felice's Rust implementation (ISC), carrying Shaun Lebron's original
+  parinfer design (pinned checkout: commit `1a0647d`). If you want
+  battle-tested parinfer as a library rather than a form-editing tool,
+  use parinfer-rust.
+- **cljfmt regime (`--fmt cljfmt`):** ports the default-rule pipeline of
+  [cljfmt](https://github.com/weavejester/cljfmt) 0.16.6
+  ([EPL-1.0](https://opensource.org/licenses/EPL-1.0), pinned at commit
+  `baab500`) over a node/zipper model mirroring
+  [rewrite-clj](https://github.com/fenil/rewrite-clj) 1.2.50
+  ([Apache-2.0](https://www.apache.org/licenses/LICENSE-2.0)). The pinned
+  rule tables (clojure / compojure / fuzzy) and the byte-exact
+  differential snapshots are committed under `tests/cljfmt-diff/`
+  (provenance: `tests/cljfmt-diff/manifest.edn`).
 
 ## Development
 

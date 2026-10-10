@@ -1,6 +1,6 @@
 # cljform — form-addressed Clojure editing: spec
 
-Status: **implemented (v2: handles, tree/strip, handle-only edit, patch mode, bounded repair, strict, clj_draft, format)** · Created: 2026-09-29
+Status: **implemented (v2: handles, tree/strip, handle-only edit, patch mode, bounded repair, strict, clj_draft, format, cljfmt regime)** · Created: 2026-09-29
 Shape: standalone Rust CLI (`cljform`) + pi extension wrapper (`clojure-forms`)
 
 ## 1. Problem
@@ -256,7 +256,7 @@ no derived summary that needs the cross-check, so only `get` drops it.
 | `check [file]` | parse + form table + nesting warnings | no | file or stdin |
 | `edit <file>` | whole-form / patch / insert / delete, handle-targeted (§5, §10.3) | yes | `--handle H` (append/prepend excepted), `--mode replace\|patch\|insert-after\|insert-before\|append\|prepend\|delete`, `--content` / `--content-file` / stdin (mutually exclusive with the inline twin, §4.1), `--old-text`/`--new-text` (patch) or `--old-text-file`/`--new-text-file` (patch, from a path — same exclusivity/UTF-8/verbatim contract, issue 41), `--strict`, `--repair`, `--dry-run`, `--format-content` / `--no-format-content` (content reindent, §10.3; default on) |
 | `materialize` | draft→candidate via indent mode (§4.4) | no | `--content` / `--content-file` / stdin; emits candidate + unified diff |
-| `format [file]` | parinfer paren-mode reindent, candidate-first (§10.5) | no | file or stdin |
+| `format [file]` | reindent, candidate-first (§10.5): two regimes — `parinfer` (default) and `cljfmt` (native port of the cljfmt 0.16.6 default-rule pipeline) | no | file or stdin; `--fmt cljfmt\|parinfer` (flag > `CLJFORM_FMT` env > default `parinfer`); envelope echoes `result.fmt` + `result.fmt_source` |
 | `balance [file]` | bracket-balance a fragment, read-only, stdin-first (§4.5): missing closers → the exact mechanical tail; misplaced closer → a line:col diagnosis (no tail offered) | no | file or `--stdin`; `--tail STRING` tests a candidate closing tail |
 
 **Content rule (edit):** content is normalized (markdown fences stripped,
@@ -1212,13 +1212,24 @@ given as a single span instead keeps its content, since the handle *is* the
 span's content. Values that are not a single well-formed span pass through
 unchanged (trimmed) and fail the usual handle checks.
 
-### 10.5 format (paren-mode reindent)
+### 10.5 format (two regimes: parinfer, cljfmt)
 
-Built. `format <file>` (or stdin) reindents the whole file the way
-parinfer's **paren mode** does — the only op that imposes a style on a whole
-file; the edit path reindents its submitted content with the same pass (by
-default; `--no-format-content` disables it, §10.3) and then base-shifts it.
-Adopted rules (reference: the local parinfer-rust
+Built. `format <file>` (or stdin) reindents the whole file — the only op that
+imposes a style on a whole file; the edit path reindents its submitted
+content with the same pass (by default; `--no-format-content` disables it,
+§10.3) and then base-shifts it.
+
+**Regime selection (issue 43).** `--fmt cljfmt|parinfer` selects the
+regime; the `CLJFORM_FMT` env var is the same knob for non-interactive
+drives. Precedence: flag > env > default (`parinfer`). An invalid env
+value is a usage error (exit 2, `invalid-fmt`). The envelope carries two
+additive keys: `result.fmt` (`"cljfmt"` | `"parinfer"`) and
+`result.fmt_source` (`"flag"` | `"env"` | `"default"`). Back-compat: no
+flag and no env var is byte-identical to the pre-issue-43 behavior
+(`--fmt parinfer` candidate-for-candidate).
+
+**Parinfer regime (default).** Reindents the way parinfer's **paren
+mode** does. Adopted rules (reference: the local parinfer-rust
 checkout's `src/parinfer.rs`, not added as a dependency):
 
 - at a line's first code character (not inside a string, comment, regex,
@@ -1236,8 +1247,27 @@ checkout's `src/parinfer.rs`, not added as a dependency):
   still carries content after the lift, is left alone;
 - comment lines, string interiors, and blank lines are left alone.
 
-Candidate-first: the result mirrors `materialize`'s shape
-(`candidate`, `diff`, `note`) and is never written. Verification before
+**Cljfmt regime (`--fmt cljfmt`).** A native Rust port of the
+cljfmt 0.16.6 default-rule pipeline (weavejester/cljfmt, EPL-1.0, pinned
+at commit baab500; the node/zipper model mirrors rewrite-clj 1.2.50,
+Apache-2.0 — no Clojure dependency, no code shared). Pipeline, in
+cljfmt's order: remove-consecutive-blank-lines →
+remove-surrounding-whitespace → insert-missing-whitespace → unindent →
+indent → remove-trailing-whitespace, over the pinned default indent
+table (clojure + compojure + fuzzy pattern rules). Indent is rule-driven
+(block / inner / arg-align, incl. depth-`n` inner rules and regex
+patterns like `^def(?!ault)(?!late)(?!er)`), and string/comment/regex/
+char-literal interiors are byte-faithful. Newline styles: only `\r\n`
+is normalized to `\n` before the pipeline (cljfmt's
+`normalize-newlines`); output restores the input's dominant separator
+(CRLF in → CRLF out; mixed → first separator wins). Documented
+divergences: no `:cljfmt.config` file support (flag/env selection only)
+and one `#_`-preceded-line indent edge case (pinned in
+`tests/cljfmt-diff/divergence.edn`, shapes excluded from the committed
+corpus).
+
+Candidate-first: both regimes mirror `materialize`'s shape
+(`candidate`, `diff`, `note`) and are never written. Verification before
 emission: the candidate must re-parse clean, and only whitespace and
 closing-delimiter positions may have changed. The gate is
 `format_preserves_tokens` (issue 14): the non-closer token stream is
@@ -1248,19 +1278,37 @@ lifted across a comment line reorders against the comment's bytes — a
 comment is not a token — and rejecting that reorder made comment-adjacent
 pull-ups `format-error` while the reference formatted them fine.
 
-**Differential gate:** `format_matches_parinfer_rust` runs both cljform and
-the installed parinfer-rust binary (`--input-format json --output-format
-text`, paren mode) over a fixture corpus (existing fixtures plus
-flat / over-indented / under-indented / nested / standalone-closer /
-comment-line / string-with-newline / regex / `#(...)`/`#{...}` / CRLF /
-tab cases) and asserts byte equality. The test skips (never fails) when
-the binary is absent, so the suite stays hermetic. The vacated-line
-shapes (standalone closer line, CRLF/tab variants, the closer-after-
-string line, and the two comment-adjacent pull-ups) are excluded from
-that byte-equality corpus and asserted instead by
-`format_vacated_lines_documented_divergence`, which pins both sides:
-parinfer-rust's exact output (vacated line kept) and cljform's (vacated
-line deleted).
+**Differential gates (issue 43).**
+- Parinfer: `format_matches_parinfer_rust` runs both cljform and the
+  installed parinfer-rust binary (`--input-format json --output-format
+  text`, paren mode) over a fixture corpus (existing fixtures plus
+  flat / over-indented / under-indented / nested / standalone-closer /
+  comment-line / string-with-newline / regex / `#(...)`/`#{...}` / CRLF /
+  tab cases) and asserts byte equality; it skips (never fails) when the
+  binary is absent, so the suite stays hermetic. The vacated-line
+  shapes (standalone closer line, CRLF/tab variants, the closer-after-
+  string line, and the two comment-adjacent pull-ups) are excluded from
+  that byte-equality corpus and asserted instead by
+  `format_vacated_lines_documented_divergence`, which pins both sides:
+  parinfer-rust's exact output (vacated line kept) and cljform's (vacated
+  line deleted).
+- Cljfmt: `tests/cljfmt-diff/` is the committed differential corpus (16
+  files: 14 synthetic rule fixtures covering block/inner/arg-align/nest/
+  every whitespace transform/CRLF/comments-and-literals/reader-macros/
+  the pinned indent table, plus two verbatim MIT/EPL bench files) with
+  byte-exact snapshots for BOTH regimes:
+  `snapshots/cljfmt/` (real cljfmt 0.16.6, pinned),
+  `snapshots/parinfer/` (parinfer-rust commit 1a0647d) and
+  `snapshots/parinner-ours/` goldens for the two enumerated parinfer
+  divergences. Provenance + re-run recipe: `manifest.edn`; the
+  intentional parinfer deviations: `divergence.edn`. The hermetic half
+  (cljform vs snapshots, no external tool) runs in the default cargo
+  suite as `tests/cljfmt-diff-regression.rs`; the live half
+  (three-way: cljform vs real cljfmt vs parinfer-rust, idempotence
+  probes, known-edge-case EXPECTED-DIFF reports, and an upstream-drift
+  check of the committed snapshots) is
+  `scripts/cljfmt-diff.mjs [--regression|--differential|--snapshots
+  |--all]` — serial, per-file verdicts, non-zero exit on any failure.
 
 ### 10.6 Deferred / out of scope
 

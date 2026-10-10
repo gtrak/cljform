@@ -11,6 +11,7 @@
 mod balance;
 mod broken;
 mod cli;
+mod cljfmt;
 mod content;
 mod edit;
 mod errors;
@@ -152,7 +153,29 @@ fn dispatch(cli: &Cli) -> Result<Output, Fail> {
         cli::Op::Get { file, name, handle } => ops::run_get(file, name, handle),
         cli::Op::Check { file } => ops::run_check(file),
         cli::Op::Materialize { content, content_file } => ops::run_materialize(content, content_file),
-        cli::Op::Format { file } => ops::run_format(file),
+        cli::Op::Format { file, fmt } => {
+            // Regime precedence: --fmt flag > CLJFORM_FMT env > parinfer default.
+            // An invalid CLJFORM_FMT value is a usage error (exit 2).
+            let env = std::env::var("CLJFORM_FMT").ok();
+            let fmt_flag: Option<cljfmt::FmtRegime> = *fmt;
+            let (fmt, fmt_source) = match (fmt_flag, env.as_deref()) {
+                (Some(f), _) => (Some(f), "flag"),
+                (None, Some("cljfmt")) => (Some(cljfmt::FmtRegime::Cljfmt), "env"),
+                (None, Some("parinfer")) => (Some(cljfmt::FmtRegime::Parinfer), "env"),
+                (None, Some(v)) => {
+                    return Err(Fail(
+                        errors::exit::USAGE,
+                        errors::ErrorBody::new(
+                            "invalid-fmt",
+                            format!("CLJFORM_FMT must be 'cljfmt' or 'parinfer', got '{v}'"),
+                        )
+                        .with_hint("unset CLJFORM_FMT or pass --fmt explicitly"),
+                    ))
+                }
+                (None, None) => (None, "default"),
+            };
+            ops::run_format(file, fmt, fmt_source)
+        }
         cli::Op::Edit {
             file,
             mode,

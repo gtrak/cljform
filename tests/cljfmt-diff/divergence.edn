@@ -1,0 +1,39 @@
+;; parinfer-regime divergence manifest (issue 43 §5)
+;;
+;; cljform's parinfer regime is reindent-only; byte-equality with
+;; parinfer-rust paren mode is the bar. Every INTENTIONAL deviation is
+;; enumerated here with its reason; the regression test compares those
+;; files against the committed `snapshots/parinfer-ours/` goldens
+;; instead of the raw parinfer snapshot. If an entry ever stops matching
+;; its golden, that is a regression, not a new divergence.
+;;
+;; An empty manifest would mean cljform's parinfer regime is
+;; byte-identical to parinfer-rust on the whole corpus; it is not, for
+;; the one documented reason below (vacated-line removal, SPEC §10.5 /
+;; issue 14). CRLF canonicality (issue 18) is NOT a divergence against
+;; the pinned parinfer-rust build (commit 1a0647d preserves the input's
+;; line-separator style, matching cljform) — verified at snapshot
+;; generation (manifest date).
+{:divergences
+ [{:file "block-inner-basic.clj"
+   :reason "vacated-line removal (SPEC §10.5, issue 14): `(def x 1\n  )`
+            pulls the closer up and cljform deletes the vacated line
+            where parinfer-rust leaves it whitespace-only."}
+  {:file "whitespace-passes.clj"
+   :reason "vacated-line removal (SPEC §10.5, issue 14): `(def z\n   4\n)`
+            vacates the closer's line; cljform deletes it, parinfer-rust
+            leaves a blank line."}]
+ :known-cljfmt-divergences
+ [{:shape "a form's element whose immediately preceding element is an
+            #_ (uneval) form, starting its own line, in an unindented
+            list"
+   :minimal-repro "(foo\n x\n (= a b)\n (conj :x)\n #_#_(= c d)\n (conj :y))\n"
+   :upstream "cljfmt 0.16.6 indents the element at margin(#_-form)+2"
+   :cljform "cljform indents it by the list-indent rule (second-element
+            margin)"
+   :status "recorded edge-case decision; such shapes are excluded from the
+            differential corpus (bench files containing them are listed
+            in the report, not in the committed corpus)"
+   :affected-bench-files #{"analysis/java.clj" "impl/analyzer.clj"}
+   :note "revisit if cljfmt upstream changes; repro via the probe
+          harness in the report"}]}

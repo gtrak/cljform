@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use crate::broken;
+use crate::cljfmt;
 use crate::cli::{self, Cli};
 use crate::content;
 use crate::errors::{self, ErrorBody, Fail, Output};
@@ -1441,13 +1442,13 @@ fn enclosing_label(n: &handle::Node) -> String {
     }
 }
 
-/// `cljform format [file]` (issue 06): parinfer paren-mode reindent.
-/// Candidate-first — mirrors `materialize`'s result shape
-/// (`candidate`, `diff`, `note`) and never writes. The candidate must
-/// re-parse clean and pass the token gate (whitespace + closer positions
-/// only, `format_preserves_tokens`, §10.5); anything less is a
-/// `format-error` (exit 1) and is never emitted.
-pub fn run_format(file: &Option<PathBuf>) -> Result<Output, Fail> {
+/// `cljform format [file] [--fmt cljfmt|parinfer]` (issues 06, 43):
+/// reindent in the selected regime. Candidate-first — mirrors
+/// `materialize`'s result shape (`candidate`, `diff`, `note`) and never
+/// writes. The candidate must re-parse clean and pass the token gate
+/// (whitespace + closer positions only, `format_preserves_tokens`, §10.5);
+/// anything less is a `format-error` (exit 1) and is never emitted.
+pub fn run_format(file: &Option<PathBuf>, fmt: Option<cljfmt::FmtRegime>, fmt_source: &str) -> Result<Output, Fail> {
     let (raw, file_path) = match file {
         Some(p) => {
             let (bytes, _bom) = read_file(p)?;
@@ -1464,15 +1465,30 @@ pub fn run_format(file: &Option<PathBuf>) -> Result<Output, Fail> {
     if raw.trim().is_empty() {
         return Err(Fail(errors::exit::PARSE, ErrorBody::new("format-error", "input is empty")));
     }
-    // The input must parse clean: format reindents code, it does not repair
-    // structure (that is `materialize`'s job).
-    parse_or_fail(raw.as_bytes(), "input")?;
-    let candidate = format::format_paren(&raw)
-        .map_err(|e| Fail(errors::exit::PARSE, errors::positional_body("format-error", e.line, e.col, e.message)))?;
-    // Verification gates: re-parse clean + the token gate (SPEC §10.5):
-    // only whitespace and closing-delimiter positions may change, and a
-    // lifted closer may reorder against comment bytes (comments are not
-    // tokens) without tripping it.
+    match fmt.unwrap_or(cljfmt::FmtRegime::Parinfer) {
+        cljfmt::FmtRegime::Parinfer => {
+            // The input must parse clean: format reindents code, it does not
+            // repair structure (that is `materialize`'s job).
+            parse_or_fail(raw.as_bytes(), "input")?;
+            let candidate = format::format_paren(&raw)
+                .map_err(|e| Fail(errors::exit::PARSE, errors::positional_body("format-error", e.line, e.col, e.message)))?;
+            gates_and_envelope(raw, file_path, candidate, "parinfer", fmt_source, "parinfer paren-mode")
+        }
+        cljfmt::FmtRegime::Cljfmt => {
+            // The cljfmt engine parses the input itself; a reader error is a
+            // format-error (exit 1), never a silent fallback.
+            let candidate = cljfmt::format_cljfmt(&raw)
+                .map_err(|e| Fail(errors::exit::PARSE, errors::positional_body("format-error", e.line, e.col, e.message)))?;
+            gates_and_envelope(raw, file_path, candidate, "cljfmt", fmt_source, "cljfmt default rules")
+        }
+    }
+}
+
+/// The candidate verification gates shared by both regimes (SPEC §10.5):
+/// the candidate re-parses clean and its token stream is unchanged (only
+/// whitespace and closing-delimiter positions may move). Then the
+/// candidate-first envelope (candidate + diff + note; never writes).
+fn gates_and_envelope(raw: String, file_path: Option<String>, candidate: String, fmt: &str, fmt_source: &str, regime: &str) -> Result<Output, Fail> {
     if let Err(e) = parser::parse(candidate.as_bytes()) {
         return Err(Fail(
             errors::exit::PARSE,
@@ -1492,9 +1508,11 @@ pub fn run_format(file: &Option<PathBuf>) -> Result<Output, Fail> {
     }
     let diff = materialize::unified_diff(&raw, &candidate, "input", "candidate");
     let note = if candidate == raw {
-        "already formatted (parinfer paren-mode); candidate is unchanged — not written"
+        format!("already formatted ({regime}); candidate is unchanged — not written")
     } else {
-        "candidate reformatted to parinfer paren-mode indentation; token stream verified unchanged — not written"
+        format!(
+            "candidate reformatted to {regime} indentation; token stream verified unchanged — not written"
+        )
     };
     Ok(
         Output::ok("format")
@@ -1504,6 +1522,8 @@ pub fn run_format(file: &Option<PathBuf>) -> Result<Output, Fail> {
                 "candidate": candidate,
                 "diff": diff,
                 "note": note,
+                "fmt": fmt,
+                "fmt_source": fmt_source,
             })),
     )
 }
