@@ -580,10 +580,11 @@ fn write_gate_mismatch_leads_content_side() {
     check_ok(&p);
 }
 
-/// No behavior change when the content BALANCES but the parse fails for
-/// other reasons (here: the splice splits the string state) — the walker
-/// simply reports balanced and the file-level message stands alone,
-/// byte-identical to the pre-follow-up refusal.
+/// No CONTENT-SIDE behavior change when the content BALANCES but the
+/// parse fails for other reasons (here: the splice splits the string
+/// state) — the content verdict does not lead and the file-level message
+/// stands (issue 39 follow-up; issue 44 then layers the FILE-level
+/// refusal itself on unclosed kinds — see the assertions below).
 #[test]
 fn write_gate_balanced_content_keeps_file_level_message() {
     let p = fixture("wg-bal.clj", b"(def s \"hello\")\n");
@@ -598,9 +599,36 @@ fn write_gate_balanced_content_keeps_file_level_message() {
     );
     assert_eq!(code, 1, "{d} {err}");
     let msg = d["error"]["message"].as_str().unwrap();
-    assert!(msg.starts_with("resulting file does not parse: "), "unchanged: {msg}");
+    // Issue 44 layering: the resulting file fails as an unclosed kind (the
+    // unterminated string swallows the form's closer, so the walker sees
+    // the `(` open at EOF) and the FILE-level refusal leads with the
+    // enriched diagnosis — the raw parser message demoted to context. The
+    // content verdict still does not lead (balanced content, zero relative
+    // delta: the issue-39 pass-through this test pins).
+    assert!(
+        msg.starts_with("unclosed at EOF (innermost first):"),
+        "the file-level diagnosis leads (no content verdict): {msg}"
+    );
+    assert!(msg.contains("the file is missing 1 closer"), "{msg}");
+    assert!(
+        msg.contains("resulting file does not parse: unclosed open-paren (form reaches end of file) @ line 1 col "),
+        "the raw parser message is the demoted context: {msg}"
+    );
+    // The issue-44 envelope keys carry the file-level facts (the string
+    // swallowed the closer — the unclosed stack is the def's `(`).
     assert_eq!(
-        d["error"]["hint"].as_str().unwrap(),
+        d["error"]["unclosed"],
+        serde_json::json!([{ "char": "(", "line": 1, "col": 1, "sourceLine": "(def s \"x\"\")" }])
+    );
+    assert_eq!(
+        d["error"]["missing"],
+        serde_json::json!({ "total": 1, "paren": 1, "bracket": 0, "brace": 0 })
+    );
+    assert_eq!(d["error"]["swallowSpan"], serde_json::json!([1, 1]));
+    assert!(d["error"].get("likelySwallowed").is_none(), "{d}");
+    let hint = d["error"]["hint"].as_str().unwrap();
+    assert_eq!(
+        hint,
         "fix the bracket structure first; cljform never writes to a file that does not parse"
     );
     check_ok(&p);

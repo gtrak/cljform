@@ -17,6 +17,7 @@
 use serde::Serialize;
 use serde::ser::SerializeMap;
 
+use crate::balance;
 use crate::errors::{self, ErrorBody, Fail};
 use crate::parser;
 
@@ -24,10 +25,15 @@ use crate::parser;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Diagnostic {
     /// A tree-sitter ERROR/MISSING region: (start line, end line) plus the
-    /// parser's message for the region.
+    /// parser's message for the region. `unclosed` (issue 44) carries the
+    /// unclosed-form diagnosis on the FIRST parse-error row when the
+    /// failure is an unclosed/EOF kind — the recover view's diagnostics
+    /// section carries the same facts the parse-error envelope's additive
+    /// keys carry; None on every other row (its JSON shape is unchanged).
     ParseError {
         span: (usize, usize),
         message: String,
+        unclosed: Option<UnclosedDiagnosis>,
     },
     /// A git conflict region: the marker-anchored line spans of its sides.
     /// `base` exists for diff3 conflicts only. `malformed` marks regions the
@@ -101,11 +107,19 @@ impl Diagnostic {
     /// guard hook renders the same shape in TS):
     /// `parse error lines 7–9: unclosed open-paren (…)` and
     /// `conflict region lines 30–41 (head lines 28–32 · base lines 33–35 ·
-    /// incoming lines 36–41)`.
+    /// incoming lines 36–41)`. The issue-44 unclosed-form diagnosis rides
+    /// UNDER the parse-error row (an indented continuation line), never on
+    /// the row itself.
     pub fn human_line(&self) -> String {
         match self {
-            Diagnostic::ParseError { span, message } => {
-                format!("parse error {}: {}", line_span(span), message)
+            Diagnostic::ParseError { span, message, unclosed } => {
+                let mut s = format!("parse error {}: {}", line_span(span), message);
+                if let Some(d) = unclosed {
+                    s.push('\n');
+                    s.push_str("    ");
+                    s.push_str(&d.lead());
+                }
+                s
             }
             Diagnostic::ConflictRegion {
                 head, base, incoming, malformed,
@@ -290,15 +304,329 @@ fn standalone(ch: char, line: usize) -> Diagnostic {
 
 /// The ParseError's FULL ERROR/MISSING list as ParseError diagnostics
 /// (issue 31: ALL spans, not just the first — the gate's `diagnostics`
-/// field and the recover view's parse-error rows).
+/// field and the recover view's parse-error rows). The issue-44
+/// unclosed-form diagnosis is NOT collected here: the parse-error envelope
+/// carries it as its own additive keys, and the recover view attaches it to
+/// the first row via `Broken::attach_unclosed` (which needs the bytes).
 pub fn collect_parse_diagnostics(e: &parser::ParseError) -> Vec<Diagnostic> {
     e.diagnostics
         .iter()
         .map(|d| Diagnostic::ParseError {
             span: (d.line, d.end_line),
             message: d.message.clone(),
+            unclosed: None,
         })
         .collect()
+}
+
+// ─── issue 44: the unclosed-form diagnosis ─────────────────────────────────
+
+/// One unclosed delimiter of the balance walk's EOF stack: the opener's
+/// char + 1-based line/col + the verbatim source line it sits on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnclosedOpener {
+    pub char: char,
+    pub line: usize,
+    pub col: usize,
+    #[serde(rename = "sourceLine")]
+    pub source_line: String,
+}
+
+/// The missing-closer count, broken out by delimiter type: `total` is the
+/// EOF stack's depth (issue 44: "stack depth"), `paren`/`bracket`/`brace`
+/// the per-type breakdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct MissingClose {
+    pub total: usize,
+    pub paren: usize,
+    pub bracket: usize,
+    pub brace: usize,
+}
+
+/// One likely-swallowed form: a column-1 `(` line in the post-break region
+/// (a LOOKS-LIKE structural observation — it is not a parsed fact: the
+/// broken region is one form to the parser, so these lines' forms are not
+/// individually addressable).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LikelySwallowed {
+    pub line: usize,
+    pub preview: String,
+}
+
+/// The unclosed-form diagnosis (issue 44): everything the balance walk's
+/// EOF stack yields for an unclosed-delimiter / unexpected-EOF parse error
+/// — the stack (INNERMOST FIRST), the missing-closer count, the swallow
+/// span (outermost unclosed opener → EOF: everything in it is currently
+/// read as one form), and the likely-swallowed top-level-looking forms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnclosedDiagnosis {
+    pub unclosed: Vec<UnclosedOpener>,
+    pub missing: MissingClose,
+    /// 1-based inclusive: [outermost unclosed opener's line, file's last
+    /// line].
+    pub swallow_span: (usize, usize),
+    /// Empty when the post-break region has no column-1 `(` lines.
+    pub likely_swallowed: Vec<LikelySwallowed>,
+}
+
+/// Run the unclosed-form diagnosis on `bytes` when the parse failure is an
+/// unclosed/EOF kind AND the balance walk (issue 39's machinery — the full
+/// stack walk, never aborts) confirms openers remain at EOF. None
+/// otherwise: a mismatched closer is NOT an unclosed kind (the walk aborts
+/// at the stray closer, its existing path is unchanged), and a balanced
+/// walk (an unterminated top-level string, say) has no unclosed stack to
+/// report. Non-UTF-8 input cannot be walked faithfully and stays raw.
+pub fn unclosed_diagnosis(
+    bytes: &[u8],
+    parse_err: &parser::ParseError,
+) -> Option<UnclosedDiagnosis> {
+    // The first-error message is the kind gate: every unclosed/EOF kind
+    // the parser reports starts with "unclosed"; a mismatched closer
+    // reports "unexpected token …" and never qualifies.
+    if !parse_err.message.starts_with("unclosed") {
+        return None;
+    }
+    let text = std::str::from_utf8(bytes).ok()?;
+    let lines: Vec<&str> = text.split('\n').collect();
+    let balance::Walk::MissingTail { stack, .. } = balance::walk(text) else {
+        return None;
+    };
+    // The walk pushes in open order (bottom first): the LAST entry is the
+    // innermost, the FIRST the outermost.
+    let unclosed = stack
+        .iter()
+        .rev()
+        .map(|o| UnclosedOpener {
+            char: o.ch as char,
+            line: o.line,
+            col: o.col,
+            source_line: lines[o.line - 1].to_string(),
+        })
+        .collect();
+    let mut missing = MissingClose {
+        total: stack.len(),
+        paren: 0,
+        bracket: 0,
+        brace: 0,
+    };
+    for o in &stack {
+        match o.ch {
+            b'(' => missing.paren += 1,
+            b'[' => missing.bracket += 1,
+            _ => missing.brace += 1,
+        }
+    }
+    // The outermost unclosed opener opens the broken region: everything
+    // from its line to EOF is currently inside this form. (The stack is
+    // guaranteed non-empty by MissingTail — the missing closer(s) ARE
+    // the open stack.)
+    let outermost = stack.first()?;
+    let last_line = last_line_of(text);
+    let likely_swallowed = likely_swallowed_lines(&lines, outermost.line, last_line);
+    Some(UnclosedDiagnosis {
+        unclosed,
+        missing,
+        swallow_span: (outermost.line, last_line),
+        likely_swallowed,
+    })
+}
+
+/// 1-based last content line of `text` (1 for the empty text; a trailing
+/// newline does not start a line) — the same counting the ops' file-last-
+/// line helper uses.
+fn last_line_of(text: &str) -> usize {
+    let n = text.split('\n').count();
+    if text.ends_with('\n') {
+        n - 1
+    } else {
+        n
+    }
+}
+
+/// The likely-swallowed scan (issue 44): column-1 `(` lines strictly AFTER
+/// the outermost unclosed opener's line, through the file's last line. The
+/// broken form's own opener line is excluded (it IS the swallow span's
+/// start), and a column-1 `(` inside an intact multi-line form before the
+/// break can never qualify (it predates the outermost opener). LOOKS-LIKE,
+/// by construction: a line inside an unterminated string or the like still
+/// counts — the phrasing says so, never asserts it.
+fn likely_swallowed_lines(lines: &[&str], after_line: usize, last_line: usize) -> Vec<LikelySwallowed> {
+    lines
+        .iter()
+        .enumerate()
+        .filter(|&(i, l)| i + 1 > after_line && i < last_line && l.starts_with('('))
+        .map(|(i, l)| LikelySwallowed {
+            line: i + 1,
+            preview: line_preview(l),
+        })
+        .collect()
+}
+
+/// The envelope preview of one line: trailing whitespace trimmed, capped
+/// at 80 chars (a long continuation is not a preview; the cap is char-safe
+/// for the verbatim line's UTF-8).
+fn line_preview(line: &str) -> String {
+    let t = line.trim_end();
+    if t.chars().count() <= 80 {
+        t.to_string()
+    } else {
+        format!("{}…", t.chars().take(79).collect::<String>())
+    }
+}
+
+impl UnclosedDiagnosis {
+    /// The human LEAD (the enriched diagnosis that leads the parse-error
+    /// message, with the raw parser message demoted to context — issue 39's
+    /// layering pattern, and the recover view's diagnostics continuation
+    /// line): the unclosed stack (innermost first, each with char +
+    /// line:col + the opener line's verbatim prefix; def-like heads get
+    /// named from the opener line when cheap — the line's own text says it
+    /// for free), the missing-closer count (delimiters broken out when
+    /// mixed), the swallow span, and the looks-like swallowed-forms list
+    /// (omitted when the region has no top-level-looking openers).
+    pub fn lead(&self) -> String {
+        let parts = [
+            self.stack_clause(),
+            self.missing_clause(),
+            self.swallow_clause(),
+        ];
+        parts.join("; ")
+    }
+
+    /// `unclosed at EOF (innermost first): `(let` at line 10 col 3 —
+    /// inside `(defn f4 [x]` at line 9 col 1` (one entry: no `— inside`
+    /// tail).
+    fn stack_clause(&self) -> String {
+        let mut s = String::from("unclosed at EOF (innermost first): ");
+        let mut first = true;
+        for u in &self.unclosed {
+            if first {
+                first = false;
+            } else {
+                s.push_str(" — inside ");
+            }
+            s.push_str(&format!(
+                "`{}` at line {} col {}",
+                Self::opener_label(&u.source_line, u.col),
+                u.line,
+                u.col
+            ));
+        }
+        s
+    }
+
+    /// `the file is missing 1 closer` (stack depth); when the missing
+    /// closers are MIXED across delimiter types the breakdown follows:
+    /// `the file is missing 2 closers (1 paren, 1 bracket)`.
+    fn missing_clause(&self) -> String {
+        let n = self.missing.total;
+        let mut s = if n == 1 {
+            "the file is missing 1 closer".to_string()
+        } else {
+            format!("the file is missing {n} closers")
+        };
+        let kinds = (self.missing.paren > 0) as usize
+            + (self.missing.bracket > 0) as usize
+            + (self.missing.brace > 0) as usize;
+        if kinds > 1 {
+            let mut parts: Vec<String> = Vec::new();
+            let term = |n: usize, word: &str, plural: &str| {
+                if n == 1 {
+                    format!("1 {word}")
+                } else {
+                    format!("{n} {plural}")
+                }
+            };
+            if self.missing.paren > 0 {
+                parts.push(term(self.missing.paren, "paren", "parens"));
+            }
+            if self.missing.bracket > 0 {
+                parts.push(term(self.missing.bracket, "bracket", "brackets"));
+            }
+            if self.missing.brace > 0 {
+                parts.push(term(self.missing.brace, "brace", "braces"));
+            }
+            s.push_str(&format!(" ({})", parts.join(", ")));
+        }
+        s
+    }
+
+    /// `everything from line 9 to EOF is currently inside this form` —
+    /// plus, when the post-break region has top-level-looking openers, the
+    /// looks-like swallowed list: `f5 (line 14) and f6 (line 16) look like
+    /// top-level forms being swallowed by it (a structural observation,
+    /// not a parsed fact)`.
+    fn swallow_clause(&self) -> String {
+        let (a, _b) = self.swallow_span;
+        let mut s = format!("everything from line {a} to EOF is currently inside this form");
+        if !self.likely_swallowed.is_empty() {
+            let labels: Vec<String> = self
+                .likely_swallowed
+                .iter()
+                .map(|l| format!("{} (line {})", Self::likely_label(&l.preview), l.line))
+                .collect();
+            let verb = if labels.len() == 1 {
+                "looks like a top-level form being swallowed by it"
+            } else {
+                "look like top-level forms being swallowed by it"
+            };
+            s.push_str(&format!(
+                " — {} {verb} (a structural observation, not a parsed fact)",
+                join_and(&labels)
+            ));
+        }
+        s
+    }
+
+    /// The opener line's text from the opener's column to end of line
+    /// (trimmed, capped): `(let` for a lone `(let` line, `(defn f4 [x]` for
+    /// the repro — the verbatim prefix names def-like heads for free.
+    fn opener_label(source_line: &str, col: usize) -> String {
+        // The opener is an ASCII delimiter at byte index col-1, which is a
+        // char boundary; col is 1-based.
+        let rest = source_line.get(col.saturating_sub(1)..).unwrap_or("");
+        let t = rest.trim_end();
+        if t.chars().count() <= 80 {
+            t.to_string()
+        } else {
+            format!("{}…", t.chars().take(79).collect::<String>())
+        }
+    }
+
+    /// The def-like name (or head) of a likely-swallowed line, when cheap:
+    /// the first two tokens after the column-1 `(` — a def-like head's
+    /// second token is the var name, otherwise the head stands.
+    fn likely_label(preview: &str) -> String {
+        let rest = preview.strip_prefix('(').unwrap_or(preview);
+        let mut toks = rest.split_whitespace();
+        let head = toks.next().unwrap_or("");
+        if head.is_empty() {
+            return "form".to_string();
+        }
+        if let Some(name) = toks.next() {
+            if is_symbol(name) && parser::defines_var(parser::base_head(head)) {
+                return name.to_string();
+            }
+        }
+        head.to_string()
+    }
+}
+
+/// `a and b` / `a, b, and c` (the swallowed-forms list's join).
+fn join_and(parts: &[String]) -> String {
+    match parts.len() {
+        0 => String::new(),
+        1 => parts[0].clone(),
+        2 => format!("{} and {}", parts[0], parts[1]),
+        _ => format!("{}, and {}", parts[..parts.len() - 1].join(", "), parts[parts.len() - 1]),
+    }
+}
+
+/// Cheap symbol-ish check for the likely-swallowed name slot: non-empty,
+/// not starting with a delimiter or quote char (a `[]` binding vector or a
+/// string token is not a name).
+fn is_symbol(s: &str) -> bool {
+    !s.is_empty() && !matches!(s.as_bytes()[0], b'(' | b')' | b'[' | b']' | b'{' | b'}' | b'"' | b'\'' | b';' | b'`' | b'#')
 }
 
 /// The broken-state union: conflict regions + parse-error diagnostics,
@@ -313,6 +641,31 @@ pub fn broken(conflicts: Vec<Diagnostic>, parse_err: Option<&parser::ParseError>
     d.sort_by_key(|d| d.first_line());
     Broken {
         diagnostics: d,
+    }
+}
+
+impl Broken {
+    /// Issue 44: attach the unclosed-form diagnosis to the FIRST parse-error
+    /// row — the first-error region, the same region the parse-error
+    /// envelope's line/col/message name — so the `tree --recover`
+    /// diagnostics section carries the same facts the envelope's additive
+    /// keys carry (read-only; no handles — the unchanged rule). No-op when
+    /// there is no parse error, the failure is not an unclosed/EOF kind, or
+    /// the walk confirms no openers at EOF (a mismatched closer is not an
+    /// unclosed kind — its rows stay unchanged).
+    pub fn attach_unclosed(&mut self, bytes: &[u8], parse_err: Option<&parser::ParseError>) {
+        let Some(e) = parse_err else { return };
+        let Some(d) = unclosed_diagnosis(bytes, e) else { return };
+        if let Some(row) = self
+            .diagnostics
+            .iter_mut()
+            .find_map(|x| match x {
+                Diagnostic::ParseError { unclosed, .. } => Some(unclosed),
+                _ => None,
+            })
+        {
+            *row = Some(d);
+        }
     }
 }
 
@@ -499,11 +852,26 @@ impl Serialize for Diagnostic {
         #[derive(Serialize)]
         struct Span(usize, usize);
         match self {
-            Diagnostic::ParseError { span, message } => {
-                let mut map = serializer.serialize_map(Some(3))?;
+            Diagnostic::ParseError { span, message, unclosed } => {
+                let mut map = serializer.serialize_map(Some(if unclosed.is_some() { 7 } else { 3 }))?;
                 map.serialize_entry("kind", "parse-error")?;
                 map.serialize_entry("line", &Span(span.0, span.1))?;
                 map.serialize_entry("message", message)?;
+                // Issue 44: the same additive facts the parse-error
+                // envelope carries — present only on the first parse-error
+                // row of an unclosed/EOF-kind failure; every other row and
+                // every other diagnostic keeps its byte-identical shape.
+                if let Some(d) = unclosed {
+                    map.serialize_entry("unclosed", &d.unclosed)?;
+                    map.serialize_entry("missing", &d.missing)?;
+                    map.serialize_entry(
+                        "swallowSpan",
+                        &[d.swallow_span.0, d.swallow_span.1],
+                    )?;
+                    if !d.likely_swallowed.is_empty() {
+                        map.serialize_entry("likelySwallowed", &d.likely_swallowed)?;
+                    }
+                }
                 map.end()
             }
             Diagnostic::ConflictRegion {
@@ -833,6 +1201,7 @@ mod tests {
         let p = Diagnostic::ParseError {
             span: (7, 9),
             message: "unclosed open-paren (form reaches end of file)".to_string(),
+            unclosed: None,
         };
         let j = serde_json::to_value(&p).expect("serializes");
         assert_eq!(
@@ -933,6 +1302,7 @@ mod tests {
         let diags = vec![Diagnostic::ParseError {
             span: (4, 5),
             message: "m".into(),
+            unclosed: None,
         }];
         let intact = intact_forms(&forms, &diags);
         assert_eq!(intact.len(), 1);
@@ -957,5 +1327,344 @@ mod tests {
             ..f.clone()
         };
         assert_eq!(form_label(&nameless), "defn");
+    }
+
+    // ─── issue 44: the unclosed-form diagnosis ───
+
+    /// The owner's flagship repro (shape B, supervisor-confirmed): a 7-form
+    /// file whose f4 defn closer is missing — the let at line 10 is closed
+    /// by its own `)`, so the walker's EOF stack holds the single defn
+    /// opener at line 9 col 1; f5/f6 sit in the swallow span as column-1
+    /// openers. 16 content lines (trailing newline → the parser's EOF
+    /// line is 17, the owner's observed diagnostic end). Explicit escapes:
+    /// a backslash line-continuation would strip these lines' indentation.
+    const REPRO_B: &str = "(ns repro)\n\
+                           (defn f1 [] 1)\n\
+                           (defn f2 [] 2)\n\
+                           (defn f3 [] 3)\n\
+                           ; f4 below: the defn's closer is missing\n\
+                           \n\
+                           \n\
+                           \n\
+                           (defn f4 [x]\n  (let\n   x)\n\
+                           \n\
+                           \n\
+                           (defn f5 [] 5)\n\
+                           \n\
+                           (defn f6 [] 6)\n";
+
+    /// The deep-hole shape (A): f4's LET closer is dropped, so both the
+    /// let (line 10 col 3) and its defn (line 9 col 1) are open at EOF —
+    /// stack depth 2, innermost first.
+    const REPRO_A: &str = "(ns hole)\n\
+                           (defn f1 [] 1)\n\
+                           (defn f2 [] 2)\n\
+                           (defn f3 [] 3)\n\
+                           ; f4 below: its let is never closed\n\
+                           \n\
+                           \n\
+                           \n\
+                           (defn f4 [x]\n  (let\n   x\n\
+                           \n\
+                           \n\
+                           (defn f5 [] 5)\n\
+                           \n\
+                           (defn f6 [] 6)\n";
+
+    /// A fabricated first-error for the gate tests (the diagnosis reads
+    /// only the message; the real parse path is pinned by the integration
+    /// suite and the real-parse test below).
+    fn unclosed_eof_err() -> parser::ParseError {
+        parser::ParseError {
+            line: 9,
+            col: 1,
+            message: "unclosed open-paren (form reaches end of file)".to_string(),
+            diagnostics: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn unclosed_diagnosis_flagship_repro() {
+        let d = unclosed_diagnosis(REPRO_B.as_bytes(), &unclosed_eof_err())
+            .expect("the unclosed/EOF kind enriches");
+        // Single-entry stack: the defn opener (the let is closed by its
+        // own closer — LIFO), named from its line's verbatim prefix.
+        assert_eq!(
+            d.unclosed,
+            vec![UnclosedOpener {
+                char: '(',
+                line: 9,
+                col: 1,
+                source_line: "(defn f4 [x]".to_string(),
+            }]
+        );
+        // Missing count = stack depth, broken out by type.
+        assert_eq!(
+            d.missing,
+            MissingClose { total: 1, paren: 1, bracket: 0, brace: 0 }
+        );
+        // Swallow span: outermost unclosed opener's line → file's last line.
+        assert_eq!(d.swallow_span, (9, 16));
+        // Likely-swallowed: the column-1 `(` lines after line 9.
+        assert_eq!(
+            d.likely_swallowed,
+            vec![
+                LikelySwallowed { line: 14, preview: "(defn f5 [] 5)".to_string() },
+                LikelySwallowed { line: 16, preview: "(defn f6 [] 6)".to_string() },
+            ]
+        );
+        assert_eq!(
+            d.lead(),
+            "unclosed at EOF (innermost first): `(defn f4 [x]` at line 9 col 1; \
+             the file is missing 1 closer; everything from line 9 to EOF is \
+             currently inside this form — f5 (line 14) and f6 (line 16) look \
+             like top-level forms being swallowed by it (a structural \
+             observation, not a parsed fact)"
+        );
+    }
+
+    #[test]
+    fn unclosed_diagnosis_deep_hole_innermost_first() {
+        let d = unclosed_diagnosis(REPRO_A.as_bytes(), &unclosed_eof_err())
+            .expect("the unclosed/EOF kind enriches");
+        // Two openers at EOF: INNERMOST FIRST — the let, then its defn.
+        assert_eq!(
+            d.unclosed
+                .iter()
+                .map(|u| (u.char, u.line, u.col))
+                .collect::<Vec<_>>(),
+            vec![('(', 10, 3), ('(', 9, 1)]
+        );
+        assert_eq!(d.unclosed[0].source_line, "  (let");
+        assert_eq!(d.unclosed[1].source_line, "(defn f4 [x]");
+        assert_eq!(
+            d.missing,
+            MissingClose { total: 2, paren: 2, bracket: 0, brace: 0 }
+        );
+        assert_eq!(d.swallow_span, (9, 16));
+        assert_eq!(
+            d.lead(),
+            "unclosed at EOF (innermost first): `(let` at line 10 col 3 — \
+             inside `(defn f4 [x]` at line 9 col 1; the file is missing 2 \
+             closers; everything from line 9 to EOF is currently inside this \
+             form — f5 (line 14) and f6 (line 16) look like top-level forms \
+             being swallowed by it (a structural observation, not a parsed \
+             fact)"
+        );
+    }
+
+    #[test]
+    fn unclosed_diagnosis_three_levels_and_mixed_breakdown() {
+        // Three nested openers, none closed: the order must hold at depth 3.
+        let text = "(defn a []\n  (let\n    (foo\n     x\n";
+        let d = unclosed_diagnosis(text.as_bytes(), &unclosed_eof_err()).expect("enriches");
+        assert_eq!(
+            d.unclosed
+                .iter()
+                .map(|u| (u.line, u.col))
+                .collect::<Vec<_>>(),
+            vec![(3, 5), (2, 3), (1, 1)]
+        );
+        assert_eq!(d.swallow_span, (1, 4));
+        assert!(d.likely_swallowed.is_empty(), "no column-1 openers after line 1");
+        assert_eq!(
+            d.lead(),
+            "unclosed at EOF (innermost first): `(foo` at line 3 col 5 — \
+             inside `(let` at line 2 col 3 — inside `(defn a []` at line 1 \
+             col 1; the file is missing 3 closers; everything from line 1 \
+             to EOF is currently inside this form"
+        );
+        // Mixed delimiter types break out (nonzero types only).
+        let d = unclosed_diagnosis(b"([x\n", &unclosed_eof_err()).expect("enriches");
+        assert_eq!(
+            d.missing,
+            MissingClose { total: 2, paren: 1, bracket: 1, brace: 0 }
+        );
+        assert!(
+            d.lead().contains("the file is missing 2 closers (1 paren, 1 bracket)"),
+            "{}",
+            d.lead()
+        );
+    }
+
+    #[test]
+    fn unclosed_diagnosis_last_form_has_no_likely_swallowed() {
+        // The broken form is the LAST form: the swallow span is still
+        // correct (outermost opener → EOF) but nothing follows it, so the
+        // likely-swallowed key stays absent and the lead has no looks-like
+        // clause.
+        let text = "(def a 1)\n(defn last []\n  (let\n   x)\n";
+        let d = unclosed_diagnosis(text.as_bytes(), &unclosed_eof_err()).expect("enriches");
+        assert_eq!(d.swallow_span, (2, 4));
+        assert_eq!(
+            d.missing,
+            MissingClose { total: 1, paren: 1, bracket: 0, brace: 0 }
+        );
+        assert!(d.likely_swallowed.is_empty());
+        assert!(
+            !d.lead().contains("look"),
+            "no looks-like clause for an empty region: {}",
+            d.lead()
+        );
+        assert!(
+            d.lead().ends_with("everything from line 2 to EOF is currently inside this form"),
+            "{}",
+            d.lead()
+        );
+    }
+
+    #[test]
+    fn unclosed_diagnosis_single_likely_uses_singlular_verb() {
+        let text = "(def a 1\n\n(def b 2)\n";
+        let d = unclosed_diagnosis(text.as_bytes(), &unclosed_eof_err()).expect("enriches");
+        assert_eq!(
+            d.likely_swallowed,
+            vec![LikelySwallowed { line: 3, preview: "(def b 2)".to_string() }]
+        );
+        assert!(
+            d.lead().contains("b (line 3) looks like a top-level form being swallowed by it"),
+            "{}",
+            d.lead()
+        );
+    }
+
+    #[test]
+    fn unclosed_diagnosis_none_for_other_error_kinds() {
+        // A mismatched closer is NOT an unclosed kind: the walk aborts at
+        // the stray closer, and the message gate rejects "unexpected
+        // token". Both gates must hold independently.
+        let stray = parser::ParseError {
+            line: 2,
+            col: 1,
+            message: "unexpected token \")\"".to_string(),
+            diagnostics: Vec::new(),
+        };
+        assert!(unclosed_diagnosis(b"(def a 1)\n)\n", &stray).is_none());
+        // Walk gate: even an "unclosed" message gets no enrichment when
+        // the walk aborts (a stray closer early in the file).
+        assert!(unclosed_diagnosis(b"(a [b\nc)\n", &unclosed_eof_err()).is_none());
+        // Walk gate: a balanced walk (an unterminated top-level string —
+        // no unclosed DELIMITER) has no stack to report.
+        let string_err = parser::ParseError {
+            line: 1,
+            col: 1,
+            message: "unclosed string literal".to_string(),
+            diagnostics: Vec::new(),
+        };
+        assert!(unclosed_diagnosis(b"\"abc\n", &string_err).is_none());
+        // Non-UTF-8 input cannot be walked faithfully: stays raw.
+        let mut bad = REPRO_B.as_bytes().to_vec();
+        bad.push(0xff);
+        assert!(unclosed_diagnosis(&bad, &unclosed_eof_err()).is_none());
+    }
+
+    #[test]
+    fn unclosed_diagnosis_attaches_to_first_parse_error_row_of_real_parse() {
+        // The full path: the REAL parse of the flagship repro (its first
+        // error is the unclosed/EOF kind) feeds the union, and
+        // attach_unclosed lands the payload on the FIRST parse-error row
+        // only.
+        let err = parser::parse(REPRO_B.as_bytes())
+            .err()
+            .expect("the repro does not parse");
+        let mut b = broken(Vec::new(), Some(&err));
+        b.attach_unclosed(REPRO_B.as_bytes(), Some(&err));
+        let parse_rows: Vec<&Diagnostic> = b
+            .diagnostics
+            .iter()
+            .filter(|d| matches!(d, Diagnostic::ParseError { .. }))
+            .collect();
+        assert!(!parse_rows.is_empty(), "the parse-error layer is present");
+        match parse_rows[0] {
+            Diagnostic::ParseError { unclosed, .. } => {
+                assert!(unclosed.is_some(), "the first row carries the diagnosis");
+            }
+            other => panic!("first row is not a parse error: {other:?}"),
+        }
+        for row in &parse_rows[1..] {
+            if let Diagnostic::ParseError { unclosed, .. } = row {
+                assert!(unclosed.is_none(), "later rows stay bare: {row:?}");
+            }
+        }
+        // A mismatch-kind parse attaches nothing (existing rows unchanged).
+        let err = parser::parse(b"(def a 1)\n)\n")
+            .err()
+            .expect("stray closer does not parse");
+        let mut b = broken(Vec::new(), Some(&err));
+        b.attach_unclosed(b"(def a 1)\n)\n", Some(&err));
+        for d in &b.diagnostics {
+            if let Diagnostic::ParseError { unclosed, .. } = d {
+                assert!(unclosed.is_none(), "mismatch kind stays bare: {d:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn parse_error_row_serializes_additive_unclosed_keys() {
+        let d = unclosed_diagnosis(REPRO_B.as_bytes(), &unclosed_eof_err()).expect("enriches");
+        let row = Diagnostic::ParseError {
+            span: (9, 16),
+            message: "unclosed open-paren (form reaches end of file)".to_string(),
+            unclosed: Some(d),
+        };
+        let j = serde_json::to_value(&row).expect("serializes");
+        assert_eq!(j["kind"], "parse-error");
+        assert_eq!(j["line"], serde_json::json!([9, 16]));
+        assert_eq!(
+            j["unclosed"],
+            serde_json::json!([{ "char": "(", "line": 9, "col": 1, "sourceLine": "(defn f4 [x]" }])
+        );
+        assert_eq!(j["missing"], serde_json::json!({ "total": 1, "paren": 1, "bracket": 0, "brace": 0 }));
+        assert_eq!(j["swallowSpan"], serde_json::json!([9, 16]));
+        assert_eq!(
+            j["likelySwallowed"],
+            serde_json::json!([{ "line": 14, "preview": "(defn f5 [] 5)" }, { "line": 16, "preview": "(defn f6 [] 6)" }])
+        );
+        // The bare row keeps its byte-identical three-key shape.
+        let bare = Diagnostic::ParseError {
+            span: (9, 16),
+            message: "m".to_string(),
+            unclosed: None,
+        };
+        let j = serde_json::to_value(&bare).expect("serializes");
+        assert!(j.get("unclosed").is_none());
+        assert!(j.get("missing").is_none());
+        assert!(j.get("swallowSpan").is_none());
+        assert!(j.get("likelySwallowed").is_none());
+        // An empty likely-swallowed list omits its key ("only when found").
+        let mut d = unclosed_diagnosis(b"(def a 1\n", &unclosed_eof_err()).expect("enriches");
+        d.likely_swallowed = Vec::new();
+        let j = serde_json::to_value(Diagnostic::ParseError {
+            span: (1, 1),
+            message: "m".to_string(),
+            unclosed: Some(d),
+        })
+        .expect("serializes");
+        assert!(j.get("likelySwallowed").is_none(), "{}", j);
+        assert!(j.get("swallowSpan").is_some(), "{}", j);
+    }
+
+    #[test]
+    fn human_line_carries_unclosed_continuation() {
+        let d = unclosed_diagnosis(REPRO_B.as_bytes(), &unclosed_eof_err()).expect("enriches");
+        let row = Diagnostic::ParseError {
+            span: (9, 16),
+            message: "unclosed open-paren (form reaches end of file)".to_string(),
+            unclosed: Some(d),
+        };
+        let h = row.human_line();
+        assert!(
+            h.starts_with("parse error lines 9–16: unclosed open-paren (form reaches end of file)\n    "),
+            "{h:?}"
+        );
+        assert!(h.contains("unclosed at EOF (innermost first):"), "{h:?}");
+        assert!(h.contains("f5 (line 14) and f6 (line 16)"), "{h:?}");
+        // A bare row is exactly one line.
+        let bare = Diagnostic::ParseError {
+            span: (2, 2),
+            message: "unexpected token \")\"".to_string(),
+            unclosed: None,
+        };
+        assert_eq!(bare.human_line(), "parse error line 2: unexpected token \")\"");
     }
 }

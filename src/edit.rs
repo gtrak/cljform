@@ -729,8 +729,13 @@ fn write_gate_enrich(
     // Only the resulting-file parse layer qualifies: the other verify_edit
     // failures (boundary proof, untouched-forms shape, strict detector
     // gate) carry their own codes and never take a content verdict.
+    // Issue 44: `contains`, not `starts_with` — when the resulting-file
+    // failure is an unclosed/EOF kind, parse_or_fail has already layered
+    // the enriched lead on top of the raw layer (the layer text now sits
+    // after the lead, with its coordinates appended); every other shape
+    // still starts with it.
     if body.code != "parse-error"
-        || !body.message.starts_with("resulting file does not parse:")
+        || !body.message.contains("resulting file does not parse:")
     {
         return Fail(exit, body);
     }
@@ -854,7 +859,7 @@ fn write_gate_enrich(
                     );
                     let message = format!(
                         "{lead}\nfile-level context: {} @ line {line} col {col}",
-                        body.message
+                        raw_resulting_file_layer(&body)
                     );
                     return Fail(exit, ErrorBody { message, hint: Some(hint), ..body });
                 }
@@ -945,13 +950,34 @@ fn write_gate_enrich(
     };
     // The file-level coordinates are the parse error's own (parse_or_fail
     // always attaches them); the layer is demoted, not dropped — the
-    // diagnostics ride along unchanged.
+    // diagnostics ride along unchanged. Issue 44: the raw parse layer is
+    // extracted out of the possibly-layered message (the enriched lead
+    // must not be demoted twice), and the issue-44 envelope keys survive
+    // the `..body` move untouched.
     let (line, col) = (body.line.unwrap_or_default(), body.col.unwrap_or_default());
     let message = format!(
         "{lead}\nfile-level context: {} @ line {line} col {col}",
-        body.message
+        raw_resulting_file_layer(&body)
     );
     Fail(exit, ErrorBody { message, hint: Some(hint), ..body })
+}
+
+/// The raw resulting-file parse layer for the demoted context line
+/// (issue 44): when parse_or_fail layered the refusal (enriched lead on top
+/// of `resulting file does not parse: … @ line l col c`), the context line
+/// demotes the RAW layer — from the layer marker to just before the
+/// coordinate suffix — never the whole layered message. The pre-issue-44
+/// message (the layer itself, no suffix) passes through unchanged.
+fn raw_resulting_file_layer(body: &ErrorBody) -> String {
+    let (line, col) = (body.line.unwrap_or_default(), body.col.unwrap_or_default());
+    let suffix = format!(" @ line {line} col {col}");
+    match body.message.find("resulting file does not parse:") {
+        Some(i) => body.message[i..]
+            .strip_suffix(suffix.as_str())
+            .unwrap_or(&body.message[i..])
+            .to_string(),
+        None => body.message.clone(),
+    }
 }
 
 /// Issue 42 (A): the closer delta of newText relative to oldText — the
@@ -2825,6 +2851,80 @@ mod tests {
             diff: String::new(),
             noop: false,
         }
+    }
+
+    /// Issue 44: when parse_or_fail has layered the resulting-file refusal
+    /// (the enriched lead on top of the raw layer, coordinates appended),
+    /// the write gate demotes the RAW layer — exactly one `file-level
+    /// context:` line, the enriched lead not demoted twice — and the
+    /// issue-44 envelope keys survive the `..body` move.
+    #[test]
+    fn write_gate_layered_resulting_file_message_demotes_raw_layer() {
+        let submitted = "(defn f [x]\n  (dec x";
+        let diagnosis = crate::broken::UnclosedDiagnosis {
+            unclosed: vec![crate::broken::UnclosedOpener {
+                char: '(',
+                line: 2,
+                col: 1,
+                source_line: "(defn f [x]".to_string(),
+            }],
+            missing: crate::broken::MissingClose {
+                total: 1,
+                paren: 1,
+                bracket: 0,
+                brace: 0,
+            },
+            swallow_span: (2, 2),
+            likely_swallowed: Vec::new(),
+        };
+        // The layered refusal exactly as parse_or_fail builds it for an
+        // unclosed-kind resulting file.
+        let body = ErrorBody::new(
+            "parse-error",
+            "unclosed at EOF (innermost first): `(defn f [x]` at line 2 col 1; \
+             the file is missing 1 closer; everything from line 2 to EOF is \
+             currently inside this form\nresulting file does not parse: \
+             unclosed open-paren (form reaches end of file) @ line 2 col 1",
+        )
+        .at(Some(2), Some(1))
+        .with_hint(
+            "fix the bracket structure first; cljform never writes to a file that does not parse",
+        )
+        .with_unclosed_diagnosis(&diagnosis);
+        let out = write_gate_enrich(
+            Fail(errors::exit::PARSE, body),
+            &Some(prepared_payload()),
+            &Some(submitted.to_string()),
+            &None,
+            &None,
+            &None,
+            b"(ns r)\n(defn f [x]\n  (dec x",
+        );
+        let body = &out.1;
+        assert_eq!(body.code, "parse-error");
+        let msg = body.message.clone();
+        // The content verdict leads (the submitted content is the missing-
+        // tail culprit); the demoted context is the RAW layer, exactly once.
+        assert!(
+            msg.starts_with("content is missing 2 closer(s); mechanical tail (placement is yours to verify): ))"),
+            "{msg}"
+        );
+        let context_lines: Vec<&str> = msg.lines().filter(|l| l.starts_with("file-level context:")).collect();
+        assert_eq!(context_lines.len(), 1, "one demoted context line: {msg}");
+        assert_eq!(
+            context_lines[0],
+            "file-level context: resulting file does not parse: unclosed open-paren (form reaches end of file) @ line 2 col 1"
+        );
+        assert!(
+            !msg.starts_with("unclosed at EOF"),
+            "the file-level lead is not the final lead: {msg}"
+        );
+        // The issue-44 keys ride the refusal through the rewrite.
+        let s = serde_json::to_string(body).unwrap();
+        assert!(s.contains("\"unclosed\""), "{s}");
+        assert!(s.contains("\"missing\""), "{s}");
+        assert!(s.contains("\"swallowSpan\""), "{s}");
+        assert!(!s.contains("\"likelySwallowed\""), "empty list stays absent: {s}");
     }
 
     /// The walker sees the SUBMITTED content of the whole-form modes — the

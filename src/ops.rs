@@ -62,15 +62,29 @@ pub fn parse_or_fail(bytes: &[u8], what: &str) -> Result<parser::Parsed, Fail> {
         return Err(broken::conflict_fail(&regions));
     }
     parser::parse(bytes).map_err(|e| {
-        Fail(
-            errors::exit::PARSE,
-            ErrorBody::new("parse-error", format!("{what} does not parse: {}", e.message))
-                .at(Some(e.line), Some(e.col))
-                .with_hint(
-                    "fix the bracket structure first; cljform never writes to a file that does not parse",
-                )
-                .with_diagnostics(broken::collect_parse_diagnostics(&e)),
-        )
+        let mut body = ErrorBody::new("parse-error", format!("{what} does not parse: {}", e.message))
+            .at(Some(e.line), Some(e.col))
+            .with_hint(
+                "fix the bracket structure first; cljform never writes to a file that does not parse",
+            )
+            .with_diagnostics(broken::collect_parse_diagnostics(&e));
+        // Issue 44: the unclosed-form diagnosis — on an unclosed-delimiter /
+        // unexpected-EOF parse error, the balance walk's EOF stack (issue
+        // 39's machinery, never aborts) LEADS the message and the raw
+        // parser message is demoted to context (issue 39's layering
+        // pattern). A mismatched closer is NOT an unclosed kind (the walk
+        // aborts at the stray closer, not missing a tail), and a balanced
+        // walk has no unclosed stack to report — both pass through
+        // byte-identical, as do healthy files and every other error kind.
+        if let Some(d) = broken::unclosed_diagnosis(bytes, &e) {
+            let demoted = format!(
+                "{what} does not parse: {} @ line {} col {}",
+                e.message, e.line, e.col
+            );
+            body.message = format!("{}\n{}", d.lead(), demoted);
+            body = body.with_unclosed_diagnosis(&d);
+        }
+        Fail(errors::exit::PARSE, body)
     })
 }
 
@@ -891,7 +905,11 @@ pub fn run_tree(
             // value is still a usage error — same contract as the normal
             // view.
             let _ = depth_arg(depth, full)?;
-            let b = broken::broken(regions, parsed.as_ref().err());
+            let mut b = broken::broken(regions, parsed.as_ref().err());
+            // Issue 44: the recover view's diagnostics section carries the
+            // same unclosed-form facts the parse-error envelope's additive
+            // keys carry (read-only; no handles — the unchanged rule).
+            b.attach_unclosed(&bytes, parsed.as_ref().err());
             return render_recover_view(file, &bytes, had_bom, &b, window, human_mode);
         }
     }

@@ -199,6 +199,29 @@ cljform [--json|--human] <op> [args]
   itself stays the first-error text, byte-identical). Additive key:
   absent on every healthy-file envelope.
 
+  **Unclosed-form diagnosis (issue 44).** A `parse-error` whose first
+  error is an unclosed-delimiter / unexpected-EOF kind (the "form
+  reaches end of file" shape) additionally carries the balance walk's
+  EOF-stack facts (issue 39's machinery — the full stack walk, never
+  aborts) as additive keys on the error object: `unclosed`
+  (`[{char, line, col, sourceLine}]`, the stack INNERMOST FIRST, each
+  with the verbatim source line of its opener — def-like heads are
+  named from the opener line when cheap), `missing`
+  (`{total, paren, bracket, brace}` — `total` is the stack depth,
+  broken out by delimiter type), `swallowSpan` (`[a, b]` — the span
+  from the OUTERMOST unclosed opener's line to the file's last line:
+  everything in it is currently read as one form), and
+  `likelySwallowed` (`[{line, preview}]`, only when found — column-1
+  `(` lines after the last intact form, derived from the `tree
+  --recover` intact-forms machinery; a LOOKS-LIKE structural
+  observation, never a parsed fact). The enriched diagnosis LEADS the
+  message and the raw parser message (unclosed open-paren / form
+  reaches EOF + its position) is demoted to context — issue 39's
+  layering pattern. Healthy envelopes and every OTHER error kind (a
+  mismatched closer is NOT an unclosed kind: the walk aborts at the
+  stray closer, its existing path stands) stay byte-identical — the
+  keys are present only on those failures.
+
   **Warning-delta attribution (issue 38).** The EDIT envelope only
   (single op and batch) additionally carries `warningsDelta:
   {new, preExisting}` plus an additive `new: true|false` flag on every
@@ -561,6 +584,23 @@ the walker is provably panic-free (byte iteration and `pop()` only).
   the correct placement is inside the form; see the mismatch diagnosis`)
   and shows no preview. Never applied: the refusal is a refusal; whole-form
   content modes keep the absolute framing (nothing to be relative to).
+- **Unclosed-form diagnosis on parse refusals (issue 44).** When ANY op
+  refuses on parse with an unclosed-delimiter / unexpected-EOF kind
+  (check, tree, edit, get — every op gated by `parse_or_fail`), the
+  balance walk (issue 39's machinery — the full stack walk, never
+  aborts; `full_counts`/`walk` reuse, no new walker) runs on the file
+  bytes and its EOF stack enriches the `parse-error` envelope: the
+  unclosed stack (innermost first, char + line:col + verbatim source
+  line), the missing-closer count (stack depth, broken out by
+  delimiter type), the swallow span (outermost unclosed opener → EOF),
+  and the likely-swallowed forms (column-1 openers after the last
+  intact form — the recover view's intact-forms machinery; looks-like
+  phrasing, a structural observation). The enriched diagnosis LEADS the
+  message; the raw parser message is demoted to context (issue 39's
+  layering pattern, as in the write-gate diagnosis above). A mismatched
+  closer is NOT an unclosed kind (the walk aborts, not missing a tail)
+  and a balanced walk has no stack to report — both pass through
+  byte-identical, as do healthy paths.
 - **No new extension tools (DECISION, issue 42 D):** the extension's
   stale-handle guidance was updated to the post-40A truth (the refusal
   REPORTS the recovered form when identity is verifiable — read the
@@ -712,6 +752,21 @@ make-widget (line 28–101) — intended?"` and decides.
   grammar; they are never executed. This is a hard, reviewable property of the
   dependency set.
 - **Atomic write** per I1 (temp+rename+fsync, same-directory temp file).
+- **Unclosed-form diagnosis reuses the balance walker (issue 44).** The
+  parse-error enrichment (the §4.1 additive keys, the §4.5 parse-refusal
+  lead, and the §10.2 recover diagnostics) is computed by
+  `balance::walk` over the file bytes (BOM-stripped, UTF-8-gated) —
+  issue 39's machinery, never a second parser: the EOF stack yields the
+  unclosed list (innermost first), the missing-closer count (stack
+  depth, broken out by delimiter type), and the outermost opener (the
+  swallow span's start). The likely-swallowed scan runs over the recover
+  view's intact-forms region (column-1 `(` lines strictly after the
+  outermost unclosed opener — equivalently, after the last intact form —
+  and is looks-like by construction: a line inside an unterminated
+  string still counts, and the phrasing says so). The raw parser anchor
+  is context only (demoted, never asserted): the walker-derived facts
+  are the contract, and tree-sitter's error recovery can anchor the
+  same break differently on different files.
 - **Output:** `serde_json`; human mode is a thin formatter over the same
   structs. No color unless TTY.
 - **Performance target:** `forms`/`check` on a 1,100-line / ~50 KB file (a
@@ -1000,7 +1055,13 @@ collection delimiter:
     window: {requested, effective}}` (the window key only when windowed);
     diagnostics serialize with `kind`, the line spans, `message`, and the
     per-side spans (`head`/`base`/`incoming`, `malformed` when the
-    region could not be paired or terminated).
+    region could not be paired or terminated). **Issue 44:** the first
+    parse-error row of an unclosed/EOF-kind failure additionally carries
+    the same additive facts the `parse-error` envelope does (`unclosed`,
+    `missing`, `swallowSpan`, and `likelySwallowed` only when found) —
+    the human view renders them as an indented continuation under the
+    parse-error row. Every other row and every other diagnostic keeps
+    its byte-identical shape.
   - **NO handles anywhere (design note, owner-confirmed).** (1) The
     broken region is the edit target and the write path is gated, so
     handles would be inert decoration inviting a doomed edit call. (2)

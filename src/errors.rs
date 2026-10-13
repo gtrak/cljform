@@ -62,6 +62,26 @@ pub struct ErrorBody {
     /// written; the atomic batch is the refusal).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batch_ops: Option<Vec<BatchOpBlock>>,
+    /// Issue 44: the unclosed-form diagnosis on an unclosed-delimiter /
+    /// unexpected-EOF `parse-error` — the balance walk's EOF stack,
+    /// INNERMOST FIRST, each with char + line:col + the verbatim source
+    /// line. Additive key, present only on those failures.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unclosed: Option<Vec<crate::broken::UnclosedOpener>>,
+    /// Issue 44: the missing-closer count (stack depth), broken out by
+    /// delimiter type. Additive key, present only on those failures.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub missing: Option<crate::broken::MissingClose>,
+    /// Issue 44: the swallow span `[outermost unclosed opener's line, file
+    /// last line]` (1-based, inclusive) — everything in it is currently
+    /// read as one form. Additive key, present only on those failures.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "swallowSpan")]
+    pub swallow_span: Option<[usize; 2]>,
+    /// Issue 44: the likely-swallowed forms (column-1 openers after the
+    /// last intact form — a looks-like structural observation, never a
+    /// parsed fact). Present only when found (non-empty).
+    #[serde(skip_serializing_if = "Option::is_none", rename = "likelySwallowed")]
+    pub likely_swallowed: Option<Vec<crate::broken::LikelySwallowed>>,
 }
 
 impl ErrorBody {
@@ -77,6 +97,10 @@ impl ErrorBody {
             suggestions: None,
             diagnostics: None,
             batch_ops: None,
+            unclosed: None,
+            missing: None,
+            swallow_span: None,
+            likely_swallowed: None,
         }
     }
 
@@ -111,6 +135,21 @@ impl ErrorBody {
     pub fn with_batch_ops(mut self, blocks: Vec<BatchOpBlock>) -> Self {
         if !blocks.is_empty() {
             self.batch_ops = Some(blocks);
+        }
+        self
+    }
+
+    /// Attach the issue-44 unclosed-form diagnosis (unclosed/EOF-kind
+    /// parse errors only): the walker's EOF stack (innermost first), the
+    /// missing-closer count, the swallow span, and the looks-like
+    /// swallowed-forms list (only when non-empty). Additive keys — every
+    /// other error shape stays byte-identical.
+    pub fn with_unclosed_diagnosis(mut self, d: &crate::broken::UnclosedDiagnosis) -> Self {
+        self.unclosed = Some(d.unclosed.clone());
+        self.missing = Some(d.missing);
+        self.swallow_span = Some([d.swallow_span.0, d.swallow_span.1]);
+        if !d.likely_swallowed.is_empty() {
+            self.likely_swallowed = Some(d.likely_swallowed.clone());
         }
         self
     }
