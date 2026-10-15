@@ -21,6 +21,7 @@
 //! rewrites bytes and enforces its own failure rules, so its contract does
 //! not match this inference-only scanner.)
 
+#[derive(Clone)]
 pub struct MaterializeError {
     pub line: usize,
     pub col: usize,

@@ -151,13 +151,13 @@ pub fn read_text_file(p: &Path) -> Result<String, Fail> {
     })
 }
 
-struct Target {
-    form: Form,
+pub(crate) struct Target {
+    pub(crate) form: Form,
 }
 
 /// The `get --name` lookup (SPEC §5): the unique top-level form whose head
 /// defines `name`. Edits target by handle only; this is the read path.
-fn resolve_target(forms: &[Form], name: &str) -> Result<Target, Fail> {
+pub(crate) fn resolve_target(forms: &[Form], name: &str) -> Result<Target, Fail> {
     let matches: Vec<&Form> = forms
         .iter()
         .filter(|f| f.name.as_deref() == Some(name))

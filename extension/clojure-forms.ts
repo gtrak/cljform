@@ -753,7 +753,8 @@ export default function ClojureForms(pi: ExtensionAPI) {
 			"closing brackets and get back a bracketed CANDIDATE plus a unified diff. It completes missing " +
 			"closers implied by indentation. It does NOT invent missing openers, so a fully bracket-less draft " +
 			"is returned unchanged with a note (a guessed bracketing would be worse than an obvious no-op). " +
-			"Draft never touches the repo or any user file: the ONLY writes it performs are scratch artifacts in " +
+			"Decision rule: new multi-line form → clj_draft (pass path+handle for the prepare-time vote) · small in-form change → clj_edit patch (by handle, or --name for a top-level def-like) · whole-form swap → clj_edit replace (by handle). "
+				+ "Draft never touches the repo or any user file: the ONLY writes it performs are scratch artifacts in " +
 			"the system temp dir — cljform-draft-<n>-sent.clj (the draft verbatim, exact bytes as submitted) and " +
 			"cljform-draft-<n>-rebalanced.clj (the completed candidate; when inference is a no-op, sent only — " +
 			"one file, said so). Both paths are reported: the handoff is a REFERENCE (clj_edit or cljform edit " +
@@ -938,6 +939,7 @@ export default function ClojureForms(pi: ExtensionAPI) {
 			"dryRun: true validates and shows the outcome without writing.",
 			"strict: true (CI mode) refuses detector warnings; together with repair it refuses the repair instead of applying it (repair-refused).",
 			"repair: true enables bracket inference from indentation (missing trailing closers + a mid-file dedent closure); without it, unbalanced content is refused (unbalanced-content) with the inferred candidate.",
+				"Decision rule: new multi-line form → clj_draft (pass path+handle for the prepare-time vote) · small in-form change → clj_edit patch (by handle, or --name for a top-level def-like) · whole-form swap → clj_edit replace (by handle).",
 			"autoFormat (default true): cljform edit reindents content in parinfer paren mode before base-shifting it; set it false to pass --no-format-content (content stays verbatim). Patch oldText/newText are never reindented.",
 		],
 		parameters: Type.Object({
@@ -1325,6 +1327,11 @@ export default function ClojureForms(pi: ExtensionAPI) {
 			// edit the hook states the remaining regions.
 			for (const d of e.diagnostics ?? []) report.push(`  ${diagnosticLine(d)}`);
 			report.push("Fix the bracket structure immediately; nothing else about this edit is verified.");
+				// issue 46 (C): the exit ramp for the defaulting-to-edit trap —
+				// the built-in edit cannot repair; cljform's edit path can.
+				report.push(
+					"cljform can complete this for you: use clj_edit (repair: true applies the inferred candidate) or clj_draft for a bracket-less draft — then stay in cljform.",
+				);
 		} else {
 			const prev = cache.get(abs);
 			remember(abs, out.forms, out.warnings);

@@ -34,6 +34,7 @@ pub enum Payload {
     Patch { bytes: Vec<u8>, diff: String, noop: bool },
 }
 
+#[derive(Clone)]
 pub enum PrepareError {
     /// Empty or comments-only: almost certainly not what the caller meant.
     Empty,

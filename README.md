@@ -146,7 +146,12 @@ stays separate calls). Full contract: SPEC §10.3 (batch).
 ## The model
 
 - **Handles are content-addressed.** `tree` marks each form with
-  `⟦handle⟧`; that handle is the only address `edit` accepts. Resolution
+  `⟦handle⟧`; that handle is the only address `edit` accepts. Patch mode (issue 46) can also target a top-level def-like by
+  `--name` — safe there because the patch's oldText must match current
+  bytes, so the payload is its own freshness guard. The decision rule:
+  new multi-line form → `clj_draft` (vote included) · small in-form
+  change → `clj_edit patch` (by handle, or `--name`) · whole-form swap →
+  `clj_edit replace` (handle). Resolution
   either matches the one form it names or refuses (`stale-handle`,
   `ambiguous-handle`) — a stale view can never target the wrong form.
 - **Writes are verified.** A write happens only if the post-splice file

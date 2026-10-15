@@ -105,13 +105,20 @@ pub enum Op {
         /// and prepend are file-level and take no target.
         #[arg(long)]
         handle: Option<String>,
+        /// Issue 46 (B): PATCH ONLY — resolve the target by unique def-like
+        /// name (same resolver as `get --name`) instead of a handle. Safe
+        /// here because the patch's oldText must match current bytes: the
+        /// payload is the freshness guard. Replace/insert/delete keep
+        /// handle-only (staleness safety).
+        #[arg(long, conflicts_with = "handle")]
+        name: Option<String>,
         /// Batch edit (issue 36): a JSON file holding an array of ops —
         /// N edit ops, one call, one atomic write. Each op is a normal edit
         /// op ({"handle", "mode", "content" / "oldText" / "newText"}); every
         /// handle resolves against the ORIGINAL file and each target is
         /// tracked across the batch's own ops. Composes with --dry-run,
         /// --strict, --repair, --format-content/--no-format-content.
-        #[arg(long, conflicts_with_all = ["mode", "handle", "content", "content_file", "old_text", "new_text", "old_text_file", "new_text_file"])]
+        #[arg(long, conflicts_with_all = ["mode", "handle", "name", "content", "content_file", "old_text", "new_text", "old_text_file", "new_text_file"])]
         batch: Option<PathBuf>,
         /// Validate only; write nothing.
         #[arg(long)]

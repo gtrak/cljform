@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::Mode;
 use crate::errors::{self, ErrorBody, Fail, Output};
+use crate::ops;
 use crate::ops::{
     parse_or_fail, read_content, read_file, read_text_file, resolve_handle, StaleRecovery, with_bom,
 };
@@ -231,6 +232,7 @@ fn build_patch_payload(
 /// has decided — issue 12), parinfer reindent, and base-shift the final
 /// lines to the splice column (seam trim).
 fn build_prepared_payload(
+    file: &Path,
     mode: Mode,
     content: &Option<String>,
     content_file: &Option<PathBuf>,
@@ -297,8 +299,41 @@ fn build_prepared_payload(
     //    The base-shift dedent is computed from the submitted
     //    content and applied after inference has decided — never
     //    fed back into it.
-    let mut prepared =
-        content::prepare(&stripped, false, strict, repair).map_err(errors::prepare_fail)?;
+    let mut prepared = match content::prepare(&stripped, false, strict, repair) {
+        Ok(p) => p,
+        // Issue 46 (A): the unbalanced refusal writes the VERIFIED candidate
+        // to a temp artifact (draft's contract — repo untouched) and the
+        // hint gains the one-tap confirm: a REFERENCE call, so confirming
+        // the repair does not re-send the payload. Mismatch refusals write
+        // nothing (no candidate exists there — the LIFO rule).
+        Err(ref e @ content::PrepareError::Unbalanced { ref candidate, .. }) => {
+            let artifact = write_candidate_artifact(candidate);
+            let mut fail = errors::prepare_fail(e.clone());
+            if let (Some(path), Fail(_, body)) = (&artifact, &mut fail) {
+                let handle_str = handle_node
+                    .map(|n| n.handle.clone())
+                    .unwrap_or_default();
+                let handle_part = if handle_str.is_empty() {
+                    String::new()
+                } else {
+                    format!(" --handle {handle_str}")
+                };
+                let tap = format!(
+                    "\none-tap confirm: cljform edit {}{} --mode {} --content-file {} --repair  (the artifact at that path is the verified candidate shown above; it matches THIS refusal — if the file moved since, the confirm fails stale-handle and re-votes)",
+                    file.display(),
+                    handle_part,
+                    mode_name(&mode),
+                    path.display(),
+                );
+                body.hint = Some(match body.hint.take() {
+                    Some(h) => format!("{h}{tap}"),
+                    None => tap,
+                });
+            }
+            return Err(fail);
+        }
+        Err(e) => return Err(errors::prepare_fail(e)),
+    };
     if !matches!(base_shift, seam::BaseShift::None) {
         let t = String::from_utf8_lossy(&prepared.bytes).into_owned();
         prepared.bytes = seam::reindent_dedent_by(&stripped, &t).into_bytes();
@@ -716,8 +751,28 @@ fn verify_edit(
 /// THAT splice — stated once, never applied; if the end-append does not
 /// parse, the refusal says so honestly and shows no preview. Whole-form
 /// content modes keep the absolute framing (nothing to be relative to).
+/// Issue 46 (A): persist the verified inferred candidate for the one-tap
+/// confirm. Draft's temp-dir contract: the system temp dir, a stable
+/// `cljform-edit-<pid>-<n>-candidate.clj` name, repo untouched. The
+/// candidate is the one the refusal already displayed and 42's claim path
+/// already parse-verified.
+fn write_candidate_artifact(candidate: &str) -> Option<PathBuf> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "cljform-edit-{}-{n}-candidate.clj",
+        std::process::id()
+    ));
+    std::fs::write(&path, candidate).ok()?;
+    Some(path)
+}
+
+#[allow(clippy::too_many_arguments)] // issue 45/46: the walker diagnosis needs the full payload + provenance context
 fn write_gate_enrich(
     fail: Fail,
+    file: &Path,
+    handle: &Option<String>,
     payload: &Option<content::Payload>,
     content: &Option<String>,
     content_file: &Option<PathBuf>,
@@ -822,12 +877,23 @@ fn write_gate_enrich(
                                 };
                                 let claim =
                                     crate::balance::tail_verification_claim(new_bytes, &tail, "file");
+                                // Issue 46 (A): the candidate artifact + the
+                                // one-tap confirm (a reference call — the
+                                // patch is re-run with --new-text-file, its
+                                // oldText unchanged).
+                                let tap = match write_candidate_artifact(&candidate) {
+                                    Some(path) => format!(
+                                        "\none-tap confirm: re-run this patch with --new-text-file {} (oldText unchanged — the artifact is the balanced newText; if the file moved since this refusal, the confirm fails stale-handle and re-votes)",
+                                        path.display()
+                                    ),
+                                    None => String::new(),
+                                };
                                 (
                                     format!(
                                         "resulting file is missing {n} closer(s) at EOF; mechanical tail (placement is yours to verify): {tail}\npreview (tail appended at end \u{2014} verify placement):\n{preview}\n{claim}"
                                     ),
                                     format!(
-                                        "fix the submitted {field}: append the missing closer(s) above at its end (they closed the enclosing form that oldText also closed), then resubmit; cljform never writes to a file that does not parse"
+                                        "fix the submitted {field}: append the missing closer(s) above at its end (they closed the enclosing form that oldText also closed), then resubmit; cljform never writes to a file that does not parse{tap}"
                                     ),
                                 )
                             } else {
@@ -879,9 +945,10 @@ fn write_gate_enrich(
                 // (newText + tail), stated once; the loud caveats stand
                 // unchanged and nothing is ever applied.
                 if crate::balance::tail_verifies(submitted.as_bytes(), &tail) {
+                    let candidate = format!("{submitted}{tail}");
                     let diff = crate::materialize::unified_diff(
                         old_text.as_deref().expect("old_walk gate above"),
-                        &format!("{submitted}{tail}"),
+                        &candidate,
                         "oldText",
                         "newText+tail",
                     );
@@ -890,8 +957,15 @@ fn write_gate_enrich(
                         &tail,
                         "newText",
                     );
+                    let tap = match write_candidate_artifact(&candidate) {
+                        Some(path) => format!(
+                            "\none-tap confirm: re-run this patch with --new-text-file {} (oldText unchanged \u{2014} the artifact is the balanced newText; if the file moved since this refusal, the confirm fails stale-handle and re-votes)",
+                            path.display()
+                        ),
+                        None => String::new(),
+                    };
                     format!(
-                        "{field} is missing {n} closer(s); mechanical tail (placement is yours to verify): {tail}\npreview (tail appended at end \u{2014} verify placement):\n{diff}\n{claim}"
+                        "{field} is missing {n} closer(s); mechanical tail (placement is yours to verify): {tail}\npreview (tail appended at end \u{2014} verify placement):\n{diff}\n{claim}{tap}"
                     )
                 } else {
                     format!(
@@ -910,8 +984,26 @@ fn write_gate_enrich(
                 // reported as verified facts.
                 let claim =
                     crate::balance::tail_verification_claim(new_bytes, &tail, "file");
+                // Issue 46 (A): the candidate artifact for the content-mode
+                // one-tap confirm (new_bytes + tail verified at file level).
+                let tap = {
+                    let candidate = {
+                        let mut c = new_bytes.to_vec();
+                        c.extend_from_slice(tail.as_bytes());
+                        String::from_utf8_lossy(&c).into_owned()
+                    };
+                    match write_candidate_artifact(&candidate) {
+                        Some(path) => format!(
+                            "\none-tap confirm: cljform edit {} --handle {} --mode replace --content-file {} --repair (the artifact is the resulting file with the tail appended \u{2014} verified above; if the file moved since this refusal, the confirm fails stale-handle and re-votes)",
+                            file.display(),
+                            handle.as_deref().unwrap_or("<handle>"),
+                            path.display()
+                        ),
+                        None => String::new(),
+                    }
+                };
                 format!(
-                    "{field} is missing {n} closer(s); mechanical tail (placement is yours to verify): {tail} \u{2014} {claim}"
+                    "{field} is missing {n} closer(s); mechanical tail (placement is yours to verify): {tail} \u{2014} {claim}{tap}"
                 )
             };
             let lead = match &rel {
@@ -1046,6 +1138,7 @@ pub fn run_edit(
     old_text_file: &Option<PathBuf>,
     new_text_file: &Option<PathBuf>,
     handle_opt: &Option<String>,
+    name: &Option<String>,
     dry_run: bool,
     strict: bool,
     repair: bool,
@@ -1078,6 +1171,55 @@ pub fn run_edit(
         ),
         _ => (None, None),
     };
+
+    // Issue 46 (B): patch-by-name — resolve a unique def-like name to its
+    // handle and continue through the EXISTING handle path (stale recovery,
+    // verification, everything identical). SAFE for patch only: the
+    // payload's oldText must match current bytes, so the freshness guard is
+    // the payload itself — a stale mental model fails loudly as
+    // patch-not-found exactly as with a handle. Replace/insert/delete stay
+    // handle-only (no payload guard there; replace would bypass the
+    // content-addressed staleness check).
+    let handle_opt: Option<String> = match (name, mode) {
+        (Some(n), Mode::Patch) => {
+            // The parse gate at fn top already proved the file parses; the
+            // re-parse is deterministic (issue 30 L1 precedent).
+            #[allow(clippy::expect_used)]
+            let forms = {
+                let parsed = parser::parse(&bytes).expect("parse gate above");
+                if parsed.forms.is_empty() {
+                    return Err(Fail(
+                        errors::exit::TARGET,
+                        ErrorBody::new(
+                            "form-not-found",
+                            format!("no form defines {n:?}"),
+                        )
+                        .with_hint("no def-like forms carry names in this file"),
+                    ));
+                }
+                parsed.forms
+            };
+            let target = ops::resolve_target(&forms, n)?;
+            // The full hash's 6-hex prefix IS the handle (content-addressed);
+            // it exists in the current tree by construction, so the
+            // resolution can never go stale.
+            Some(target.form.hash[..6].to_string())
+        }
+        (Some(_), _) => {
+            return Err(Fail(
+                errors::exit::USAGE,
+                ErrorBody::new(
+                    "usage",
+                    "--name is patch-only: the patch's oldText is the freshness guard, so name resolution is safe there",
+                )
+                .with_hint(
+                    "for replace/insert/delete use the handle: clj_get --name <name> gives the current handle",
+                ),
+            ))
+        }
+        (None, _) => handle_opt.clone(),
+    };
+    let handle_opt = &handle_opt;
 
     // Target (SPEC §5/§10.3): --handle for replace/patch/delete/
     // insert-before/insert-after; append and prepend are file-level and
@@ -1260,7 +1402,7 @@ pub(crate) fn run_edit_op(
             }
         },
         _ => Some(build_prepared_payload(
-            mode, content, content_file, handle_node.as_ref(), bytes, strict, repair,
+            file, mode, content, content_file, handle_node.as_ref(), bytes, strict, repair,
             format_content, &mut notes,
         )?),
     };
@@ -1381,8 +1523,12 @@ pub(crate) fn run_edit_op(
     ) {
         Ok(ok) => ok,
         Err(fail) => {
+            let gate_handle: Option<String> =
+                handle_node.as_ref().map(|n| n.handle.clone());
             return Err(write_gate_enrich(
                 fail,
+                file,
+                &gate_handle,
                 &payload,
                 content,
                 content_file,
@@ -2893,6 +3039,8 @@ mod tests {
         .with_unclosed_diagnosis(&diagnosis);
         let out = write_gate_enrich(
             Fail(errors::exit::PARSE, body),
+            Path::new("r.clj"),
+            &None,
             &Some(prepared_payload()),
             &Some(submitted.to_string()),
             &None,
@@ -2940,6 +3088,8 @@ mod tests {
         let new_bytes = b"(ns r)\n(defn f [x]\n  (dec x";
         let out = write_gate_enrich(
             resulting_file_fail(),
+            Path::new("r.clj"),
+            &None,
             &Some(prepared_payload()),
             &Some(submitted.to_string()),
             &None,
@@ -2991,6 +3141,8 @@ mod tests {
         let new_bytes = b"(ns r)\n(def f x \"((";
         let out = write_gate_enrich(
             resulting_file_fail(),
+            Path::new("r.clj"),
+            &None,
             &Some(prepared_payload()),
             &Some(submitted.to_string()),
             &None,
@@ -3026,6 +3178,8 @@ mod tests {
         let submitted = "(a [b\nc)";
         let out = write_gate_enrich(
             resulting_file_fail(),
+            Path::new("r.clj"),
+            &None,
             &Some(prepared_payload()),
             &Some(submitted.to_string()),
             &None,
@@ -3056,6 +3210,8 @@ mod tests {
     fn write_gate_balanced_content_passes_through() {
         let out = write_gate_enrich(
             resulting_file_fail(),
+            Path::new("r.clj"),
+            &None,
             &Some(prepared_payload()),
             &Some("\"x\"".to_string()),
             &None,
@@ -3087,6 +3243,8 @@ mod tests {
         );
         let out = write_gate_enrich(
             fail,
+            Path::new("r.clj"),
+            &None,
             &Some(prepared_payload()),
             &Some("(defn f [x]\n  (dec x".to_string()),
             &None,
@@ -3112,6 +3270,8 @@ mod tests {
         let submitted = "(a b (c"; // walks: 2 open, 0 close — missing 2, tail `))`
         let out = write_gate_enrich(
             resulting_file_fail(),
+            Path::new("r.clj"),
+            &None,
             &Some(patch_payload()),
             &None,
             &None,
@@ -3174,6 +3334,8 @@ mod tests {
         let submitted = "(a b))"; // walks: mismatch, `)` with no openers remain
         let out = write_gate_enrich(
             resulting_file_fail(),
+            Path::new("r.clj"),
+            &None,
             &Some(patch_payload()),
             &None,
             &None,
@@ -3211,6 +3373,8 @@ mod tests {
         let submitted = "(a) [b) c";
         let out = write_gate_enrich(
             resulting_file_fail(),
+            Path::new("r.clj"),
+            &None,
             &Some(patch_payload()),
             &None,
             &None,
@@ -3244,6 +3408,8 @@ mod tests {
         let submitted = "(def s \"(abc";
         let out = write_gate_enrich(
             resulting_file_fail(),
+            Path::new("r.clj"),
+            &None,
             &Some(patch_payload()),
             &None,
             &None,
@@ -3277,6 +3443,8 @@ mod tests {
     fn write_gate_patch_without_old_text_keeps_absolute() {
         let out = write_gate_enrich(
             resulting_file_fail(),
+            Path::new("r.clj"),
+            &None,
             &Some(patch_payload()),
             &None,
             &None,
@@ -3313,6 +3481,8 @@ mod tests {
         let new_bytes = b"(defn outer [x]\n  (helper x)\n  (helper y)\n";
         let out = write_gate_enrich(
             resulting_file_fail(),
+            Path::new("r.clj"),
+            &None,
             &Some(patch_payload()),
             &None,
             &None,
@@ -3378,6 +3548,8 @@ mod tests {
         let submitted = "(a) [b) (c d"; // early-exit net 0; full: 3 open, 2 close → -1
         let out = write_gate_enrich(
             resulting_file_fail(),
+            Path::new("r.clj"),
+            &None,
             &Some(patch_payload()),
             &None,
             &None,
@@ -3411,6 +3583,8 @@ mod tests {
         let new_bytes = b"(def s \"(abc";
         let out = write_gate_enrich(
             resulting_file_fail(),
+            Path::new("r.clj"),
+            &None,
             &Some(patch_payload()),
             &None,
             &None,
@@ -3445,6 +3619,8 @@ mod tests {
         let new_bytes = b"(a) )"; // parse fails: stray closer; file walk = mismatch
         let out = write_gate_enrich(
             resulting_file_fail(),
+            Path::new("r.clj"),
+            &None,
             &Some(patch_payload()),
             &None,
             &None,
@@ -3470,6 +3646,8 @@ mod tests {
     fn write_gate_patch_balanced_newtext_zero_delta_passes_through() {
         let out = write_gate_enrich(
             resulting_file_fail(),
+            Path::new("r.clj"),
+            &None,
             &Some(patch_payload()),
             &None,
             &None,
