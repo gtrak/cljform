@@ -41,6 +41,11 @@ pub struct Fail(pub u8, pub ErrorBody);
 #[derive(Serialize)]
 pub struct ErrorBody {
     pub code: &'static str,
+    /// Issue 45: the bracket-failure subkind on `unbalanced-content` —
+    /// `mismatch` | `missing-tail` | `unparseable`. Additive, present only
+    /// when set; every other envelope stays byte-identical.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub line: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -90,6 +95,7 @@ impl ErrorBody {
     pub fn new(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             code,
+            kind: None,
             line: None,
             col: None,
             message: message.into(),
@@ -113,6 +119,12 @@ impl ErrorBody {
 
     pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
         self.hint = Some(hint.into());
+        self
+    }
+
+    /// Issue 45: the bracket-failure subkind on `unbalanced-content`.
+    pub fn kind(mut self, kind: &'static str) -> Self {
+        self.kind = Some(kind);
         self
     }
 
@@ -241,7 +253,7 @@ pub fn prepare_fail(p: content::PrepareError) -> Fail {
                 } => {
                     format!(
                         "{}; a misplaced closer cannot be fixed by a tail",
-                        crate::balance::mismatch_sentence(closer, line, col, innermost)
+                        crate::balance::mismatch_sentence(closer, line, col, innermost.as_ref())
                     )
                 }
                 // A raw walk of submitted content cannot come back balanced
@@ -265,6 +277,7 @@ pub fn prepare_fail(p: content::PrepareError) -> Fail {
                         "content is unbalanced and bracket inference is off (opt-in)\n{diff}\ncandidate:\n{candidate}"
                     ),
                 )
+                .kind("missing-tail")
                 .with_hint(hint),
             )
         },
@@ -276,23 +289,118 @@ pub fn prepare_fail(p: content::PrepareError) -> Fail {
             )
             .with_hint("resend the complete content, or remove the stray opening fence"),
         ),
-        other => {
-            let (line, col) = match other.line_col() {
-                Some((l, c)) => (Some(l), Some(c)),
-                None => (None, None),
-            };
-            Fail(
-                exit::PARSE,
-                ErrorBody::new("not-one-form", other.message())
-                    .at(line, col)
-                    .with_hint(
-                        "submit balanced content, or run clj_draft to see the inferred candidate; this content needs a human eye"
-                    ),
+        content::PrepareError::Empty => Fail(
+            exit::TARGET,
+            ErrorBody::new(
+                "empty-content",
+                "content is empty or comments-only — was a variable interpolated? (for removal use mode \"delete\")",
+            )
+            .with_hint("for removal use mode \"delete\"; otherwise submit the forms you meant"),
+        ),
+        // Issue 45: both bracket-failure arms route through the balance
+        // walk on the content AS SUBMITTED — the mismatch diagnosis carries
+        // the FULL open stack (head tokens + line:col), the net-unclosed
+        // count comes from full counts, and the code is `unbalanced-content`
+        // (the old `not-one-form` mislabeled legal multi-form content). The
+        // raw prepare-layer error is demoted to context, same layering as
+        // the issue-39/44 fixes.
+        content::PrepareError::Materialize { err, submitted } => {
+            bracket_failure_fail(
+                format!(
+                    "context: content structure rejected — line {} col {}: {}",
+                    err.line, err.col, err.message
+                ),
+                &submitted,
+            )
+        }
+        content::PrepareError::Unparseable { err, submitted } => {
+            bracket_failure_fail(
+                format!(
+                    "context: content does not parse — line {} col {}: {}",
+                    err.line, err.col, err.message
+                ),
+                &submitted,
             )
         }
     }
 }
 
+/// Issue 45: the shared diagnosis for content bracket failures that the
+/// repair pipeline cannot structure (mismatched brackets make indent mode
+/// itself reject; unrepairable content fails the re-parse). The balance
+/// walk on the submitted text leads with the honest facts — the mismatch
+/// case carries the FULL open stack with head tokens + line:col (the
+/// culprits of a dropped-closer transcription are exactly the still-open
+/// openers); the raw prepare-layer error is demoted to context. Code is
+/// `unbalanced-content` (the old `not-one-form` mislabeled legal
+/// multi-form content); the LIFO rule holds — a mismatch offers no tail.
+fn bracket_failure_fail(raw_context: String, submitted: &str) -> Fail {
+    let (lead, kind, hint, at) = match crate::balance::walk(submitted) {
+        crate::balance::Walk::Mismatch {
+            closer,
+            line,
+            col,
+            innermost,
+            remaining,
+            ..
+        } => {
+            let sentence = crate::balance::mismatch_sentence(
+                closer,
+                line,
+                col,
+                innermost.as_ref(),
+            );
+            let stack = crate::balance::mismatch_stack_sentence(
+                innermost.as_ref().expect("mismatch with empty stack is represented by innermost=None"),
+                &remaining,
+            );
+            let counts = crate::balance::full_counts(submitted);
+            let net = counts.open.saturating_sub(counts.close);
+            let lead = format!(
+                "{sentence}; {stack} — net {net} opener(s) unclosed at that point"
+            );
+            let hint = format!(
+                "the {} at line {} is the first close that no longer matches — a closer was likely dropped earlier; iterate standalone with `cljform balance --stdin`, then submit balanced content",
+                closer as char,
+                line
+            );
+            (lead, "mismatch", hint, Some((line, col)))
+        }
+        crate::balance::Walk::MissingTail { stack, .. } => {
+            let n = stack.len();
+            let tail = crate::balance::tail_for(&stack);
+            let claim = crate::balance::tail_verification_claim(
+                submitted.as_bytes(),
+                &tail,
+                "content",
+            );
+            let lead = format!(
+                "content is missing {n} closer(s); mechanical tail (placement is yours to verify): {tail} — {claim}"
+            );
+            let hint = "pass --repair to apply the inferred brackets, or submit balanced content".to_string();
+            (lead, "missing-tail", hint, None)
+        }
+        // The walk balances but the grammar still rejects: not a bracket-
+        // balance problem — the raw prepare error leads.
+        crate::balance::Walk::Balanced { .. } => {
+            return Fail(
+                exit::TARGET,
+                ErrorBody::new("unbalanced-content", raw_context)
+                    .kind("unparseable")
+                    .with_hint(
+                        "submit balanced content (check it standalone with `cljform balance --stdin`)",
+                    ),
+            );
+        }
+    };
+    Fail(
+        exit::TARGET,
+        ErrorBody::new("unbalanced-content", format!("{lead}\n{raw_context}"))
+            .kind(kind)
+            .at(at.map(|(l, _)| Some(l)).unwrap_or(None), at.map(|(_, c)| Some(c)).unwrap_or(None))
+            .with_hint(hint),
+    )
+}
 /// Rank the named top-level forms against a failed `--name` lookup: exact >
 /// substring (either direction) > edit distance, so a form whose name
 /// literally contains the query is never buried by closer-spelling strangers.

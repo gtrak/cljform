@@ -226,9 +226,20 @@ fn unterminated_fence_truncated_content_is_refused_not_repaired() {
 fn unrepairable_content_fails_with_position() {
     let p = f("r5.clj");
     let (code, d, _) = edit_content(&p, &handle_of(&p, "target"), "(defn target [x]\n  ] ] ]");
-    assert_eq!(code, 1);
-    assert_eq!(d["error"]["code"], "not-one-form");
+    // Issue 45: bracket failures are unbalanced-content (not-one-form
+    // mislabeled legal multi-form content), with the walker diagnosis.
+    assert_eq!(code, 3);
+    assert_eq!(d["error"]["code"], "unbalanced-content");
+    assert_eq!(d["error"]["kind"], "mismatch");
     assert!(d["error"]["line"].is_u64(), "position required: {d}");
+    assert!(
+        d["error"]["message"].as_str().unwrap().contains("still open at the mismatch"),
+        "full stack in the message: {d}"
+    );
+    assert!(
+        d["error"]["hint"].as_str().unwrap().contains("cljform balance --stdin"),
+        "standalone-iterate pointer: {d}"
+    );
     // File untouched.
     assert_eq!(std::fs::read_to_string(&p).unwrap(), FIXTURE);
 }
@@ -237,12 +248,12 @@ fn unrepairable_content_fails_with_position() {
 fn empty_and_comment_only_content_rejected() {
     let p = f("r6.clj");
     let (code, d, _) = edit_content(&p, &handle_of(&p, "target"), "   \n\n  ");
-    assert_eq!(code, 1);
+    assert_eq!(code, 3);
     assert!(d["error"]["message"].as_str().unwrap().contains("interpolated"));
 
     let (code, d, _) = edit_content(&p, &handle_of(&p, "target"), ";; just a comment");
-    assert_eq!(code, 1);
-    assert_eq!(d["error"]["code"], "not-one-form");
+    assert_eq!(code, 3);
+    assert_eq!(d["error"]["code"], "empty-content");
 }
 
 #[test]

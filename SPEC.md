@@ -114,7 +114,7 @@ cljform [--json|--human] <op> [args]
 - **Exit codes** (the wrapper branches on these):
   - `0` — success (including a clean `--dry-run`; for `balance`: the
     fragment is balanced, with or without an accepted `--tail`, §4.5)
-  - `1` — parse/structure error: `parse-error`, `not-one-form`,
+  - `1` — parse/structure error: `parse-error`,
     `truncated-content`, `shape-violation`, `detector-fatal` (under
     `--strict`), `annotate-conflict` (`tree` view), `materialize-error`,
     `format-error`, `conflict-markers` (a broken file: git conflict
@@ -303,9 +303,17 @@ outcome are **independent of indentation**: inference runs on the content
 as submitted (markers/fences stripped only); the base-shift dedent is
 computed from the submitted content and applied after the decision; and
 the parinfer reindent below runs on the balanced prepared content — none
-of it feeds back into the inference. Other refusals: `not-one-form`
-(exit 1 — needs a human eye), `truncated-content` (exit 1, an unterminated
-opening fence). Content modes then reindent
+of it feeds back into the inference. Other refusals: `empty-content` (exit 3, empty or
+comments-only), `truncated-content` (exit 1, an unterminated opening
+fence). Bracket failures of content — including the repair pipeline's
+ambiguous-structure rejection — are `unbalanced-content` (issue 45):
+`kind` is `mismatch` | `missing-tail` | `unparseable`; a mismatch carries
+the FULL open stack at the mismatch (head tokens + line:col, innermost
+first) plus the net-unclosed count, and its hint names
+`cljform balance --stdin` as the standalone iterate tool — never
+`clj_draft` (draft infers from indentation; it is not the tool for
+transcription typos in bracketed content). `not-a-form` is reserved for
+genuine form-count/arity failures (no current producer). Content modes then reindent
 the prepared content in parinfer paren mode (default on; `--no-format-content`
 disables it): the candidate must re-parse and pass the token gate (the
 `format` gates, §10.5), otherwise the prepared content is kept with a note
@@ -889,7 +897,8 @@ Failure variant (the F1 replay): agent edits a test file with the `defn`
 closer misplaced. Two outcomes, both safe:
 - via `clj_edit`: the content splices (repaired from indentation when the
   fix is unambiguous) → **D1 fires** on the result (deftest inside defn) →
-  agent sees it in-turn; or the content is unrepairable → `not-one-form` /
+  agent sees it in-turn; or the content is unrepairable →
+  `unbalanced-content` (walker diagnosis: full open stack, issue 45) /
   `parse-error @ line …`, file untouched.
 - via plain `edit` (if the agent skipped the tools): the **guard hook** appends
   `forms: 13→10, lost: 3× deftest` + D1 to the tool result. Same-turn catch.

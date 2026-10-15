@@ -172,7 +172,7 @@ stays separate calls). Full contract: SPEC §10.3 (batch).
 | `edit <file> --batch OPS.json` | N edit ops in one atomic call: a JSON array of `{handle, mode, content / oldText+newText}`. Every handle resolves against the original file and each target is tracked across the batch; per-op blocks + aggregate counts; any failure writes nothing |
 | `check <file>` | Parse + form table + detector warnings (file or stdin) |
 | `materialize --content C` | Indent-mode bracket completion → candidate + diff, never writes |
-| `balance [file]` | Bracket-balance a fragment (read-only, stdin-first, `--tail T` tests a candidate tail): missing closers → the exact mechanical tail (strings/comments/charlits/regex don't count); a misplaced closer → a line:col diagnosis, no tail offered. Exit 0 balanced / 1 unbalanced or mismatch |
+| `balance [file]` | Bracket-balance a fragment (read-only, stdin-first, `--tail T` tests a candidate tail): missing closers → the exact mechanical tail (strings/comments/charlits/regex don't count); a misplaced closer → a line:col diagnosis with the full open stack, no tail offered. Also the standalone blob validator — `cljform balance --stdin` checks any fragment without a target file or handle. Exit 0 balanced / 1 unbalanced or mismatch |
 | `format <file>` | Reindent → candidate + diff, never writes. Two regimes: parinfer paren mode (default) and a native cljfmt 0.16.6 port (`--fmt cljfmt`, or `CLJFORM_FMT=cljfmt`) |
 | `strip` | Remove `⟦…⟧` markers → exact original bytes (pure filter, file or stdin) |
 

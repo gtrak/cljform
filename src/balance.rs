@@ -35,11 +35,16 @@ use crate::materialize::{lex_step, Lx};
 use crate::ops;
 
 /// One open delimiter of the walk (1-based line/col; col is line-relative).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `head` is the first symbol token after the opener (issue 45): `(try` →
+/// `try`, `(catch` → `catch` — the mismatch diagnosis names culprits by
+/// head + line:col, not bare chars. None when the opener is immediately
+/// followed by a closer/whitespace-close or the line ends.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Opener {
     pub(crate) ch: u8,
     pub(crate) line: usize,
     pub(crate) col: usize,
+    pub(crate) head: Option<String>,
 }
 
 /// Per-delimiter counts. `paren`/`bracket`/`brace` are the closers that
@@ -108,6 +113,32 @@ pub(crate) fn full_counts(text: &str) -> Counts {
     counts
 }
 
+/// The first symbol token after an opener (issue 45): skip blanks, read
+/// until whitespace/delimiter/EOF, capped at 24 bytes. Returns None when the
+/// opener is immediately (or blank-then) closed or the line ends first.
+fn head_of(bytes: &[u8], start: usize) -> Option<String> {
+    let mut i = start;
+    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return None;
+    }
+    let is_delim = |b: u8| matches!(b, b'(' | b')' | b'[' | b']' | b'{' | b'}');
+    if is_delim(bytes[i]) {
+        return None;
+    }
+    let begin = i;
+    while i < bytes.len()
+        && !bytes[i].is_ascii_whitespace()
+        && !is_delim(bytes[i])
+        && i - begin < 24
+    {
+        i += 1;
+    }
+    Some(String::from_utf8_lossy(&bytes[begin..i]).into_owned())
+}
+
 /// The raw-delimiter stack walk: the materialize lexer's exact state
 /// machine, line by line (a comment never spans lines; a multi-line string
 /// stays open and its interior never counts).
@@ -129,10 +160,12 @@ pub(crate) fn walk(text: &str) -> Walk {
             match bytes[idx] {
                 b'(' | b'[' | b'{' => {
                     counts.open += 1;
+                    let head = head_of(bytes, idx + 1);
                     stack.push(Opener {
                         ch: bytes[idx],
                         line: li + 1,
                         col: idx + 1,
+                        head,
                     });
                 }
                 b')' | b']' | b'}' => {
@@ -230,20 +263,46 @@ pub fn tail_verification_claim(bytes: &[u8], tail: &str, target: &str) -> String
 /// and the `edit` unbalanced-refusal hint (issue 39 wiring): closer char +
 /// line:col, and the innermost opener it failed to close (char + line:col,
 /// or "no openers remain").
-pub(crate) fn mismatch_sentence(closer: u8, line: usize, col: usize, innermost: Option<Opener>) -> String {
+pub(crate) fn mismatch_sentence(closer: u8, line: usize, col: usize, innermost: Option<&Opener>) -> String {
     let ch = closer as char;
     match innermost {
         Some(o) => format!(
             "mismatch at line {line} col {col}: {ch} closes nothing \
-             — innermost open is {} from line {} col {}",
-            o.ch as char,
-            o.line,
-            o.col
+             — innermost open is {ch2} from line {oline} col {ocol}",
+            ch2 = o.ch as char,
+            oline = o.line,
+            ocol = o.col
         ),
         None => format!(
             "mismatch at line {line} col {col}: {ch} closes nothing — no openers remain"
         ),
     }
+}
+
+/// An opener labeled for humans: head token when present (issue 45 —
+/// `(try @12:7`), bare char otherwise (`( @12:7`).
+pub(crate) fn opener_label(o: &Opener) -> String {
+    let ch = o.ch as char;
+    match &o.head {
+        Some(h) => format!("{ch}{h} @{}:{}", o.line, o.col),
+        None => format!("{ch} @{}:{}", o.line, o.col),
+    }
+}
+
+/// The FULL open stack at a mismatch, innermost first (issue 45): the
+/// still-open openers the culprit closer left behind — the culprits of the
+/// owner's incident (dropped closers earlier in the form) are exactly these
+/// entries, each with its head token + line:col. `innermost` first, then
+/// `remaining` (already bottom-first) reversed.
+pub(crate) fn mismatch_stack_sentence(innermost: &Opener, remaining: &[Opener]) -> String {
+    let mut labels = vec![opener_label(innermost)];
+    for o in remaining.iter().rev() {
+        labels.push(opener_label(o));
+    }
+    format!(
+        "still open at the mismatch (innermost first): {}",
+        labels.join(", ")
+    )
 }
 
 /// (1-based line, 1-based col) where a char appended right after `text`
@@ -317,7 +376,7 @@ fn read_fragment(file: &Option<PathBuf>, stdin: bool) -> Result<(String, Option<
 /// The mismatch report (SPEC §4.5): the closer, where it sat, the
 /// innermost opener it failed to close (None = the closer arrived with an
 /// empty stack), and — derived — the one-sentence diagnosis.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Mismatch {
     closer: u8,
     line: usize,
@@ -328,7 +387,7 @@ struct Mismatch {
 impl Mismatch {
     /// The one-sentence diagnosis (shared with the edit hint).
     fn sentence(&self) -> String {
-        mismatch_sentence(self.closer, self.line, self.col, self.innermost)
+        mismatch_sentence(self.closer, self.line, self.col, self.innermost.as_ref())
     }
 }
 
@@ -418,7 +477,7 @@ fn decide(w: &Walk, tail: &Option<String>, text: &str) -> Verdict {
                         _ => b'}',
                     };
                     if b != expected {
-                        bad = Some((i, b, Some(*open)));
+                        bad = Some((i, b, Some(open.clone())));
                         break;
                     }
                 }
@@ -497,7 +556,7 @@ fn decide(w: &Walk, tail: &Option<String>, text: &str) -> Verdict {
                     closer: *closer,
                     line: *line,
                     col: *col,
-                    innermost: *innermost,
+                    innermost: innermost.clone(),
                 }),
                 notes,
             }
@@ -540,7 +599,7 @@ pub fn run_balance(
                 "stack".into(),
                 serde_json::json!(
                     s.iter()
-                        .map(|o| serde_json::json!({ "ch": o.ch as char, "line": o.line, "col": o.col }))
+                        .map(|o| serde_json::json!({ "ch": o.ch as char, "line": o.line, "col": o.col, "head": o.head }))
                         .collect::<Vec<_>>()
                 ),
             );
@@ -556,7 +615,8 @@ pub fn run_balance(
             mm.insert(
                 "innermost".into(),
                 m.innermost
-                    .map(|o| serde_json::json!({ "ch": o.ch as char, "line": o.line, "col": o.col }))
+                    .as_ref()
+                    .map(|o| serde_json::json!({ "ch": o.ch as char, "line": o.line, "col": o.col, "head": o.head }))
                     .unwrap_or(serde_json::Value::Null),
             );
             mm.insert("message".into(), serde_json::json!(m.sentence()));

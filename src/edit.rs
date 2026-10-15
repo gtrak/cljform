@@ -934,7 +934,7 @@ fn write_gate_enrich(
         } => {
             let absolute = format!(
                 "{field}: {}; a misplaced closer cannot be fixed by a tail",
-                crate::balance::mismatch_sentence(closer, line, col, innermost)
+                crate::balance::mismatch_sentence(closer, line, col, innermost.as_ref())
             );
             let lead = match &rel {
                 Some((old_c, new_c)) => patch_relative_lead(new_c, old_c, absolute),

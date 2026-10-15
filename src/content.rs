@@ -37,10 +37,20 @@ pub enum Payload {
 pub enum PrepareError {
     /// Empty or comments-only: almost certainly not what the caller meant.
     Empty,
-    /// Unbalanced even after repair; carries the precise parse error.
-    Unparseable(ParseError),
+    /// Unbalanced even after repair; carries the precise parse error and
+    /// the submitted text (issue 45: the balance walk diagnoses it).
+    Unparseable {
+        err: ParseError,
+        submitted: String,
+    },
     /// Indent mode itself rejected the structure (mismatched brackets).
-    Materialize(materialize::MaterializeError),
+    /// Carries the submitted text (issue 45: the balance walk diagnoses
+    /// the mismatch — full open stack with head tokens + line:col — and
+    /// the envelope is reclassified out of `not-one-form`).
+    Materialize {
+        err: materialize::MaterializeError,
+        submitted: String,
+    },
     /// Content came from an opening markdown fence that was never closed:
     /// almost certainly a truncated paste, so no repair is attempted.
     TruncatedFence,
@@ -57,45 +67,6 @@ pub enum PrepareError {
     Unbalanced { candidate: String, diff: String, submitted: String },
 }
 
-impl PrepareError {
-    pub fn message(&self) -> String {
-        match self {
-            PrepareError::Empty => {
-                "content is empty or comments-only — was a variable interpolated? \
-                 (for removal use mode \"delete\")"
-                    .to_string()
-            }
-            PrepareError::Unparseable(e) => format!(
-                "content does not parse even after bracket repair — line {} col {}: {}",
-                e.line, e.col, e.message
-            ),
-            PrepareError::Materialize(e) => format!(
-                "content structure is ambiguous for bracket repair — line {} col {}: {}",
-                e.line, e.col, e.message
-            ),
-            PrepareError::RepairRefused { .. } => "--strict beats --repair: submitted content is \
-                 unbalanced and would have been repaired by indentation — refused instead"
-                .to_string(),
-            PrepareError::TruncatedFence => "content starts with a markdown fence that is never \
-                 closed — the paste looks truncated, so it was not repaired"
-                .to_string(),
-            PrepareError::Unbalanced { .. } => "content is unbalanced and bracket inference is \
-                 off by default — the inferred candidate is attached; pass --repair to apply it"
-                .to_string(),
-        }
-    }
-
-    pub fn line_col(&self) -> Option<(usize, usize)> {
-        match self {
-            PrepareError::Unparseable(e) => Some((e.line, e.col)),
-            PrepareError::Materialize(e) => Some((e.line, e.col)),
-            PrepareError::Empty
-            | PrepareError::TruncatedFence
-            | PrepareError::RepairRefused { .. }
-            | PrepareError::Unbalanced { .. } => None,
-        }
-    }
-}
 
 /// Fence-strip and edge-trim only — no bracket inference. `materialize`
 /// must see the caller's real draft so its own indent-mode inference runs on
@@ -160,14 +131,20 @@ pub fn prepare(
     //    `repair` the candidate is applied; without it the refusal carries
     //    the candidate + diff it would have applied.
     match materialize::indent_mode(&text) {
-        Err(e) => Err(PrepareError::Materialize(e)),
+        Err(e) => Err(PrepareError::Materialize {
+            err: e,
+            submitted: text,
+        }),
         Ok(cand) if cand == text => {
             // The same `text` failed to parse a few lines above (step 2) and
             // the parser is deterministic, so the re-parse is still Err — a
             // hard assertion is the right call (issue 30 L1).
             #[allow(clippy::expect_used)]
             let err = parser::parse(text.as_bytes()).expect_err("parse failed above");
-            Err(PrepareError::Unparseable(err))
+            Err(PrepareError::Unparseable {
+                err,
+                submitted: text,
+            })
         }
         Ok(cand) => {
             let diff = materialize::unified_diff(&text, &cand, "submitted", "repaired");
@@ -183,7 +160,10 @@ pub fn prepare(
                 #[allow(clippy::expect_used)]
                 let err =
                     parser::parse(text.as_bytes()).expect_err("parse failed above");
-                PrepareError::Unparseable(err)
+                PrepareError::Unparseable {
+                    err,
+                    submitted: text.clone(),
+                }
             })?;
             if !repair {
                 return Err(PrepareError::Unbalanced {
