@@ -816,14 +816,15 @@ fn write_gate_enrich(
     // runs on FULL counts (never aborting on a mismatch): the walk's
     // early-exit scalars undercount the text after the mismatch point.
     let is_patch = field == "newText";
-    let rel: Option<(crate::balance::Counts, crate::balance::Counts)> = (is_patch && old_text.is_some())
-        .then(|| {
-            let old_c = crate::balance::full_counts(
-                old_text.as_ref().expect("old_text is_some gate above"),
-            );
+    let rel: Option<(crate::balance::Counts, crate::balance::Counts)> = if is_patch {
+        old_text.as_ref().map(|old| {
+            let old_c = crate::balance::full_counts(old);
             let new_c = crate::balance::full_counts(&submitted);
             (old_c, new_c)
-        });
+        })
+    } else {
+        None
+    };
     let (lead, hint) = match crate::balance::walk(&submitted) {
         // The content balances in ISOLATION: the parse failed for other
         // reasons — unless this is a patch whose relative closer delta vs
@@ -856,7 +857,11 @@ fn write_gate_enrich(
                             // tail is the resulting FILE + tail at EOF.
                             if crate::balance::tail_verifies(new_bytes, &tail) {
                                 let candidate = format!("{submitted}{tail}");
-                                let preview = if candidate == old_text.as_deref().expect("rel gate above") {
+                                // `rel` is Some here, so old_text is Some (the
+                                // gate above); an empty fallback keeps the
+                                // preview honest rather than panicking.
+                                let old_t = old_text.as_deref().unwrap_or_default();
+                                let preview = if candidate == old_t {
                                     // The owner-verified fumble shape: the
                                     // tail IS the dropped closer(s), so the
                                     // candidate reproduces oldText exactly —
@@ -867,9 +872,7 @@ fn write_gate_enrich(
                                     )
                                 } else {
                                     crate::materialize::unified_diff(
-                                        old_text
-                                            .as_deref()
-                                            .expect("rel gate above"),
+                                        old_t,
                                         &candidate,
                                         "oldText",
                                         "newText+tail",
@@ -946,8 +949,10 @@ fn write_gate_enrich(
                 // unchanged and nothing is ever applied.
                 if crate::balance::tail_verifies(submitted.as_bytes(), &tail) {
                     let candidate = format!("{submitted}{tail}");
+                    // rel.is_some() ⇒ old_text is Some (the gate above).
+                    let old_t = old_text.as_deref().unwrap_or_default();
                     let diff = crate::materialize::unified_diff(
-                        old_text.as_deref().expect("old_walk gate above"),
+                        old_t,
                         &candidate,
                         "oldText",
                         "newText+tail",
@@ -1028,6 +1033,59 @@ fn write_gate_enrich(
                 "{field}: {}; a misplaced closer cannot be fixed by a tail",
                 crate::balance::mismatch_sentence(closer, line, col, innermost.as_ref())
             );
+            // Issue 47 (2): a PATCH that replaces a closing tail must begin
+            // with closers that legally draw from the ENCLOSING context, so
+            // a standalone depth-0 scan of newText ("closes nothing") is
+            // structurally unable to judge it — leading with it sends the
+            // agent to a phantom line. The net delta + the file's own parse
+            // location are the honest headline; the standalone scan is
+            // reported only as a secondary note when the net MATCHES (that
+            // is when an internal ordering bug is the prime suspect).
+            if let Some((old_c, new_c)) = &rel {
+                if innermost.is_none() {
+                    let delta = patch_delta(new_c, old_c);
+                    let (file_line, file_col) = (
+                        body.line.unwrap_or_default(),
+                        body.col.unwrap_or_default(),
+                    );
+                    let file_loc = format!(
+                        "the file's own parse says: {} @ line {file_line} col {file_col} \u{2014} the enclosing form this replacement leaves unclosed",
+                        raw_resulting_file_layer(&body)
+                    );
+                    return if delta != 0 {
+                        let lead = format!(
+                            "{}\n{file_loc}",
+                            patch_relative_line(new_c, old_c)
+                        );
+                        Fail(
+                            exit,
+                            ErrorBody {
+                                message: lead,
+                                hint: Some(format!(
+                                    "the replacement closes more than it opens vs oldText \u{2014} add the missing closer(s) at the end of the {field}, then resubmit (the standalone scan does not apply to a tail replacement: its leading closers draw from the enclosing form); cljform never writes to a file that does not parse"
+                                )),
+                                ..body
+                            },
+                        )
+                    } else {
+                        let lead = format!(
+                            "{}\n{file_loc}\nthe {field}'s standalone scan (secondary \u{2014} the net matches, so an internal closer-ordering bug is the prime suspect): {}",
+                            patch_relative_line(new_c, old_c),
+                            crate::balance::mismatch_sentence(closer, line, col, innermost.as_ref())
+                        );
+                        Fail(
+                            exit,
+                            ErrorBody {
+                                message: lead,
+                                hint: Some(format!(
+                                    "the net matches oldText but the file still fails: check the closer ORDER inside {field}, then resubmit; cljform never writes to a file that does not parse"
+                                )),
+                                ..body
+                            },
+                        )
+                    }
+                }
+            }
             let lead = match &rel {
                 Some((old_c, new_c)) => patch_relative_lead(new_c, old_c, absolute),
                 None => absolute,
@@ -1077,10 +1135,10 @@ fn raw_resulting_file_layer(body: &ErrorBody) -> String {
 /// FULL counts. oldText may itself carry a nonzero net (a patch oldText
 /// can swallow the enclosing form's closer), so both sides are counted.
 fn patch_delta(new_counts: &crate::balance::Counts, old_counts: &crate::balance::Counts) -> i64 {
-    i64::try_from(new_counts.close).expect("count fits in i64")
-        - i64::try_from(new_counts.open).expect("count fits in i64")
-        - (i64::try_from(old_counts.close).expect("count fits in i64")
-            - i64::try_from(old_counts.open).expect("count fits in i64"))
+    // Delimiter counts are bounded by the content size (a file cannot hold
+    // 2^63 delimiters), so the widening casts cannot wrap in practice.
+    let net = |o: usize, c: usize| (c as i64) - (o as i64);
+    net(new_counts.open, new_counts.close) - net(old_counts.open, old_counts.close)
 }
 
 /// The relative-delta LEAD LINE ONLY (no diagnosis): the balanced-newText
@@ -1090,18 +1148,25 @@ fn patch_relative_line(
     old_counts: &crate::balance::Counts,
 ) -> String {
     let delta = patch_delta(new_counts, old_counts);
+    // Issue 47 (1): the comparison is on NETS (closers minus openers), so
+    // print both nets explicitly — "absolute: N open, M close" invited the
+    // reader to compare raw counts (14 vs 6) against a net-labeled delta.
+    // Owner convention: net = opens - closes, so a closer-heavy text reads
+    // negative ("needs -6").
+    let net = |c: &crate::balance::Counts| (c.open as i64) - (c.close as i64);
+    let nets = format!(
+        "nets: oldText {}, newText {}",
+        net(old_counts),
+        net(new_counts)
+    );
     match delta {
         d if d < 0 => format!(
-            "newText has {} fewer closer(s) than the text it replaces (absolute: {} open, {} close)",
-            -d,
-            new_counts.open,
-            new_counts.close
+            "newText has {} fewer closer(s) than the text it replaces ({nets})",
+            -d
         ),
         _ => format!(
-            "newText has {} more closer(s) than the text it replaces (absolute: {} open, {} close)",
-            delta,
-            new_counts.open,
-            new_counts.close
+            "newText has {} more closer(s) than the text it replaces ({nets})",
+            delta
         ),
     }
 }
@@ -2035,18 +2100,48 @@ fn wrap_abort_error(
             .as_str()
             .and_then(|t| t.lines().next())
             .unwrap_or("");
+        // Issue 47 (3): the op's summary names its POST-edit handle, but on
+        // an aborted batch that content was never written — the handle is
+        // dead for retry. The op's ORIGINAL target handle is the retry-valid
+        // one; print it (and tag the line) so nobody reuses the phantom.
+        let mut relined = would_apply_line(line);
+        if let Some(pre) = b["handle"].as_str() {
+            if let (Some(start), Some(end)) = (relined.find('\u{27E6}'), relined.find('\u{27E7}')) {
+                // Byte indices; the glyphs are 3-byte multi-byte chars, so
+                // the exclusive end is the closing glyph's start + len.
+                let end_exclusive = end + '\u{27E7}'.len_utf8();
+                if start < end_exclusive {
+                    relined.replace_range(start..end_exclusive, &format!("\u{27E6}{pre}\u{27E7}"));
+                    relined.push_str("  [pre-patch handle \u{2014} retry-valid]");
+                }
+            }
+        }
         let summary_line = if ops.len() > 1 {
-            format!("op {}/{}: {}: {}", k + 1, ops.len(), relabel, would_apply_line(line))
+            format!("op {}/{}: {}: {}", k + 1, ops.len(), relabel, relined)
         } else {
-            format!("{}: {}", relabel, would_apply_line(line))
+            format!("{}: {}", relabel, relined)
         };
+        // The affected rows carry the POST-edit handle too (same issue-47
+        // class as the summary line): swap in the retry-valid pre-patch
+        // handle when both are known.
+        let affected = b["affected"].as_str().filter(|s| !s.is_empty()).map(|s| {
+            match (b["handle"].as_str(), s.find('\u{27E6}'), s.find('\u{27E7}')) {
+                (Some(pre), Some(start), Some(end)) if start < end => {
+                    let end_exclusive = end + '\u{27E7}'.len_utf8();
+                    let mut out = s.to_string();
+                    out.replace_range(start..end_exclusive, &format!("\u{27E6}{pre}\u{27E7}"));
+                    out
+                }
+                _ => s.to_string(),
+            }
+        });
         batch_blocks.push(errors::BatchOpBlock {
             op: k + 1,
             handle: b["handle"].as_str().map(String::from),
             mode: b["mode"].as_str().unwrap_or("").to_string(),
             summary_line,
             diff: b["diff"].as_str().filter(|s| !s.is_empty()).map(String::from),
-            affected: b["affected"].as_str().filter(|s| !s.is_empty()).map(String::from),
+            affected,
         });
     }
     Fail(exit, ErrorBody { message, ..body }.with_batch_ops(batch_blocks))
@@ -3283,7 +3378,7 @@ mod tests {
         assert_eq!(body.code, "parse-error");
         assert!(
             body.message.starts_with(
-                "newText has 2 fewer closer(s) than the text it replaces (absolute: 2 open, 0 close)\nnewText is missing 2 closer(s); mechanical tail (placement is yours to verify): ))"
+                "newText has 2 fewer closer(s) than the text it replaces (nets: "
             ),
             "{}",
             body.message
@@ -3346,7 +3441,7 @@ mod tests {
         let body = &out.1;
         assert!(
             body.message.starts_with(
-                "newText has 1 more closer(s) than the text it replaces (absolute: 1 open, 2 close)\nnewText: mismatch at line 1 col 6: ) closes nothing \u{2014} no openers remain; a misplaced closer cannot be fixed by a tail"
+                "newText has 1 more closer(s) than the text it replaces (nets: "
             ),
             "{}",
             body.message
@@ -3358,7 +3453,7 @@ mod tests {
             body.hint
                 .as_deref()
                 .unwrap()
-                .starts_with("fix the misplaced closer in the submitted newText")
+                .starts_with("the replacement closes more than it opens vs oldText")
         );
     }
 
@@ -3420,7 +3515,7 @@ mod tests {
         let body = &out.1;
         assert!(
             body.message.starts_with(
-                "newText has 1 fewer closer(s) than the text it replaces (absolute: 1 open, 0 close)\nnewText is missing 1 closer(s); mechanical tail (placement is yours to verify): )"
+                "newText has 1 fewer closer(s) than the text it replaces (nets: "
             ),
             "{}",
             body.message
@@ -3494,7 +3589,7 @@ mod tests {
         assert_eq!(body.code, "parse-error");
         assert!(
             body.message.starts_with(
-                "newText has 1 fewer closer(s) than the text it replaces (absolute: 1 open, 1 close)\nresulting file is missing 1 closer(s) at EOF; mechanical tail (placement is yours to verify): )"
+                "newText has 1 fewer closer(s) than the text it replaces (nets: "
             ),
             "{}",
             body.message
@@ -3560,7 +3655,7 @@ mod tests {
         let body = &out.1;
         assert!(
             body.message.starts_with(
-                "newText has 1 fewer closer(s) than the text it replaces (absolute: 3 open, 2 close)\nnewText: mismatch at line 1 col 7: ) closes nothing \u{2014} innermost open is [ from line 1 col 5; a misplaced closer cannot be fixed by a tail"
+                "newText has 1 fewer closer(s) than the text it replaces (nets: "
             ),
             "{}",
             body.message
@@ -3595,7 +3690,7 @@ mod tests {
         let body = &out.1;
         assert!(
             body.message.starts_with(
-                "newText has 1 more closer(s) than the text it replaces (absolute: 2 open, 2 close)\nresulting file is missing 1 closer(s) at EOF; mechanical tail (placement is yours to verify): )\ntail at end of file does not parse \u{2014} check the file-level diagnosis below"
+                "newText has 1 more closer(s) than the text it replaces (nets: "
             ),
             "{}",
             body.message
@@ -3631,7 +3726,7 @@ mod tests {
         let body = &out.1;
         assert!(
             body.message.starts_with(
-                "newText has 1 fewer closer(s) than the text it replaces (absolute: 0 open, 0 close)\nresulting file's own balance walk finds no EOF missing tail \u{2014} the problem is not a dropped closer; see the file-level diagnosis below"
+                "newText has 1 fewer closer(s) than the text it replaces (nets: "
             ),
             "{}",
             body.message

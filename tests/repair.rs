@@ -625,3 +625,20 @@ fn materialize_human_unchanged_is_one_line() {
     let s = String::from_utf8(out).unwrap();
     assert_eq!(s, "already canonical (no changes)\n", "{s:?}");
 }
+
+#[test]
+fn closers_only_content_is_diagnosed_not_a_panic() {
+    // Issue 47 regression: content that BEGINS with closers makes the walk
+    // report a mismatch with an EMPTY stack — the diagnosis must handle
+    // innermost=None (it used to expect() and panic; the issue-30 backstop
+    // turned it into internal-error, but a diagnosed refusal is the fix).
+    let p = f("r47.clj");
+    let (code, d, _) = edit_content(&p, &handle_of(&p, "target"), ")))");
+    assert_eq!(code, 3, "{d}");
+    assert_eq!(d["error"]["code"], "unbalanced-content");
+    assert_eq!(d["error"]["kind"], "mismatch");
+    let msg = d["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("no openers remain"), "{msg}");
+    assert!(!msg.contains("still open at the mismatch"), "{msg}");
+    assert_eq!(std::fs::read_to_string(&p).unwrap(), FIXTURE);
+}

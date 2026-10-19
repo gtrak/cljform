@@ -314,7 +314,7 @@ fn write_gate_enrichment_fires_on_file_content() {
     let msg = d["error"]["message"].as_str().unwrap();
     assert!(
         msg.starts_with(
-            "newText has 2 fewer closer(s) than the text it replaces (absolute: 2 open, 0 close)\nnewText is missing 2 closer(s); mechanical tail (placement is yours to verify): )]"
+            "newText has 2 fewer closer(s) than the text it replaces (nets: "
         ),
         "{msg}"
     );

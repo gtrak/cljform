@@ -578,10 +578,14 @@ fn fragment_recovery_line(
 /// "this form is now" is never asserted here.
 fn enclosing_candidate_report(nodes: &[handle::Node], matched: &handle::Node) -> String {
     // Byte ranges are unique per node (same range = same node).
-    let idx = nodes
+    let Some(idx) = nodes
         .iter()
         .position(|n| n.start_byte == matched.start_byte && n.end_byte == matched.end_byte)
-        .expect("matched node is in the collected table");
+    else {
+        // Unreachable by construction (the caller matched from this table);
+        // fall back to the neutral candidate line rather than panicking.
+        return "your oldText matches a form here \u{2014} run tree to pick the handle".to_string();
+    };
     let mut chain: Vec<&handle::Node> = Vec::new();
     let mut p = nodes[idx].parent;
     while let Some(i) = p {

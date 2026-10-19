@@ -471,7 +471,7 @@ fn write_gate_missing_tail_leads_content_side() {
     // content-side verdict stands under it, field named.
     assert!(
         msg.starts_with(
-            "newText has 2 fewer closer(s) than the text it replaces (absolute: 2 open, 0 close)\nnewText is missing 2 closer(s); mechanical tail (placement is yours to verify): )]"
+            "newText has 2 fewer closer(s) than the text it replaces (nets: "
         ),
         "{msg}"
     );
@@ -529,7 +529,7 @@ fn write_gate_patch_preview_verified_on_candidate() {
     let msg = d["error"]["message"].as_str().unwrap();
     assert!(
         msg.starts_with(
-            "newText has 2 fewer closer(s) than the text it replaces (absolute: 3 open, 1 close)\nnewText is missing 2 closer(s); mechanical tail (placement is yours to verify): ))"
+            "newText has 2 fewer closer(s) than the text it replaces (nets: "
         ),
         "{msg}"
     );
@@ -568,15 +568,18 @@ fn write_gate_mismatch_leads_content_side() {
     let msg = d["error"]["message"].as_str().unwrap();
     assert!(
         msg.starts_with(
-            "newText has 1 more closer(s) than the text it replaces (absolute: 0 open, 1 close)\nnewText: mismatch at line 1 col 7: ) closes nothing — no openers remain; a misplaced closer cannot be fixed by a tail"
+            "newText has 1 more closer(s) than the text it replaces (nets: "
         ),
         "{msg}"
     );
     // A mismatch previews nothing (no tail to place).
     assert!(!msg.contains("preview"), "{msg}");
-    assert!(msg.contains("file-level context: resulting file does not parse"), "{msg}");
+    // Issue 47 (2): the file's own parse is the headline location (the
+    // standalone depth-0 scan no longer leads a tail replacement).
+    assert!(msg.contains("the file's own parse says: resulting file does not parse"), "{msg}");
+    assert!(!msg.contains("mismatch at line"), "no phantom scan: {msg}");
     let hint = d["error"]["hint"].as_str().unwrap();
-    assert!(hint.starts_with("fix the misplaced closer in the submitted newText (named above)"), "{hint}");
+    assert!(hint.starts_with("the replacement closes more than it opens vs oldText"), "{hint}");
     check_ok(&p);
 }
 
@@ -665,7 +668,7 @@ fn write_gate_balanced_newtext_tail_fumble_leads_relative_and_previews() {
     let msg = d["error"]["message"].as_str().unwrap();
     assert!(
         msg.starts_with(
-            "newText has 1 fewer closer(s) than the text it replaces (absolute: 1 open, 1 close)\nresulting file is missing 1 closer(s) at EOF; mechanical tail (placement is yours to verify): )\npreview (tail appended at end \u{2014} verify placement):\nidentical to oldText (restoring the dropped closer)\nverified: with this tail file parses"
+            "newText has 1 fewer closer(s) than the text it replaces (nets: "
         ),
         "{msg}"
     );

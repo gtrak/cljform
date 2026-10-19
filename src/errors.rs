@@ -350,15 +350,19 @@ fn bracket_failure_fail(raw_context: String, submitted: &str) -> Fail {
                 col,
                 innermost.as_ref(),
             );
-            let stack = crate::balance::mismatch_stack_sentence(
-                innermost.as_ref().expect("mismatch with empty stack is represented by innermost=None"),
-                &remaining,
-            );
             let counts = crate::balance::full_counts(submitted);
             let net = counts.open.saturating_sub(counts.close);
-            let lead = format!(
-                "{sentence}; {stack} — net {net} opener(s) unclosed at that point"
-            );
+            // An empty stack at the mismatch is a real shape (content that
+            // BEGINS with closers — e.g. a closers-only tail submitted as
+            // whole content); there is no stack to print then, and the
+            // mismatch sentence already says "no openers remain".
+            let lead = match innermost.as_ref() {
+                Some(first) => format!(
+                    "{sentence}; {} — net {net} opener(s) unclosed at that point",
+                    crate::balance::mismatch_stack_sentence(first, &remaining)
+                ),
+                None => format!("{sentence}; net {net} opener(s) unclosed at that point"),
+            };
             let hint = format!(
                 "the {} at line {} is the first close that no longer matches — a closer was likely dropped earlier; iterate standalone with `cljform balance --stdin`, then submit balanced content",
                 closer as char,

@@ -1,5 +1,5 @@
 //! Issue 46 tests: one-tap confirm (candidate artifact + reference-call confirm) and patch-by-name.
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::process::Command;
 
