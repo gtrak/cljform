@@ -714,3 +714,70 @@ fn write_gate_diagnosis_does_not_touch_content_stage() {
     );
     assert!(!d["error"]["message"].as_str().unwrap().contains("file-level context"), "{}", d);
 }
+
+/// Issue 47 follow-up (found by T20 dogfooding on a real repo): the
+/// tail-patch headline used the RAW parser position (often the file's
+/// first line), while the walker's precise innermost opener — the form
+/// that actually needs its closer, plus the forms it swallows — sat unused
+/// in the JSON. The lead, the envelope position, and the `unclosed` key
+/// must agree, and the refusal must carry the same verified candidate +
+/// one-tap confirm the MissingTail path offers (affordance parity).
+#[test]
+fn tail_patch_refusal_names_the_unclosed_form_and_offers_the_candidate() {
+    // Two top-level defns: dropping a closer from the first swallows the
+    // second — the dogfood shape (kaocha api.clj's defn test-plan).
+    let src = "(defn first [config]\n  (assoc config :a (helper config)))\n\n(defn second [config]\n  (inc 1))\n";
+    let p = fixture("tail-patch-47.clj", src.as_bytes());
+    let h = handle_of(&p, "first");
+    let (code, d, err) = edit_args(
+        &p,
+        Some("patch"),
+        Some(&h),
+        &[
+            "--old-text",
+            "(helper config)))",
+            "--new-text",
+            "(helper config))",
+        ],
+    );
+    assert_eq!(code, 1, "{d} {err}");
+    assert_eq!(d["error"]["code"], "parse-error");
+    let msg = d["error"]["message"].as_str().unwrap();
+    // The walker's location leads — the opener that needs the closer, not
+    // the file's first line.
+    assert!(msg.contains("`(defn first [config]` at line 1 col 1"), "{msg}");
+    assert!(msg.contains("second (line 4)"), "swallowed form named: {msg}");
+    // The envelope position agrees with the walker (both the top-level
+    // fields and the additive `unclosed` key).
+    assert_eq!(d["error"]["line"], 1, "{d}");
+    assert_eq!(d["error"]["col"], 1, "{d}");
+    assert_eq!(d["error"]["unclosed"][0]["line"], 1, "{d}");
+    // Affordance parity: the verified candidate artifact + reference call.
+    assert!(msg.contains("one-tap confirm: re-run this patch with --new-text-file"), "{msg}");
+    let path = msg
+        .split("--new-text-file ")
+        .nth(1)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string();
+    let artifact = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(artifact, "(helper config)))", "{artifact}");
+    // The confirm is the ordinary patch write: it succeeds and the file
+    // ends up as intended (the dropped closer restored).
+    let (code2, d2, err2) = edit_args(
+        &p,
+        Some("patch"),
+        Some(&h),
+        &[
+            "--old-text",
+            "(helper config)))",
+            "--new-text-file",
+            &path,
+        ],
+    );
+    assert_eq!(code2, 0, "{d2} {err2}");
+    let after = std::fs::read_to_string(&p).unwrap();
+    assert_eq!(after, src, "the confirm restored the dropped closer");
+}

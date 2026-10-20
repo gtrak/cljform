@@ -1048,19 +1048,96 @@ fn write_gate_enrich(
                         body.line.unwrap_or_default(),
                         body.col.unwrap_or_default(),
                     );
-                    let file_loc = format!(
-                        "the file's own parse says: {} @ line {file_line} col {file_col} \u{2014} the enclosing form this replacement leaves unclosed",
-                        raw_resulting_file_layer(&body)
-                    );
+                    // Issue 44's walker gives the actionable location —
+                    // the innermost unclosed OPENER (its head token and
+                    // line:col) plus the swallowed forms — where the raw
+                    // parser only names the file's first line. Fall back to
+                    // the raw layer when the walker declines (not an
+                    // unclosed kind, non-UTF-8, balanced walk).
+                    // The envelope's own line/col (the raw parser's, often
+                    // the file's first line) is replaced by the walker's
+                    // innermost opener so the structured position and the
+                    // message agree.
+                    let mut envelope_pos: Option<(usize, usize)> = None;
+                    let file_loc =
+                        match crate::parser::parse(new_bytes) {
+                            Err(pe) => match crate::broken::unclosed_diagnosis(new_bytes, &pe) {
+                                Some(d) => {
+                                    if let Some(u) = d.unclosed.first() {
+                                        envelope_pos = Some((u.line, u.col));
+                                    }
+                                    format!(
+                                        "the file's own parse says: resulting file does not parse \u{2014} {} \u{2014} the enclosing form this replacement leaves unclosed",
+                                        d.lead()
+                                    )
+                                }
+                                None => format!(
+                                    "the file's own parse says: {} @ line {file_line} col {file_col} \u{2014} the enclosing form this replacement leaves unclosed",
+                                    raw_resulting_file_layer(&body)
+                                ),
+                            },
+                            Ok(_) => format!(
+                                "the file's own parse says: {} @ line {file_line} col {file_col} \u{2014} the enclosing form this replacement leaves unclosed",
+                                raw_resulting_file_layer(&body)
+                            ),
+                        };
+                    let (env_line, env_col) = match envelope_pos {
+                        Some((l, c)) => (Some(l), Some(c)),
+                        None => (body.line, body.col),
+                    };
+                    // Affordance parity with the MissingTail arm (issue 46):
+                    // the file-level walk knows the missing closers, the
+                    // verified splice proves the tail, so the candidate is
+                    // offered as an artifact + reference call rather than
+                    // as advice to hand-assemble the tail.
+                    let missing = match std::str::from_utf8(new_bytes)
+                        .ok()
+                        .map(crate::balance::walk)
+                    {
+                        Some(crate::balance::Walk::MissingTail { stack, .. }) if !stack.is_empty() => {
+                            Some((stack.len(), crate::balance::tail_for(&stack)))
+                        }
+                        _ => None,
+                    };
+                    let affordance = match (&missing, delta != 0) {
+                        (Some((n, tail)), true) if crate::balance::tail_verifies(new_bytes, tail) => {
+                            let candidate = format!("{submitted}{tail}");
+                            let old_t = old_text.as_deref().unwrap_or_default();
+                            let diff = crate::materialize::unified_diff(
+                                old_t,
+                                &candidate,
+                                "oldText",
+                                "newText+tail",
+                            );
+                            let tap = match write_candidate_artifact(&candidate) {
+                                Some(path) => format!(
+                                    "\none-tap confirm: re-run this patch with --new-text-file {} (oldText unchanged \u{2014} the artifact is the balanced {field}; if the file moved since this refusal, the confirm fails stale-handle and re-votes)",
+                                    path.display()
+                                ),
+                                None => String::new(),
+                            };
+                            format!(
+                                "the file is missing {n} closer(s) at EOF; mechanical tail (placement is yours to verify): {tail}\npreview ({field}+tail \u{2014} the tail lands inside the replacement, closing the enclosing form):\n{diff}{tap}"
+                            )
+                        }
+                        _ => String::new(),
+                    };
+                    let affordance = if affordance.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\n{affordance}")
+                    };
                     return if delta != 0 {
                         let lead = format!(
-                            "{}\n{file_loc}",
+                            "{}\n{file_loc}{affordance}",
                             patch_relative_line(new_c, old_c)
                         );
                         Fail(
                             exit,
                             ErrorBody {
                                 message: lead,
+                                line: env_line,
+                                col: env_col,
                                 hint: Some(format!(
                                     "the replacement closes more than it opens vs oldText \u{2014} add the missing closer(s) at the end of the {field}, then resubmit (the standalone scan does not apply to a tail replacement: its leading closers draw from the enclosing form); cljform never writes to a file that does not parse"
                                 )),
@@ -1077,6 +1154,8 @@ fn write_gate_enrich(
                             exit,
                             ErrorBody {
                                 message: lead,
+                                line: env_line,
+                                col: env_col,
                                 hint: Some(format!(
                                     "the net matches oldText but the file still fails: check the closer ORDER inside {field}, then resubmit; cljform never writes to a file that does not parse"
                                 )),
