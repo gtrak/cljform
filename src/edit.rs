@@ -1103,12 +1103,21 @@ fn write_gate_enrich(
                         (Some((n, tail)), true) if crate::balance::tail_verifies(new_bytes, tail) => {
                             let candidate = format!("{submitted}{tail}");
                             let old_t = old_text.as_deref().unwrap_or_default();
-                            let diff = crate::materialize::unified_diff(
-                                old_t,
-                                &candidate,
-                                "oldText",
-                                "newText+tail",
-                            );
+                            // Issue 42's owner-verified fumble shape: when
+                            // the tail IS the dropped closer(s), the
+                            // candidate reproduces oldText exactly and an
+                            // empty diff block would read like a bug.
+                            // Say the fact instead.
+                            let diff = if candidate == old_t {
+                                "identical to oldText (restoring the dropped closer)\n".to_string()
+                            } else {
+                                crate::materialize::unified_diff(
+                                    old_t,
+                                    &candidate,
+                                    "oldText",
+                                    "newText+tail",
+                                )
+                            };
                             let tap = match write_candidate_artifact(&candidate) {
                                 Some(path) => format!(
                                     "\none-tap confirm: re-run this patch with --new-text-file {} (oldText unchanged \u{2014} the artifact is the balanced {field}; if the file moved since this refusal, the confirm fails stale-handle and re-votes)",

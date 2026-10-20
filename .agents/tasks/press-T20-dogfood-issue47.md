@@ -53,3 +53,30 @@ class issue 47 was about — and both are fixed with regression tests
 Method note: the net-zero probe mutated a real file with semantically wrong
 but parse-valid content. That is the documented contract, but it is worth
 saying plainly in the docs: the gate certifies STRUCTURE, never intent.
+
+## T21 (adversarial round, local model @ xhigh) — timed out at 30 min
+
+The run explored ~26 probe groups in /tmp/t21 (tail replacements, docstring
+parens, CRLF, dry-run, batch target-removed) but never wrote its report; the
+findings below are harvested from its transcript.
+
+- **Real (medium, fixed)**: when the verified candidate reproduces oldText
+  exactly (the dropped-closer fumble), the new tail-patch affordance printed
+  an EMPTY diff block (`--- oldText / +++ newText+tail / <blank>`), while the
+  issue-42 MissingTail arm has the "identical to oldText (restoring the
+  dropped closer)" line for exactly this case. Ported; regression assertion
+  added.
+- **Not a defect (checked)**: a claimed double-space around the em dash did
+  not reproduce (single spaces live; its pipeline's artifact).
+- **Judgment call (not changed)**: a corrupted token whose replacement also
+  shifts the closer count reads as "1 more closer(s) … (nets: oldText 0,
+  newText -1)" plus the standalone mismatch and the file-level location. The
+  net delta IS true; the hint's "add the missing closer(s)" is generic advice
+  for a shape that is really a token error. Low severity; recorded, no change.
+- **Categories C/D/E: none found** — no tail replacement was told "closes
+  nothing" as a lead, the secondary scan never fired with a non-zero net, and
+  the batch handles it retried resolved.
+
+Lesson: the brief was too broad for a 30-minute local budget. Next adversarial
+round gets 3 categories and an explicit "write the report first, then probe"
+ordering.

@@ -752,7 +752,17 @@ fn tail_patch_refusal_names_the_unclosed_form_and_offers_the_candidate() {
     assert_eq!(d["error"]["line"], 1, "{d}");
     assert_eq!(d["error"]["col"], 1, "{d}");
     assert_eq!(d["error"]["unclosed"][0]["line"], 1, "{d}");
-    // Affordance parity: the verified candidate artifact + reference call.
+    // Affordance parity: the verified candidate artifact + reference call,
+    // and the fumble shape says the fact instead of printing an empty diff
+    // (T21 transcript finding: the candidate reproduced oldText).
+    assert!(
+        msg.contains("identical to oldText (restoring the dropped closer)"),
+        "{msg}"
+    );
+    assert!(
+        !msg.contains("+++ newText+tail"),
+        "no empty diff block: {msg}"
+    );
     assert!(msg.contains("one-tap confirm: re-run this patch with --new-text-file"), "{msg}");
     let path = msg
         .split("--new-text-file ")
