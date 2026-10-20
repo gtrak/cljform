@@ -329,6 +329,8 @@ impl<'a> P<'a> {
                 let body = self.read_while(|c| !matches!(c, '\n' | '\r'));
                 let mut text = format!(";{body}");
                 if matches!(self.peek(), Some('\n') | Some('\r')) {
+                    // the peek check above is exactly this test, so ch() cannot be None here.
+                    #[allow(clippy::unwrap_used)]
                     text.push(self.ch().unwrap());
                 }
                 Ok(Item::Node(Node::leaf(Tag::Comment, text)))
@@ -692,6 +694,8 @@ fn validate_number(s: &str) -> bool {
         let body_ok = if body.starts_with('.') {
             digits(&body.as_bytes()[1..])
         } else if body.contains('.') {
+            // contains('.') was just tested, so split_once must find the dot.
+            #[allow(clippy::unwrap_used)]
             let (i, f) = body.split_once('.').unwrap();
             digits(i.as_bytes()) && (f.is_empty() || digits(f.as_bytes()))
         } else {
@@ -834,10 +838,7 @@ fn dfs_next(root: &Node, path: &[usize]) -> Option<Vec<usize>> {
         return Some(p);
     }
     loop {
-        if p.is_empty() {
-            return None;
-        }
-        let last = *p.last().unwrap();
+        let &last = p.last()?;
         let idx = p.len() - 1;
         let count = node_at(root, &p[..idx]).children.len();
         if last + 1 < count {
@@ -870,7 +871,8 @@ fn remove_position(root: &Node, path: &[usize]) -> Vec<usize> {
     let last = *path.last().unwrap_or(&0);
     if last > 0 {
         let mut p = path.to_vec();
-        *p.last_mut().unwrap() = last - 1;
+        p.pop();
+        p.push(last - 1);
         while !node_at(root, &p).children.is_empty() {
             p.push(node_at(root, &p).children.len() - 1);
         }
@@ -882,6 +884,8 @@ fn remove_position(root: &Node, path: &[usize]) -> Vec<usize> {
 
 fn remove_child(root: &mut Node, path: &[usize]) {
     let pp = &path[..path.len() - 1];
+    // path is a full child path (non-empty; the parent slice above needs len >= 1).
+    #[allow(clippy::unwrap_used)]
     let i = *path.last().unwrap();
     node_at_mut(root, pp).children.remove(i);
     // The removed node's own width/after-line caches are gone with it;
@@ -896,6 +900,8 @@ fn insert_before(root: &mut Node, target: &[usize], n: Node) {
         return;
     }
     let pp = &target[..target.len() - 1];
+    // the is_empty() early return above leaves only non-empty targets here.
+    #[allow(clippy::unwrap_used)]
     let i = *target.last().unwrap();
     node_at_mut(root, pp).children.insert(i, n);
     invalidate_ancestors(root, target);
@@ -1294,7 +1300,10 @@ fn block_indent(root: &Node, path: &[usize], key: RuleKey, idx: usize) -> Option
             }
         }
     }
-    let after_ok = after.is_none() || first_form_in_line(root, after.as_ref().unwrap());
+    let after_ok = match after {
+        None => true,
+        Some(a) => first_form_in_line(root, &a),
+    };
     if after_ok && index_of(k, i) > idx {
         inner_indent(root, path, key, 0, None)
     } else {
@@ -1336,16 +1345,20 @@ fn indent_amount(root: &Node, path: &[usize]) -> usize {
     let pp = parent_path(path).unwrap_or(&[]);
     if let Some(gp) = parent_path(pp) {
         if reader_conditional(root, gp) {
+            // gp = parent_path(pp) is Some, so pp is non-empty and path has at least 2 elements.
             let mut spath = path.to_vec();
-            *spath.last_mut().unwrap() = 0;
+            let i = spath.len() - 1;
+            spath[i] = 0;
             return margin(root, &spath);
         }
     }
     match node_at(root, pp).tag {
         Tag::List | Tag::Fn => indenter(root, path).unwrap_or_else(|| list_indent(root, path)),
         _ => {
+            // pass_indent's p? admits only Newline/Comment nodes, never the Forms root: path is non-empty.
             let mut spath = path.to_vec();
-            *spath.last_mut().unwrap() = 0;
+            let i = spath.len() - 1;
+            spath[i] = 0;
             margin(root, &spath)
         }
     }
@@ -1407,9 +1420,8 @@ fn count_newlines(root: &Node, path: &[usize]) -> usize {
         }
         count += n.text.len();
         // right* (raw right sibling), then skip ws/comma via next*
-        let r = match parent_path(&z) {
-            Some(pp) => {
-                let i = *z.last().unwrap();
+        let r = match z.split_last() {
+            Some((&i, pp)) => {
                 let k = kids(root, pp);
                 (i + 1 < k.len()).then(|| {
                     let mut v = pp.to_vec();
@@ -1474,6 +1486,8 @@ fn pass_consecutive_blank_lines(root: &mut Node) {
         //   before = remove-clojure-whitespace(pos)     (drop the cw run)
         //   insert n newlines left of z/next* before; n = 1 iff before is a
         //          comment. Position ends at the insertion anchor.
+        // p? above (Newline/Comment with >2 newlines, !final_transform) guarantees a following element.
+        #[allow(clippy::expect_used)]
         let e = skip_wc_next(root, path).expect("p? guarantees a following element");
         let mut pos = dfs_prev(root, &e).unwrap_or_default();
         while is_clojure_ws(node_at(root, &pos).tag) {
@@ -1500,8 +1514,10 @@ fn pass_remove_surrounding_whitespace(root: &mut Node) {
         if path.len() == 1 {
             return false;
         }
-        let pp = parent_path(path).unwrap();
+        // len == 1 returned above, so path is non-empty; the parent path is the prefix slice.
+        let pp = &path[..path.len() - 1];
         let k = kids(root, pp);
+        #[allow(clippy::unwrap_used)]
         let i = *path.last().unwrap();
         if i == 0 {
             // left* is nil: remove unless right* is a comment or an
@@ -1557,6 +1573,8 @@ fn pass_insert_missing_whitespace(root: &mut Node) {
 
 fn insert_after(root: &mut Node, path: &[usize], n: Node) {
     let pp = &path[..path.len() - 1];
+    // path is a full child path (non-empty; the parent slice above needs len >= 1).
+    #[allow(clippy::unwrap_used)]
     let i = *path.last().unwrap();
     node_at_mut(root, pp).children.insert(i + 1, n);
     invalidate_ancestors(root, path);
