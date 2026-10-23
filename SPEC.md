@@ -124,7 +124,16 @@ cljform [--json|--human] <op> [args]
     see the backstop below) — and `balance`'s unbalanced verdicts:
     `kind: "missing-tail" | "mismatch"` on an `ok: true` envelope (the
     diagnostic is the payload, not an error — the verification outcome
-    carries the exit code, §4.5)
+    carries the exit code, §4.5). The balance JSON is one machine contract
+    (issue 48): `balanced` states the verdict beside envelope-level `ok`
+    (`ok` means the command ran); `counts` is the COMPLETE delimiter
+    census (`open`/`close`, every delimiter byte in code context) even
+    when the walk stopped at a mismatch; `matched` (`paren`/`bracket`/
+    `brace`) counts the closers that matched their own opener and is
+    OMITTED on a mismatch rather than reporting a partial number as a
+    total; and `stack` is the full open stack in both unbalanced kinds —
+    innermost LAST, i.e. the same stack the `mismatch.message` sentence
+    reads, so machine and human cannot disagree
 
   **The broken-file state (issue 31).** A file is BROKEN iff it has
   (a) tree-sitter parse errors or (b) conflict markers; both are

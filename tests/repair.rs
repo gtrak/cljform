@@ -642,3 +642,29 @@ fn closers_only_content_is_diagnosed_not_a_panic() {
     assert!(!msg.contains("still open at the mismatch"), "{msg}");
     assert_eq!(std::fs::read_to_string(&p).unwrap(), FIXTURE);
 }
+
+/// Issue 48 (3): the materialize mismatch message must be locatable (line +
+/// 1-based column) and must explain the divergence when indentation has
+/// already inserted closers — an opener that appears above can then be
+/// closed by that inference rather than by a literal closer, which is what
+/// makes the reported innermost look wrong to a reader who only counts
+/// delimiters.
+#[test]
+fn materialize_mismatch_names_line_and_explains_inferred_closers() {
+    // The `[` opened on line 3 is closed BY INFERENCE before line 4's
+    // dedent, so the literal `}` on line 5 arrives with `(` innermost.
+    let draft = b"(let [[a b]\n      [[:x 1]\n       [:y 2]]\n  (assoc {:k 1}\n   :v 2}\n  body)\n";
+    let (_code, d, _) = run_json(&["materialize", "--json"], Some(draft));
+    assert_eq!(d["ok"], false, "{d}");
+    let msg = d["error"]["message"].as_str().unwrap();
+    // 1-based column (the opener's `col` is 0-based internally).
+    assert!(msg.contains("'(' (opened line 4 col 3)"), "{msg}");
+    assert!(msg.contains("indentation already closed 1 form(s) earlier"), "{msg}");
+
+    // With no inference before the mismatch there is nothing to explain:
+    // the note stays out, and the column is still 1-based.
+    let (_code, d2, _) = run_json(&["materialize", "--json"], Some(b"(a\n  [b\n)\n"));
+    let msg2 = d2["error"]["message"].as_str().unwrap();
+    assert!(msg2.contains("'[' (opened line 2 col 3)"), "{msg2}");
+    assert!(!msg2.contains("indentation already closed"), "{msg2}");
+}

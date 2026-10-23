@@ -30,6 +30,9 @@ pub struct MaterializeError {
 
 struct OpenParen {
     ch: u8,
+    /// 1-based line the opener sits on (the diagnostics name it — a column
+    /// alone cannot be located in a long form).
+    line: usize,
     /// 0-based column within its own line (line-relative, so it can be
     /// compared against a line's indentation).
     col: usize,
@@ -121,6 +124,9 @@ fn first_comment(bytes: &[u8]) -> Option<usize> {
 /// wraps it with its candidate/diff envelope.
 pub fn indent_mode(draft: &str) -> Result<String, MaterializeError> {
     let mut lines: Vec<String> = draft.split('\n').map(str::to_string).collect();
+    // Inferred closers written so far: a mismatch can then state the fact
+    // that indentation already closed forms in this draft (issue 48 (3)).
+    let mut inferred_closers = 0usize;
     let trailing_newline = draft.ends_with('\n');
     if trailing_newline {
         lines.pop(); // the empty tail element is not a line
@@ -192,6 +198,7 @@ pub fn indent_mode(draft: &str) -> Result<String, MaterializeError> {
             if !to_close.is_empty() {
                 if let Some(prev) = last_content_line(&lines, li) {
                     insert_closers(&mut lines, prev, &to_close);
+                    inferred_closers += to_close.len();
                 }
             }
         }
@@ -207,7 +214,11 @@ pub fn indent_mode(draft: &str) -> Result<String, MaterializeError> {
             }
             match bytes[idx] {
                 b'(' | b'[' | b'{' => {
-                    stack.push(OpenParen { ch: bytes[idx], col: idx });
+                    stack.push(OpenParen {
+                        ch: bytes[idx],
+                        line: li + 1,
+                        col: idx,
+                    });
                 }
                 b')' | b']' | b'}' => {
                     let b = bytes[idx];
@@ -222,12 +233,30 @@ pub fn indent_mode(draft: &str) -> Result<String, MaterializeError> {
                             return Err(MaterializeError {
                                 line: li + 1,
                                 col: idx + 1,
-                                message: format!(
-                                    "mismatched close: found '{}' but '{}' (opened col {}) is still open",
-                                    b as char,
-                                    open.ch as char,
-                                    open.col
-                                ),
+                                message: {
+                                    // Columns are 1-based here (OpenParen.col
+                                    // is 0-based for indentation comparisons).
+                                    // When indentation has already inserted
+                                    // closers, say so: an opener that appears
+                                    // earlier in the draft can legitimately be
+                                    // closed here, and without that fact the
+                                    // message reads as a wrong stack.
+                                    let note = if inferred_closers > 0 {
+                                        format!(
+                                            " \u{2014} indentation already closed {inferred_closers} form(s) earlier in this draft, so an opener that appears above may be closed by that inference rather than by a literal closer"
+                                        )
+                                    } else {
+                                        String::new()
+                                    };
+                                    format!(
+                                        "mismatched close: found '{}' but '{}' (opened line {} col {}) is still open{}",
+                                        b as char,
+                                        open.ch as char,
+                                        open.line,
+                                        open.col + 1,
+                                        note
+                                    )
+                                },
                             });
                         }
                         None => {
@@ -235,7 +264,7 @@ pub fn indent_mode(draft: &str) -> Result<String, MaterializeError> {
                                 line: li + 1,
                                 col: idx + 1,
                                 message: format!(
-                                    "unmatched '{}' — indentation closes every form before this point",
+                                    "unmatched '{}' \u{2014} indentation closes every form before this point",
                                     b as char
                                 ),
                             });

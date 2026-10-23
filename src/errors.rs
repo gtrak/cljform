@@ -229,6 +229,15 @@ pub fn prepare_fail(p: content::PrepareError) -> Fail {
             // construction — the walk must see the submitted text). The
             // inferred-candidate display in the message stays unchanged
             // (repair stays opt-in and heuristic-labeled).
+            // The walk outcome also decides `kind`: a mismatch is NOT a
+            // missing tail (issue 48: the refusal used to hard-code
+            // missing-tail while its own hint described a mismatch).
+            let walked = crate::balance::walk(&submitted);
+            let walked_kind = match walked {
+                crate::balance::Walk::Mismatch { .. } => "mismatch",
+                crate::balance::Walk::Balanced { .. } => "unparseable",
+                crate::balance::Walk::MissingTail { .. } => "missing-tail",
+            };
             let facts = match crate::balance::walk(&submitted) {
                 crate::balance::Walk::MissingTail { stack, .. } => {
                     let n = stack.len();
@@ -277,7 +286,7 @@ pub fn prepare_fail(p: content::PrepareError) -> Fail {
                         "content is unbalanced and bracket inference is off (opt-in)\n{diff}\ncandidate:\n{candidate}"
                     ),
                 )
-                .kind("missing-tail")
+                .kind(walked_kind)
                 .with_hint(hint),
             )
         },
@@ -363,11 +372,38 @@ fn bracket_failure_fail(raw_context: String, submitted: &str) -> Fail {
                 ),
                 None => format!("{sentence}; net {net} opener(s) unclosed at that point"),
             };
-            let hint = format!(
-                "the {} at line {} is the first close that no longer matches — a closer was likely dropped earlier; iterate standalone with `cljform balance --stdin`, then submit balanced content",
-                closer as char,
-                line
-            );
+            // Issue 48 (4): a type-aware hint. The mismatched closer has two
+            // possible repairs — the opener's own closer is missing just
+            // before it, or this closer's TYPE is wrong — and naming both
+            // concretely beats "a closer was likely dropped earlier", which
+            // sends the reader hunting backward when the missing closer is
+            // often right here. Neither is asserted: the walker proves the
+            // mismatch, not the intent.
+            let hint = match innermost.as_ref() {
+                Some(open) => {
+                    let partner = match open.ch {
+                        b'(' => ')',
+                        b'[' => ']',
+                        _ => '}',
+                    };
+                    format!(
+                        "at line {} col {} the `{}` arrives while the innermost open `{}` (line {} col {}) is still unclosed — either a `{}` is missing just before this `{}` (then place it there), or this closer should be `{}` itself; a later tail cannot fix a misplaced closer. Iterate standalone with `cljform balance --stdin`, then submit balanced content",
+                        line,
+                        col,
+                        closer as char,
+                        open.ch as char,
+                        open.line,
+                        open.col,
+                        partner,
+                        closer as char,
+                        partner,
+                    )
+                }
+                None => format!(
+                    "at line {line} col {col} the `{}` arrives with NO openers left — the content closes forms it never opened; remove it or open the matching form earlier. Iterate standalone with `cljform balance --stdin`, then submit balanced content",
+                    closer as char
+                ),
+            };
             (lead, "mismatch", hint, Some((line, col)))
         }
         crate::balance::Walk::MissingTail { stack, .. } => {

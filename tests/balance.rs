@@ -42,12 +42,14 @@ fn incident_mismatch_names_line_and_innermost_opener() {
     assert_eq!(d["ok"], true, "the verification outcome is data, not an error");
     assert_eq!(d["op"], "balance");
     assert_eq!(d["kind"], "mismatch");
-    // The mechanical counts a naive counter would have seen.
+    // Issue 48 (2): `counts` is the COMPLETE delimiter census — 6 openers
+    // and 6 closers, i.e. the naive counter reads this text as balanced
+    // while the stack walk proves the closer ORDER is wrong. `matched`
+    // (pairs that closed themselves before the mismatch) is omitted here on
+    // purpose: a partial number must not look like a total.
     assert_eq!(d["counts"]["open"], 6);
-    assert_eq!(d["counts"]["close"], 4);
-    assert_eq!(d["counts"]["paren"], 1);
-    assert_eq!(d["counts"]["bracket"], 2);
-    assert_eq!(d["counts"]["brace"], 0);
+    assert_eq!(d["counts"]["close"], 6);
+    assert!(d.get("matched").is_none(), "no partial matched counts: {d}");
     // The headline diagnosis: the closer's line:col and the innermost
     // opener it failed to close (the swap! form — assoc closed itself on
     // line 4, so it is NOT the innermost).
@@ -62,16 +64,22 @@ fn incident_mismatch_names_line_and_innermost_opener() {
         .as_str()
         .unwrap()
         .contains("mismatch at line 5 col 5: ] closes nothing — innermost open is ( from line 3 col 5"));
-    // The remaining open stack (the openers UNDER the mismatched one —
-    // the innermost is named in `mismatch`), open order bottom first.
+    // Issue 48 (1): `stack` is the FULL open stack at the closer, innermost
+    // LAST — it agrees with `mismatch.innermost` and with the sentence
+    // ("innermost open is ( from line 3 col 5"). A machine consumer reading
+    // only `stack` sees the same innermost a human reads.
     let stack = d["stack"].as_array().unwrap();
-    assert_eq!(stack.len(), 2);
+    assert_eq!(stack.len(), 3);
     assert_eq!(stack[0]["ch"], "(");
     assert_eq!(stack[0]["line"], 1);
     assert_eq!(stack[0]["col"], 1);
     assert_eq!(stack[1]["ch"], "(");
     assert_eq!(stack[1]["line"], 2);
     assert_eq!(stack[1]["col"], 3);
+    assert_eq!(stack[2]["ch"], "(");
+    assert_eq!(stack[2]["line"], 3);
+    assert_eq!(stack[2]["col"], 5);
+    assert_eq!(stack[2], m["innermost"], "stack tail == mismatch.innermost");
     // NO tail is offered for a mismatch (a tail cannot fix a misplaced
     // closer).
     assert!(d.get("tail").is_none(), "no tail on a mismatch: {d}");
@@ -95,9 +103,9 @@ fn workers_arithmetic_16_15_tail_is_one_paren() {
     assert_eq!(d["kind"], "missing-tail");
     assert_eq!(d["counts"]["open"], 16);
     assert_eq!(d["counts"]["close"], 15);
-    assert_eq!(d["counts"]["paren"], 15);
-    assert_eq!(d["counts"]["bracket"], 0);
-    assert_eq!(d["counts"]["brace"], 0);
+    assert_eq!(d["matched"]["paren"], 15);
+    assert_eq!(d["matched"]["bracket"], 0);
+    assert_eq!(d["matched"]["brace"], 0);
     assert_eq!(d["tail"], ")");
     assert_eq!(d["stack"].as_array().unwrap().len(), 1);
     let (hcode, hout, _) = run_bytes(&["balance", "--stdin", "--human"], Some(content.as_bytes()));
@@ -157,9 +165,9 @@ fn traps_do_not_count() {
     // closed itself, and the trap interiors never opened anything.
     assert_eq!(d["counts"]["open"], 4);
     assert_eq!(d["counts"]["close"], 3);
-    assert_eq!(d["counts"]["paren"], 3);
-    assert_eq!(d["counts"]["bracket"], 0);
-    assert_eq!(d["counts"]["brace"], 0);
+    assert_eq!(d["matched"]["paren"], 3);
+    assert_eq!(d["matched"]["bracket"], 0);
+    assert_eq!(d["matched"]["brace"], 0);
     assert_eq!(d["tail"], ")");
     let stack = d["stack"].as_array().unwrap();
     assert_eq!(stack.len(), 1);
@@ -187,8 +195,8 @@ fn balanced_fragment_exits_zero() {
     assert_eq!(d["kind"], "balanced");
     assert_eq!(d["counts"]["open"], 3);
     assert_eq!(d["counts"]["close"], 3);
-    assert_eq!(d["counts"]["paren"], 2);
-    assert_eq!(d["counts"]["bracket"], 1);
+    assert_eq!(d["matched"]["paren"], 2);
+    assert_eq!(d["matched"]["bracket"], 1);
     assert!(d.get("stack").is_none());
     assert!(d.get("tail").is_none());
     assert!(d.get("mismatch").is_none());
@@ -790,4 +798,59 @@ fn tail_patch_refusal_names_the_unclosed_form_and_offers_the_candidate() {
     assert_eq!(code2, 0, "{d2} {err2}");
     let after = std::fs::read_to_string(&p).unwrap();
     assert_eq!(after, src, "the confirm restored the dropped closer");
+}
+
+/// Issue 48 (1),(2),(5): the balance JSON is one machine contract. `counts`
+/// is the complete census (never a walk-truncated partial), `matched` is
+/// present only when the walk completed (no partial number posing as a
+/// total), the `stack` includes the innermost opener named in the message,
+/// and `balanced` states the verdict beside the envelope-level `ok`.
+#[test]
+fn balance_json_counts_and_stack_are_one_consistent_contract() {
+    // Mismatch: 2 opens + 2 closes by raw count, but the closers are
+    // misordered — the naive census reads it as balanced.
+    let (code, d, err) = balance_json(b"(a [b)\n]", &[]);
+    assert_eq!(code, 1, "{d} {err}");
+    assert_eq!(d["kind"], "mismatch");
+    assert_eq!(d["balanced"], false, "{d}");
+    assert_eq!(d["ok"], true, "envelope-level success is not the verdict");
+    assert_eq!(d["counts"], serde_json::json!({"open": 2, "close": 2}), "{d}");
+    assert!(d.get("matched").is_none(), "no partial matched counts: {d}");
+    let stack = d["stack"].as_array().unwrap();
+    assert_eq!(stack.last().unwrap(), &d["mismatch"]["innermost"], "{d}");
+
+    // Missing tail: the walk completes, so `matched` is a real total.
+    let (code, d, _) = balance_json(b"(a [b", &[]);
+    assert_eq!(code, 1);
+    assert_eq!(d["balanced"], false);
+    assert_eq!(d["counts"], serde_json::json!({"open": 2, "close": 0}));
+    assert_eq!(d["matched"], serde_json::json!({"paren": 0, "bracket": 0, "brace": 0}));
+
+    // Balanced: verdict true, matched totals, no stack.
+    let (code, d, _) = balance_json(b"(a [b])", &[]);
+    assert_eq!(code, 0);
+    assert_eq!(d["balanced"], true);
+    assert_eq!(d["matched"], serde_json::json!({"paren": 1, "bracket": 1, "brace": 0}));
+}
+
+/// Issue 48 (4): the content-refusal hint is type-aware. A `]` arriving
+/// while `(` is innermost gets the concrete partner pair and BOTH possible
+/// repairs, instead of "a closer was likely dropped earlier" (which sends
+/// the reader hunting backward when the fix is often the closer's type).
+#[test]
+fn mismatch_hint_names_the_partner_and_both_repairs() {
+    let p = f("hint-48.clj");
+    let h = handle_of(&p, "target");
+    let (code, d, err) = edit_content(&p, &h, "(defn g [x]\n  (inc x]])\n");
+    assert_eq!(code, 3, "{d} {err}");
+    assert_eq!(d["error"]["code"], "unbalanced-content");
+    assert_eq!(d["error"]["kind"], "mismatch");
+    let hint = d["error"]["hint"].as_str().unwrap();
+    assert!(
+        hint.contains("the `]` arrives while the innermost open `(` (line 2 col 3) is still unclosed"),
+        "{hint}"
+    );
+    assert!(hint.contains("either a `)` is missing just before this `]`"), "{hint}");
+    assert!(hint.contains("or this closer should be `)` itself"), "{hint}");
+    assert!(!hint.contains("a closer was likely dropped earlier"), "{hint}");
 }

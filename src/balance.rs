@@ -392,9 +392,10 @@ impl Mismatch {
 }
 
 /// The balance verdict — everything the flat envelope and the human line
-/// need. `stack` is the full open stack for `missing-tail`, the openers
-/// UNDER the mismatched one for `mismatch` (the innermost is named in
-/// `Mismatch`). `tail` is the exact tail to append (`missing-tail`) or the
+/// need. `stack` is the FULL open stack in both unbalanced kinds: for
+/// `missing-tail` the openers that need closers, for `mismatch` the openers
+/// still open at the closer (innermost LAST) — the same stack the mismatch
+/// sentence reads from, so the machine and human views cannot disagree. `tail` is the exact tail to append (`missing-tail`) or the
 /// accepted/echoed candidate (`balanced` with `--tail`).
 #[derive(Debug)]
 struct Verdict {
@@ -546,11 +547,18 @@ fn decide(w: &Walk, tail: &Option<String>, text: &str) -> Verdict {
                         .to_string(),
                 );
             }
+            // The full stack at the closer, innermost LAST — including the
+            // opener the closer failed to match, so `stack` and
+            // `mismatch.message` name the same innermost (issue 48 (1)).
+            let mut full_stack = remaining.clone();
+            if let Some(inner) = innermost {
+                full_stack.push(inner.clone());
+            }
             Verdict {
                 kind: "mismatch",
                 exit: errors::exit::PARSE,
                 counts: *counts,
-                stack: Some(remaining.clone()),
+                stack: Some(full_stack),
                 tail: None,
                 mismatch: Some(Mismatch {
                     closer: *closer,
@@ -584,16 +592,33 @@ pub fn run_balance(
         obj.insert("ok".into(), serde_json::json!(true));
         obj.insert("op".into(), serde_json::json!("balance"));
         obj.insert("kind".into(), serde_json::json!(v.kind));
+        // `ok` is envelope-level (the command ran); this is the verdict. They
+        // are NOT the same thing: a mismatch is a successful diagnosis.
+        obj.insert(
+            "balanced".into(),
+            serde_json::json!(v.kind == "balanced"),
+        );
+        // Issue 48 (2): `counts` is the COMPLETE delimiter census (a walk
+        // that stops at a mismatch cannot supply it), so open/close always
+        // mean "every delimiter byte in code context". `matched` counts the
+        // closers that actually matched an opener of their own type; it is
+        // omitted on a mismatch because the walk stops at the first
+        // mismatch and a partial number must not look like a total.
+        let full = crate::balance::full_counts(&text);
         obj.insert(
             "counts".into(),
-            serde_json::json!({
-                "open": v.counts.open,
-                "close": v.counts.close,
-                "paren": v.counts.paren,
-                "bracket": v.counts.bracket,
-                "brace": v.counts.brace,
-            }),
+            serde_json::json!({ "open": full.open, "close": full.close }),
         );
+        if v.kind != "mismatch" {
+            obj.insert(
+                "matched".into(),
+                serde_json::json!({
+                    "paren": v.counts.paren,
+                    "bracket": v.counts.bracket,
+                    "brace": v.counts.brace,
+                }),
+            );
+        }
         if let Some(s) = &v.stack {
             obj.insert(
                 "stack".into(),
